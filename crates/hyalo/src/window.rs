@@ -285,7 +285,7 @@ fn placement_on(monitor: HMONITOR) -> Result<(Rect, u32)> {
         GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &mut dpi, &mut dpi_y)?;
     }
     let scale = dpi as f32 / 96.0;
-    Ok((layout::launcher_rect(to_rect(info.rcWork), scale), dpi))
+    Ok((layout::launcher_rect(to_rect(info.rcWork), scale, 0), dpi))
 }
 
 fn to_rect(rect: RECT) -> Rect {
