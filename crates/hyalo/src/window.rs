@@ -1580,6 +1580,61 @@ mod tests {
     }
 
     #[test]
+    fn ctrl_enter_and_ctrl_c_with_nothing_listed_keep_it_open() {
+        on_hidden_desktop(|| {
+            let (launcher, ran) = Launcher::listing_with(&["Notepad"], None);
+            launcher.type_text("xyz");
+            hold(&[VK_CONTROL]);
+            launcher.press(VK_C);
+            launcher.press(VK_RETURN);
+            assert!(ran.borrow().is_empty());
+            assert!(launcher.visible());
+        });
+    }
+
+    #[test]
+    fn a_picked_file_among_the_files_found_still_leaves_eight_rows() {
+        let picks = PicksFile::new("eight");
+        let path = picks.0.clone();
+        on_hidden_desktop(move || {
+            let names: Vec<String> = (1..=9).map(|n| format!("notes {n}.txt")).collect();
+            let names: Vec<&str> = names.iter().map(String::as_str).collect();
+            let tree = Scratch::new("window-eight").with(&names);
+            let (first, _) = Launcher::finding(&tree.0, Some(path.clone()));
+            first.search_for("notes", MAX_ROWS);
+            first.press(VK_RETURN);
+            drop(first);
+            let (second, _) = Launcher::finding(&tree.0, Some(path));
+            second.pump_until(|app| !app.catalog.picked.is_empty());
+            second.search_for("notes", MAX_ROWS);
+        });
+    }
+
+    #[test]
+    fn a_files_icon_is_asked_for_once() {
+        on_hidden_desktop(|| {
+            let tree = Scratch::new("window-icon-once").with(&["report.pdf"]);
+            let (mut services, _) = walking(just(&tree.0), None);
+            let asked = Arc::new(AtomicUsize::new(0));
+            let counted = Arc::clone(&asked);
+            services.icons = Arc::new(move |ids: &[ItemId], size, report: &dyn Fn(Found)| {
+                for id in ids {
+                    counted.fetch_add(1, Ordering::SeqCst);
+                    report(Found::Icon(id.clone(), red(size)));
+                }
+            });
+            let launcher = Launcher::serving(services);
+            launcher.search_for("report", 1);
+            launcher.pump_until(|app| !app.catalog.icons.is_empty());
+            launcher.type_text("\u{8}t");
+            // A second request would come from a thread of its own.
+            std::thread::sleep(Duration::from_millis(300));
+            launcher.pump_until(|_| true);
+            assert_eq!(asked.load(Ordering::SeqCst), 1);
+        });
+    }
+
+    #[test]
     fn ctrl_enter_and_ctrl_c_leave_an_app_alone() {
         on_hidden_desktop(|| {
             let (launcher, ran) = Launcher::listing_with(&["Notepad"], None);

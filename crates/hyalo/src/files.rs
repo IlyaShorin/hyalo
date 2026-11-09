@@ -265,9 +265,8 @@ pub fn fixed_drives() -> Vec<PathBuf> {
     // SAFETY: the buffer is ours, and its length goes with it.
     let length = unsafe { GetLogicalDriveStringsW(Some(&mut buffer)) } as usize;
     let roots = String::from_utf16_lossy(&buffer[..length.min(buffer.len())]);
-    let fixed = roots
-        .split('\0')
-        .filter(|root| !root.is_empty() && fixed(root));
+    // The list ends in empty names, which are no fixed drive.
+    let fixed = roots.split('\0').filter(|root| fixed(root));
     fixed.map(PathBuf::from).collect()
 }
 
@@ -391,6 +390,24 @@ mod tests {
         assert!(kept("$Recycle.Bin", false), "only at the root");
         assert!(kept("Windows", true));
         assert!(kept("pagefile.sys", true));
+    }
+
+    #[test]
+    fn a_walk_leaves_out_the_system_folders_at_its_root_only() {
+        let folder = Scratch::new("system").with(&[
+            "$Recycle.Bin\\",
+            r"$Recycle.Bin\deleted.txt",
+            "System Volume Information\\",
+            "sub\\$kept\\",
+            r"sub\$kept\kept.txt",
+        ]);
+        let index = walked(&folder.0);
+        assert_eq!(found(&index, "deleted"), Vec::<String>::new());
+        assert_eq!(found(&index, "volume"), Vec::<String>::new());
+        assert_eq!(
+            found(&index, "kept.txt"),
+            [folder.path(r"sub\$kept\kept.txt")]
+        );
     }
 
     #[test]
@@ -558,9 +575,17 @@ mod tests {
     }
 
     #[test]
+    fn nothing_is_not_a_fixed_drive() {
+        assert!(!fixed(""));
+    }
+
+    #[test]
     fn the_system_drive_is_a_fixed_drive() {
         let system = std::env::var("SystemDrive").expect("SystemDrive is set");
-        assert!(fixed_drives().contains(&PathBuf::from(format!("{system}\\"))));
+        let drives = fixed_drives();
+        assert!(drives.contains(&PathBuf::from(format!("{system}\\"))));
+        let drive_alone = |drive: &PathBuf| full_path(&format!("{}x", drive.display()));
+        assert!(drives.iter().all(drive_alone), "{drives:?}");
     }
 
     #[test]
