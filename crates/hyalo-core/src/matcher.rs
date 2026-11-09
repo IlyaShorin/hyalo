@@ -10,6 +10,7 @@ use std::ops::Range;
 /// How a query matched a name, weakest first.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Strength {
+    Substring,
     Acronym,
     WordStart,
     Prefix,
@@ -30,31 +31,39 @@ pub fn find(query: &str, name: &str) -> Option<Match> {
     let letters: Vec<char> = name.chars().collect();
     let folded: Vec<char> = letters.iter().copied().map(fold).collect();
     let words = words(&letters);
-    let found_at = |start: usize| folded[start..].starts_with(&query);
+    let found_at = |start: &usize| folded[*start..].starts_with(&query);
     let run = |strength, start: usize| Match {
         strength,
         positions: (start..start + query.len()).collect(),
     };
-    if found_at(0) {
+    if found_at(&0) {
         let strength = match query.len() == folded.len() {
             true => Strength::Exact,
             false => Strength::Prefix,
         };
         return Some(run(strength, 0));
     }
-    if let Some(word) = words.iter().find(|word| found_at(word.start)) {
-        return Some(run(Strength::WordStart, word.start));
-    }
-    let positions = Acronym {
-        query: &query,
-        folded: &folded,
-        words: &words,
+    let mut word_starts = words.iter().map(|word| word.start);
+    word_starts
+        .find(&found_at)
+        .map(|start| run(Strength::WordStart, start))
+        .or_else(|| acronym(&query, &folded, &words))
+        .or_else(|| {
+            let start = (0..folded.len()).find(&found_at)?;
+            Some(run(Strength::Substring, start))
+        })
+}
+
+fn acronym(query: &[char], folded: &[char], words: &[Range<usize>]) -> Option<Match> {
+    let mut search = Acronym {
+        query,
+        folded,
+        words,
         tried: HashSet::new(),
-    }
-    .positions(0, 0)?;
+    };
     Some(Match {
         strength: Strength::Acronym,
-        positions,
+        positions: search.positions(0, 0)?,
     })
 }
 
@@ -263,6 +272,30 @@ mod tests {
     #[test]
     fn word_start_is_stronger_than_an_acronym() {
         assert!(Strength::WordStart > Strength::Acronym);
+    }
+
+    #[test]
+    fn letters_inside_a_word_are_a_substring() {
+        assert_eq!(
+            strength("ode", "Visual Studio Code"),
+            Some(Strength::Substring)
+        );
+        assert_eq!(positions("ode", "Visual Studio Code"), [15, 16, 17]);
+        assert_eq!(strength("hell", "PowerShell"), Some(Strength::Substring));
+        assert_eq!(
+            strength("ЕДАК", "Видео редактор"),
+            Some(Strength::Substring)
+        );
+    }
+
+    #[test]
+    fn a_substring_is_the_first_one_in_the_name() {
+        assert_eq!(positions("an", "Banana"), [1, 2]);
+    }
+
+    #[test]
+    fn an_acronym_is_stronger_than_a_substring() {
+        assert!(Strength::Acronym > Strength::Substring);
     }
 
     #[test]
