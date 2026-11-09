@@ -181,24 +181,25 @@ extern "system" fn wndproc(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPA
         WM_HOTKEY => handled(toggle(hwnd)),
         WM_ACTIVATE if (wparam.0 & 0xFFFF) as u32 == WA_INACTIVE => {
             hide(hwnd);
-            LRESULT(0)
+            handled(Ok(()))
         }
         WM_KEYDOWN => {
             on_key(hwnd, VIRTUAL_KEY(wparam.0 as u16));
-            LRESULT(0)
+            handled(Ok(()))
         }
         WM_CHAR => handled(on_char(wparam.0 as u16)),
         // No WM_PAINT: the picture lives in the DirectComposition swap chain
         // and survives without one; DefWindowProc validates the window.
         WM_DESTROY => {
             unsafe { PostQuitMessage(0) };
-            LRESULT(0)
+            handled(Ok(()))
         }
         _ => unsafe { DefWindowProcW(hwnd, message, wparam, lparam) },
     }
 }
 
-/// The message was handled; log a failure instead of unwinding into Win32.
+/// The message was handled: answer 0, as Windows expects, and log a
+/// failure instead of unwinding into Win32.
 fn handled(result: Result<()>) -> LRESULT {
     if let Err(error) = result {
         eprintln!("hyalo: {error}");
@@ -315,8 +316,8 @@ mod tests {
     use windows::Win32::Graphics::Gdi::MonitorFromWindow;
     use windows::Win32::UI::Input::KeyboardAndMouse::VK_A;
     use windows::Win32::UI::WindowsAndMessaging::{
-        DestroyWindow, GetClientRect, GetWindowRect, PM_REMOVE, PeekMessageW, PostMessageW,
-        SendMessageW, WA_ACTIVE, WM_QUIT,
+        DestroyWindow, GetClientRect, GetWindowRect, PM_QS_POSTMESSAGE, PM_REMOVE, PeekMessageW,
+        PostMessageW, SendMessageW, WA_ACTIVE, WM_NULL, WM_QUIT,
     };
 
     use super::*;
@@ -545,13 +546,46 @@ mod tests {
     }
 
     #[test]
-    fn destroying_the_window_quits_the_app() {
+    fn the_message_loop_takes_every_posted_message_off_the_queue() {
+        on_hidden_desktop(|| {
+            let launcher = Launcher::open();
+            launcher.post(WM_NULL, 0);
+            unsafe { PostQuitMessage(0) };
+            message_loop();
+            let mut message = MSG::default();
+            let posted = PM_REMOVE | PM_QS_POSTMESSAGE;
+            let left = unsafe { PeekMessageW(&mut message, None, 0, 0, posted) };
+            assert!(!left.as_bool(), "message {:#x} left", message.message);
+        });
+    }
+
+    #[test]
+    fn answers_zero_to_the_messages_it_handles() {
+        let handled = [
+            (WM_NCCALCSIZE, 1),
+            (WM_CHAR, usize::from(b'a')),
+            (WM_KEYDOWN, usize::from(VK_A.0)),
+            (WM_ACTIVATE, WA_INACTIVE as usize),
+            (WM_HOTKEY, HOTKEY_TOGGLE as usize),
+        ];
+        on_hidden_desktop(move || {
+            let launcher = Launcher::open();
+            for (message, wparam) in handled {
+                let answer = launcher.send(message, wparam);
+                assert_eq!(answer, LRESULT(0), "message {message:#x}");
+            }
+        });
+    }
+
+    #[test]
+    fn destroying_the_window_quits_the_app_with_exit_code_zero() {
         on_hidden_desktop(|| {
             let hwnd = open().expect("open the launcher");
             unsafe { DestroyWindow(hwnd) }.expect("destroy the window");
             let mut message = MSG::default();
             let quit = unsafe { PeekMessageW(&mut message, None, WM_QUIT, WM_QUIT, PM_REMOVE) };
             assert!(quit.as_bool());
+            assert_eq!(message.wParam.0, 0, "exit code");
         });
     }
 }
