@@ -6,6 +6,7 @@ Spotlight-style launcher for Windows 11, written in Rust. Goals, architecture an
 
 - Follow `/ub-mode` (installed globally) for every code change: failing test first, smallest edit, pure logic, small ordered commits that say why, what changed, and how it was proved.
 - Platform glue (Win32, DirectX, COM) stays thin. Anything with a decision in it (layout math, text editing, query parsing, scoring) lives in a pure function with tests. Do not write fake tests for FFI glue.
+- Test the glue the way Windows drives it: `test_desktop::on_hidden_desktop` runs a test on a thread attached to a hidden desktop (no flashing windows, no stolen focus); the `Launcher` driver in `window.rs` tests sends real messages; `Renderer::read_frame` reads back the last presented frame so tests can check pixels. Never repaint before reading a frame: the test must see what the code put on screen.
 - Before a commit: `cargo fmt --all`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`, `scripts/gates.sh`.
 - Mutation testing on changed code: `scripts/gates.sh mutate --changed`. It needs Windows Developer Mode, because mutator links its workers with symlinks.
 - Check UI changes with your own eyes: run `target/debug/hyalo.exe`, then `powershell -ExecutionPolicy Bypass -File scripts/snap.ps1 -Stripes` and read `target/snap.png`. On a dark desktop the glass looks solid; the stripes show whether it really blurs.

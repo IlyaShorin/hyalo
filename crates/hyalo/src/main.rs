@@ -6,6 +6,15 @@ mod query;
 mod render;
 mod window;
 
+#[cfg(test)]
+mod test_desktop;
+
+use windows::Win32::UI::HiDpi::{
+    DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext,
+};
+
 fn main() -> windows::core::Result<()> {
+    // DPI awareness is per process and must be set before the first window.
+    unsafe { SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2)? };
     window::run()
 }

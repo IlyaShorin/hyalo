@@ -408,3 +408,92 @@ fn create_text_format(dwrite: &IDWriteFactory) -> Result<IDWriteTextFormat> {
         Ok(format)
     }
 }
+
+#[cfg(test)]
+pub use readback::Frame;
+
+/// Reading frames back from the GPU, so tests can check what is drawn.
+#[cfg(test)]
+mod readback {
+    use windows::Win32::Graphics::Direct3D11::{
+        D3D11_CPU_ACCESS_READ, D3D11_MAP_READ, D3D11_MAPPED_SUBRESOURCE, D3D11_TEXTURE2D_DESC,
+        D3D11_USAGE_STAGING, ID3D11Device, ID3D11Texture2D,
+    };
+    use windows::core::Result;
+
+    use super::Renderer;
+
+    /// One frame: premultiplied BGRA pixels, row by row.
+    pub struct Frame {
+        pub width: usize,
+        pub height: usize,
+        bgra: Vec<u8>,
+    }
+
+    impl Frame {
+        /// Blue, green, red and alpha of one pixel.
+        pub fn pixel(&self, x: usize, y: usize) -> [u8; 4] {
+            let at = (y * self.width + x) * 4;
+            [
+                self.bgra[at],
+                self.bgra[at + 1],
+                self.bgra[at + 2],
+                self.bgra[at + 3],
+            ]
+        }
+    }
+
+    impl Renderer {
+        /// Copies the last presented frame to the CPU.
+        ///
+        /// In a flip-model swap chain buffer 0 is always the next back
+        /// buffer; with two buffers, buffer 1 is the one just presented.
+        /// `FLIP_SEQUENTIAL` keeps it readable.
+        pub fn read_frame(&self) -> Result<Frame> {
+            unsafe {
+                let buffer: ID3D11Texture2D = self.swap_chain.GetBuffer(1)?;
+                let device: ID3D11Device = self.swap_chain.GetDevice()?;
+                let staging = staging_copy(&device, &buffer)?;
+                let context = device.GetImmediateContext()?;
+                let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+                context.Map(&staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))?;
+                let (width, height) = (self.width as usize, self.height as usize);
+                let mut bgra = Vec::with_capacity(width * height * 4);
+                for row in 0..height {
+                    // SAFETY: Map succeeded, so pData points to `height`
+                    // rows of RowPitch bytes, each at least `width` pixels.
+                    let start = mapped
+                        .pData
+                        .cast::<u8>()
+                        .add(row * mapped.RowPitch as usize);
+                    bgra.extend_from_slice(std::slice::from_raw_parts(start, width * 4));
+                }
+                context.Unmap(&staging, 0);
+                Ok(Frame {
+                    width,
+                    height,
+                    bgra,
+                })
+            }
+        }
+    }
+
+    /// A CPU-readable copy of `texture`.
+    fn staging_copy(device: &ID3D11Device, texture: &ID3D11Texture2D) -> Result<ID3D11Texture2D> {
+        let mut desc = D3D11_TEXTURE2D_DESC::default();
+        let mut staging = None;
+        unsafe {
+            texture.GetDesc(&mut desc);
+            desc.Usage = D3D11_USAGE_STAGING;
+            desc.BindFlags = 0;
+            desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ.0 as u32;
+            desc.MiscFlags = 0;
+            device.CreateTexture2D(&desc, None, Some(&mut staging))?;
+            let staging = staging.ok_or_else(windows::core::Error::empty)?;
+            device
+                .GetImmediateContext()?
+                .CopyResource(&staging, texture);
+            Ok(staging)
+        }
+    }
+}
