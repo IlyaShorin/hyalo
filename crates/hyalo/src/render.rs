@@ -113,6 +113,13 @@ const TITLE_TEXT: D2D1_COLOR_F = rgba(1.0, 1.0, 1.0, 0.92);
 const MATCHED_TEXT: D2D1_COLOR_F = rgba(0.55, 0.76, 1.0, 1.0);
 const SUBTITLE_TEXT: D2D1_COLOR_F = rgba(1.0, 1.0, 1.0, 0.5);
 
+/// Present's sync interval: 0, do not wait for a vertical blank. A
+/// composition swap chain cannot tear, DWM composes at the display's pace
+/// anyway, and waiting made a burst of 120 redraws take 492 ms instead of
+/// 30 to 45 ms. No test pins this: under load (mutator's parallel
+/// workers), wall-clock time could not tell the two values apart.
+const SYNC_INTERVAL: u32 = 0;
+
 /// Every bitmap here, the swap chain's and the icons, holds premultiplied
 /// BGRA.
 const PREMULTIPLIED_BGRA: D2D1_PIXEL_FORMAT = D2D1_PIXEL_FORMAT {
@@ -202,10 +209,7 @@ impl Renderer {
         let drawn = self.draw_scene(scene);
         unsafe { self.dc.EndDraw(None, None)? };
         drawn?;
-        // Sync interval 0: DWM composes at the display's pace anyway (no
-        // tearing in a composition swap chain), and a burst of redraws
-        // while typing does not wait a refresh each.
-        unsafe { self.swap_chain.Present(0, DXGI_PRESENT(0)).ok() }
+        unsafe { self.swap_chain.Present(SYNC_INTERVAL, DXGI_PRESENT(0)).ok() }
     }
 
     fn draw_scene(&mut self, scene: &Scene) -> Result<()> {
@@ -670,25 +674,27 @@ mod readback {
         /// buffer; with two buffers, buffer 1 is the one just presented.
         /// `FLIP_SEQUENTIAL` keeps it readable.
         pub fn read_frame(&self) -> Result<Frame> {
+            // One mip level, one array slice: the texture's only
+            // subresource, mapped and unmapped by this index.
+            let subresource = 0;
             unsafe {
                 let buffer: ID3D11Texture2D = self.swap_chain.GetBuffer(1)?;
                 let device: ID3D11Device = self.swap_chain.GetDevice()?;
                 let staging = staging_copy(&device, &buffer)?;
                 let context = device.GetImmediateContext()?;
                 let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
-                context.Map(&staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))?;
+                context.Map(&staging, subresource, D3D11_MAP_READ, 0, Some(&mut mapped))?;
                 let (width, height) = (self.width as usize, self.height as usize);
-                let mut bgra = Vec::with_capacity(width * height * 4);
-                for row in 0..height {
-                    // SAFETY: Map succeeded, so pData points to `height`
-                    // rows of RowPitch bytes, each at least `width` pixels.
-                    let start = mapped
-                        .pData
-                        .cast::<u8>()
-                        .add(row * mapped.RowPitch as usize);
-                    bgra.extend_from_slice(std::slice::from_raw_parts(start, width * 4));
-                }
-                context.Unmap(&staging, 0);
+                let pitch = mapped.RowPitch as usize;
+                // SAFETY: Map succeeded, so until Unmap pData points to
+                // `height` rows of `pitch` bytes, each at least `width`
+                // pixels.
+                let row = |index: usize| {
+                    let start = mapped.pData.cast::<u8>().add(index * pitch);
+                    std::slice::from_raw_parts(start, width * 4)
+                };
+                let bgra = (0..height).flat_map(row).copied().collect();
+                context.Unmap(&staging, subresource);
                 Ok(Frame {
                     width,
                     height,
@@ -720,6 +726,7 @@ mod readback {
 
 #[cfg(test)]
 mod tests {
+    use windows::Win32::Foundation::DCOMPOSITION_ERROR_WINDOW_ALREADY_COMPOSED;
     use windows::Win32::UI::WindowsAndMessaging::{
         CreateWindowExW, DestroyWindow, WS_EX_NOREDIRECTIONBITMAP, WS_POPUP,
     };
@@ -859,17 +866,17 @@ mod tests {
     }
 
     #[test]
-    fn redrawing_does_not_wait_for_the_display() {
+    fn the_picture_is_composed_above_the_window_content() {
         on_hidden_desktop(|| {
             let canvas = Canvas::new();
-            let mut renderer = Renderer::new(canvas.0, 720, 64, 96).expect("a renderer");
-            let start = std::time::Instant::now();
-            for _ in 0..120 {
-                renderer.draw(&Scene::bar("notepad")).expect("draw");
-            }
-            // Paced by a 240 Hz display, 120 frames take half a second.
-            let spent = start.elapsed();
-            assert!(spent.as_millis() < 250, "120 redraws took {spent:?}");
+            let _renderer = Renderer::new(canvas.0, 720, 64, 96).expect("a renderer");
+            // A window has one topmost composition target; the renderer's
+            // should be it, so a second one is refused.
+            let device: IDCompositionDevice =
+                unsafe { DCompositionCreateDevice(None) }.expect("a composition device");
+            let second = unsafe { device.CreateTargetForHwnd(canvas.0, true) };
+            let refused = second.expect_err("the topmost target is taken");
+            assert_eq!(refused.code(), DCOMPOSITION_ERROR_WINDOW_ALREADY_COMPOSED);
         });
     }
 
