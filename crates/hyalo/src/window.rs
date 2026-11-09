@@ -222,8 +222,9 @@ impl App {
 fn hand_over(sender: &Sender<Found>, window: isize, found: Found) {
     let _ = sender.send(found);
     let hwnd = HWND(window as *mut _);
+    // WM_FOUND carries nothing: the piece went through the channel.
     // Posting to a window that is already gone fails, and nothing waits.
-    let _ = unsafe { PostMessageW(Some(hwnd), WM_FOUND, WPARAM(0), LPARAM(0)) };
+    let _ = unsafe { PostMessageW(Some(hwnd), WM_FOUND, WPARAM::default(), LPARAM::default()) };
 }
 
 /// What the window shows: the query and a row per result.
