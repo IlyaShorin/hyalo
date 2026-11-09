@@ -6,14 +6,17 @@
 //! of it has been typed.
 //!
 //! The clock is a parameter: callers pass `now`, tests pass any time.
-//! The data is plain maps, vectors and numbers, so it serializes as is.
+//! The picks are saved as small versioned JSON; the launcher writes it to
+//! disk after every pick.
 
 use crate::item::ItemId;
 use crate::matcher;
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 /// Unix time in whole seconds.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(transparent)]
 pub struct Timestamp(pub u64);
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -22,7 +25,7 @@ pub struct Frecency {
 }
 
 /// The picks of one item for one query.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 struct Pick {
     /// Folded, never empty.
     query: String,
@@ -75,6 +78,70 @@ impl Pick {
         let age = now.0.saturating_sub(self.at.0) as f64;
         self.weight * 0.5_f64.powf(age / HALF_LIFE)
     }
+
+    /// Whether `record` could have made this pick.
+    fn is_sound(&self) -> bool {
+        !self.query.is_empty() && self.query == folded(&self.query) && self.weight > 0.0
+    }
+}
+
+/// The saved format. A change to its shape gets a new number.
+const VERSION: u32 = 1;
+
+/// What is saved: the picks, under the format's version.
+#[derive(Serialize, Deserialize)]
+struct Saved<Picks> {
+    version: u32,
+    picks: Picks,
+}
+
+/// Why saved picks could not be read.
+#[derive(Debug)]
+pub enum LoadError {
+    /// Not JSON, or not the shape this version saves.
+    Json(serde_json::Error),
+    /// Saved by a version of hyalo with another format.
+    Version(u32),
+    /// A pick `record` never makes: an empty or unfolded query, or a
+    /// weight that is not above zero. Only a hand edit leaves one.
+    Pick { id: ItemId, query: String },
+}
+
+impl Frecency {
+    /// The picks as JSON: one line, small enough to write on every pick.
+    pub fn to_json(&self) -> String {
+        let saved = Saved {
+            version: VERSION,
+            picks: &self.picks,
+        };
+        serde_json::to_string(&saved).expect("string keys and finite numbers always serialize")
+    }
+
+    /// Reads picks that `to_json` wrote. The version is checked first, so
+    /// a newer format is reported as such rather than as broken JSON.
+    pub fn from_json(json: &str) -> Result<Self, LoadError> {
+        let saved: Saved<serde_json::Value> =
+            serde_json::from_str(json).map_err(LoadError::Json)?;
+        if saved.version != VERSION {
+            return Err(LoadError::Version(saved.version));
+        }
+        let picks: BTreeMap<ItemId, Vec<Pick>> =
+            serde_json::from_value(saved.picks).map_err(LoadError::Json)?;
+        match unsound_pick(&picks) {
+            Some((id, pick)) => Err(LoadError::Pick {
+                id: id.clone(),
+                query: pick.query.clone(),
+            }),
+            None => Ok(Self { picks }),
+        }
+    }
+}
+
+fn unsound_pick(picks: &BTreeMap<ItemId, Vec<Pick>>) -> Option<(&ItemId, &Pick)> {
+    picks
+        .iter()
+        .flat_map(|(id, picks)| picks.iter().map(move |pick| (id, pick)))
+        .find(|(_, pick)| !pick.is_sound())
 }
 
 fn folded(query: &str) -> String {
@@ -178,5 +245,75 @@ mod tests {
     fn a_pick_with_an_empty_query_is_not_kept() {
         let frecency = picked(&[("", START)]);
         assert_eq!(frecency, Frecency::default());
+    }
+
+    #[test]
+    fn saves_as_small_versioned_json() {
+        assert_eq!(
+            picked(&[("code", START)]).to_json(),
+            r#"{"version":1,"picks":{"vscode":[{"query":"code","weight":1.0,"at":1700000000}]}}"#
+        );
+    }
+
+    #[test]
+    fn what_it_saves_loads_back_the_same() {
+        let frecency = picked(&[("code", START), ("co", days(3)), ("code", days(20))]);
+        let loaded = Frecency::from_json(&frecency.to_json()).expect("load");
+        assert_eq!(loaded, frecency);
+    }
+
+    fn saved_pick(query: &str, weight: &str) -> String {
+        format!(
+            r#"{{"version":1,"picks":{{"vscode":[{{"query":"{query}","weight":{weight},"at":1700000000}}]}}}}"#
+        )
+    }
+
+    #[test]
+    fn loads_a_pick_with_any_positive_weight() {
+        let frecency = Frecency::from_json(&saved_pick("code", "0.25")).expect("load");
+        assert_eq!(frecency.score(&code(), "code", START), 0.25);
+    }
+
+    #[test]
+    fn refuses_text_that_is_not_its_json() {
+        for text in [
+            "not json",
+            r#"{"version":1}"#,
+            r#"{"version":1,"picks":[]}"#,
+        ] {
+            let loaded = Frecency::from_json(text);
+            assert!(matches!(loaded, Err(LoadError::Json(_))), "{text}");
+        }
+    }
+
+    #[test]
+    fn refuses_another_version_whatever_its_picks_look_like() {
+        let json = r#"{"version":2,"picks":"a shape version 1 cannot read"}"#;
+        assert!(matches!(
+            Frecency::from_json(json),
+            Err(LoadError::Version(2))
+        ));
+    }
+
+    #[test]
+    fn refuses_a_pick_it_would_never_save() {
+        let broken = [
+            ("", "1.0"),
+            ("Code", "1.0"),
+            ("code", "0.0"),
+            ("code", "-1.0"),
+        ];
+        for (query, weight) in broken {
+            let loaded = Frecency::from_json(&saved_pick(query, weight));
+            assert!(
+                matches!(loaded, Err(LoadError::Pick { .. })),
+                "{query:?} {weight}"
+            );
+        }
+    }
+
+    #[test]
+    fn refuses_a_weight_too_large_for_a_number() {
+        assert!(Frecency::from_json(&saved_pick("code", "1e999")).is_err());
     }
 }

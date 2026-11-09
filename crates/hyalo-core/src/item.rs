@@ -3,6 +3,8 @@
 //! The UI calls these results; the type is `Item` so it does not clash with
 //! `std::result::Result`.
 
+use serde::{Deserialize, Serialize};
+
 /// One row in the results list.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Item {
@@ -19,7 +21,8 @@ pub struct Item {
 
 /// A stable key for an item: an app's AppUserModelID or shortcut path, a
 /// file's full path.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
 pub struct ItemId(pub String);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
