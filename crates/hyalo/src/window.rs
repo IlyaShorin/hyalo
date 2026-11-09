@@ -15,8 +15,7 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::{Instant, SystemTime};
 
 use hyalo_core::frecency::{Frecency, Timestamp};
-use hyalo_core::item::{Action, ItemId};
-use hyalo_core::rank::Ranked;
+use hyalo_core::item::{Action, ItemId, Kind};
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Dwm::{
     DWMSBT_TRANSIENTWINDOW, DWMWA_BORDER_COLOR, DWMWA_COLOR_NONE, DWMWA_SYSTEMBACKDROP_TYPE,
@@ -48,7 +47,7 @@ use crate::keys::{self, Command, Held};
 use crate::layout::{self, Rect};
 use crate::query::Query;
 use crate::render::{Renderer, Row, Scene};
-use crate::results::Results;
+use crate::results::{Listed, Results};
 use crate::{launch, store};
 
 const HOTKEY_TOGGLE: i32 = 1;
@@ -160,12 +159,16 @@ impl App {
     }
 
     /// Carries out the selected row's action and notes the pick, on disk
-    /// too when there is a picks file.
+    /// too when there is a picks file. A calculator answer is not noted:
+    /// it already comes first, and each sum would leave a pick behind.
     fn open_picked(&mut self, as_admin: bool) {
         let Some(row) = self.results.picked() else {
             return;
         };
         (self.services.run)(&row.item.action, as_admin);
+        if row.item.kind == Kind::Calculator {
+            return;
+        }
         self.frecency.record(&row.item.id, self.query.text(), now());
         if let Some(path) = &self.services.picks
             && let Err(error) = store::save(path, &self.frecency)
@@ -229,12 +232,12 @@ fn scene<'a>(
     results: &'a Results,
     icons: &'a HashMap<ItemId, Icon>,
 ) -> Scene<'a> {
-    let row = |ranked: &'a Ranked| Row {
-        id: &ranked.item.id,
-        title: &ranked.item.title,
-        subtitle: &ranked.item.subtitle,
-        highlights: utf16_ranges(&ranked.item.title, &ranked.found.positions),
-        icon: icons.get(&ranked.item.id),
+    let row = |listed: &'a Listed| Row {
+        id: &listed.item.id,
+        title: &listed.item.title,
+        subtitle: &listed.item.subtitle,
+        highlights: utf16_ranges(&listed.item.title, &listed.matched),
+        icon: icons.get(&listed.item.id),
     };
     Scene {
         query: query.text(),
@@ -1136,6 +1139,32 @@ mod tests {
             launcher.press(VK_RETURN);
             assert!(ran.borrow().is_empty());
             assert!(!launcher.visible());
+        });
+    }
+
+    #[test]
+    fn arithmetic_lists_its_answer_on_top_and_enter_copies_it() {
+        on_hidden_desktop(|| {
+            let (launcher, ran) = Launcher::listing_with(&["Notepad"], None);
+            launcher.type_text("2+2*2");
+            assert_eq!(launcher.rect(), launcher.placement().rect(1));
+            launcher.press(VK_RETURN);
+            let copy = Action::CopyText("6".to_string());
+            assert_eq!(*ran.borrow(), [(copy, false)]);
+            assert!(!launcher.visible());
+        });
+    }
+
+    #[test]
+    fn copying_an_answer_is_not_remembered_as_a_pick() {
+        let picks = PicksFile::new("answer");
+        let path = picks.0.clone();
+        on_hidden_desktop(move || {
+            let (launcher, ran) = Launcher::listing_with(&[], Some(path.clone()));
+            launcher.type_text("2+2");
+            launcher.press(VK_RETURN);
+            assert_eq!(ran.borrow().len(), 1, "the answer was copied");
+            assert!(!path.exists(), "no picks saved");
         });
     }
 

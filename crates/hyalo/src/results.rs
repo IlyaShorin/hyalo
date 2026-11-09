@@ -1,23 +1,33 @@
 //! The rows the window lists for a query, and which one Enter picks.
 
+use hyalo_core::calculator;
 use hyalo_core::frecency::{Frecency, Timestamp};
 use hyalo_core::item::Item;
-use hyalo_core::rank::{Ranked, rank};
+use hyalo_core::rank::rank;
 
 /// The most rows the window lists.
 pub const MAX_ROWS: usize = 8;
 
-/// The ranked rows for one query and the selected row.
+/// One row of the list: an item, and the letters of its title the query
+/// matched, as ascending `char` indices, to highlight.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Listed {
+    pub item: Item,
+    pub matched: Vec<usize>,
+}
+
+/// The rows for one query and the selected row.
 #[derive(Debug, Default)]
 pub struct Results {
-    rows: Vec<Ranked>,
+    rows: Vec<Listed>,
     /// Within `rows` whenever there are any.
     selected: usize,
 }
 
 impl Results {
-    /// The best `MAX_ROWS` items for `query`, the first one selected.
-    /// An empty query lists nothing: it would match everything equally.
+    /// The calculator's answer if the query is arithmetic, then the best
+    /// items for `query`: `MAX_ROWS` in all, the first one selected. An
+    /// empty query lists nothing: it would match everything equally.
     pub fn search<'a>(
         query: &str,
         items: impl IntoIterator<Item = &'a Item>,
@@ -27,12 +37,21 @@ impl Results {
         if query.is_empty() {
             return Self::default();
         }
-        let mut rows = rank(query, items, frecency, now);
-        rows.truncate(MAX_ROWS);
+        let answer = calculator::answer(query).map(|item| Listed {
+            item,
+            matched: Vec::new(),
+        });
+        let ranked = rank(query, items, frecency, now)
+            .into_iter()
+            .map(|ranked| Listed {
+                item: ranked.item,
+                matched: ranked.found.positions,
+            });
+        let rows = answer.into_iter().chain(ranked).take(MAX_ROWS).collect();
         Self { rows, selected: 0 }
     }
 
-    pub fn rows(&self) -> &[Ranked] {
+    pub fn rows(&self) -> &[Listed] {
         &self.rows
     }
 
@@ -41,7 +60,7 @@ impl Results {
     }
 
     /// The selected row: what Enter opens.
-    pub fn picked(&self) -> Option<&Ranked> {
+    pub fn picked(&self) -> Option<&Listed> {
         self.rows.get(self.selected)
     }
 
@@ -115,6 +134,28 @@ mod tests {
         let many: Vec<&str> = many.iter().map(String::as_str).collect();
         let results = search("app", &apps(&many));
         assert_eq!(titles(&results), &many[..MAX_ROWS]);
+    }
+
+    #[test]
+    fn an_arithmetic_query_lists_its_answer_first() {
+        let results = search("2+2", &apps(&["2+2 Notes", "Paint"]));
+        assert_eq!(titles(&results), ["4", "2+2 Notes"]);
+        assert_eq!(picked(&results), Some("4"));
+    }
+
+    #[test]
+    fn the_answer_takes_one_of_the_eight_rows() {
+        let many: Vec<String> = (1..=10).map(|n| format!("1+1 App {n:02}")).collect();
+        let many: Vec<&str> = many.iter().map(String::as_str).collect();
+        let results = search("1+1", &apps(&many));
+        assert_eq!(titles(&results)[0], "2");
+        assert_eq!(titles(&results)[1..], many[..MAX_ROWS - 1]);
+    }
+
+    #[test]
+    fn a_row_carries_the_letters_its_title_matched() {
+        let results = search("vsc", &apps(&["Visual Studio Code"]));
+        assert_eq!(results.rows()[0].matched, [0, 7, 14]);
     }
 
     #[test]

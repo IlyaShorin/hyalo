@@ -866,6 +866,26 @@ mod tests {
     }
 
     #[test]
+    fn an_answer_row_with_grouped_digits_at_100_percent() {
+        on_hidden_desktop(|| {
+            let id = ItemId("hyalo:calculator".to_string());
+            let scene = Scene {
+                query: "1234567+0,5",
+                rows: vec![Row {
+                    id: &id,
+                    title: "1\u{A0}234\u{A0}567,5",
+                    subtitle: "Calculator · Enter to copy",
+                    highlights: Vec::new(),
+                    icon: None,
+                }],
+                selected: 0,
+            };
+            let frame = drawn(&scene, (720, 128), 96);
+            assert_looks_like("answer-100", &frame);
+        });
+    }
+
+    #[test]
     fn the_picture_is_composed_above_the_window_content() {
         on_hidden_desktop(|| {
             let canvas = Canvas::new();
