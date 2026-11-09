@@ -84,43 +84,65 @@ pub fn provider(writer: Writer, roots: Roots, snapshot: Option<PathBuf>) -> Prov
     })
 }
 
-/// Loads the snapshot into an empty index, then asks for the roots and
-/// walks them.
+/// Loads the snapshot into an empty index, then asks for the roots,
+/// walks them and saves the snapshot.
 fn refresh(
     shared: &RwLock<Index>,
     roots: &dyn Fn() -> Vec<PathBuf>,
     snapshot: Option<&Path>,
     report: &dyn Fn(Found),
 ) {
-    if read(shared).is_empty()
-        && let Some(index) = snapshot.and_then(load)
-    {
-        *write(shared) = index;
-        report(Found::Files);
+    if read(shared).is_empty() {
+        load_into(shared, snapshot, report);
     }
-    let roots = roots();
-    let started = Instant::now();
-    let empty = read(shared).is_empty();
-    if empty {
-        walk_all(&roots, shared, &|| report(Found::Files));
-    } else {
-        let fresh = RwLock::default();
-        walk_all(&roots, &fresh, &|| {});
-        *write(shared) = fresh.into_inner().unwrap_or_else(PoisonError::into_inner);
-    }
-    report(Found::Files);
+    walk_into(shared, &roots(), report);
     let index = read(shared);
-    let mebibytes = index.memory() >> 20;
-    let took = started.elapsed();
-    eprintln!(
-        "hyalo: {} files and folders, {mebibytes} MiB, walked in {took:.1?}",
-        index.len()
-    );
     if let Some(path) = snapshot
         && let Err(error) = save(&index, path)
     {
         eprintln!("hyalo: cannot save {}: {error}", path.display());
     }
+}
+
+/// Puts the index saved at `snapshot` in place of the empty one, if it
+/// can be read.
+fn load_into(shared: &RwLock<Index>, snapshot: Option<&Path>, report: &dyn Fn(Found)) {
+    let started = Instant::now();
+    let Some(index) = snapshot.and_then(load) else {
+        return;
+    };
+    let took = started.elapsed();
+    eprintln!(
+        "hyalo: {} files and folders from the snapshot in {took:.1?}",
+        index.len()
+    );
+    *write(shared) = index;
+    report(Found::Files);
+}
+
+/// Walks the roots: straight into an empty index, so files turn up as
+/// they are found, or into a fresh one swapped in whole. Either way gives
+/// back the room kept for growth.
+fn walk_into(shared: &RwLock<Index>, roots: &[PathBuf], report: &dyn Fn(Found)) {
+    let started = Instant::now();
+    let empty = read(shared).is_empty();
+    if empty {
+        walk_all(roots, shared, &|| report(Found::Files));
+        write(shared).shrink_to_fit();
+    } else {
+        let fresh = RwLock::default();
+        walk_all(roots, &fresh, &|| {});
+        let mut fresh = fresh.into_inner().unwrap_or_else(PoisonError::into_inner);
+        fresh.shrink_to_fit();
+        *write(shared) = fresh;
+    }
+    report(Found::Files);
+    let index = read(shared);
+    let (mebibytes, took) = (index.memory() >> 20, started.elapsed());
+    eprintln!(
+        "hyalo: {} files and folders, {mebibytes} MiB, walked in {took:.1?}",
+        index.len()
+    );
 }
 
 /// `%LOCALAPPDATA%\hyalo\files.idx`: local, since it describes this
@@ -415,6 +437,30 @@ mod tests {
         let (provider, files) = walking(&folder, None);
         assert!(run(&provider) >= 1);
         assert_eq!(search(&files, "report"), [folder.path("report.pdf")]);
+    }
+
+    /// The memory `files` takes, and what the same index takes loaded
+    /// from its snapshot, which sizes every part exactly.
+    fn memory(files: &Files) -> (usize, usize) {
+        let index = read(&files.0);
+        let mut bytes = Vec::new();
+        index.save(&mut bytes).expect("save to memory");
+        let loaded = Index::load(&mut bytes.as_slice()).expect("load");
+        (index.memory(), loaded.memory())
+    }
+
+    #[test]
+    fn a_walk_keeps_no_room_for_growth() {
+        let names: Vec<String> = (0..300).map(|n| format!("file {n}.txt")).collect();
+        let names: Vec<&str> = names.iter().map(String::as_str).collect();
+        let folder = Scratch::new("shrink").with(&names);
+        let (provider, files) = walking(&folder, None);
+        run(&provider);
+        let (walked, exact) = memory(&files);
+        assert_eq!(walked, exact, "the first walk");
+        run(&provider);
+        let (walked, exact) = memory(&files);
+        assert_eq!(walked, exact, "a walk into a fresh index");
     }
 
     #[test]

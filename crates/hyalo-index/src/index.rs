@@ -186,6 +186,15 @@ impl Index {
         Some(Item::file(self.path(id)?, self.is_folder(id)?))
     }
 
+    /// Gives back the room kept for growth: after a walk, the arenas can
+    /// hold up to twice what they use.
+    pub fn shrink_to_fit(&mut self) {
+        self.entries.shrink_to_fit();
+        self.names.shrink_to_fit();
+        self.folded.shrink_to_fit();
+        self.free.shrink_to_fit();
+    }
+
     /// The bytes it holds on the heap.
     pub fn memory(&self) -> usize {
         self.entries.capacity() * size_of::<Entry>()
@@ -637,5 +646,19 @@ mod tests {
         index.add(d, "abc", false).unwrap();
         // Two entries, and "D:" and "abc" twice each, at least.
         assert!(index.memory() >= empty + 2 * 16 + 2 * 5);
+    }
+
+    #[test]
+    fn shrinking_gives_back_the_room_kept_for_growth() {
+        let (mut index, [_, _, _, notes, ..]) = drive();
+        index.remove(notes).unwrap();
+        index.shrink_to_fit();
+        // Six entries; C:, Users, Me, notes.txt, Windows, System32 twice;
+        // one free place.
+        assert_eq!(index.memory(), 6 * 16 + 2 * 33 + 4);
+        assert_eq!(
+            index.path(EntryId(5)).as_deref(),
+            Some(r"C:\Windows\System32")
+        );
     }
 }
