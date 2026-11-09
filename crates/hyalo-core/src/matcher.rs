@@ -2,8 +2,10 @@
 //!
 //! Strongest first: the whole name, the start of the name, the start of a
 //! later word, the starts of several words (an acronym), anywhere inside.
-//! Letters compare case-insensitively, Cyrillic included.
+//! Letters compare case-insensitively, Cyrillic included. A query typed in
+//! the wrong keyboard layout matches too, a little weaker.
 
+use crate::keyboard;
 use std::collections::HashSet;
 use std::ops::Range;
 
@@ -30,9 +32,22 @@ impl Strength {
     }
 }
 
+/// Which keyboard layout the query matched in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Layout {
+    AsTyped,
+    /// Read as the same keys in the other layout: "мысщву" as "vscode".
+    Swapped,
+}
+
+/// Points a match in the swapped layout loses: a quarter of a tier, so it
+/// stays above the next weaker kind of match typed correctly.
+const WRONG_LAYOUT: f64 = 5.0;
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Match {
     pub strength: Strength,
+    pub layout: Layout,
     /// Indices of the matched characters (`char`s, not bytes) in the name,
     /// ascending, for highlighting.
     pub positions: Vec<usize>,
@@ -41,21 +56,43 @@ pub struct Match {
 impl Match {
     /// How good the match is; more is better.
     pub fn points(&self) -> f64 {
-        self.strength.points()
+        let penalty = match self.layout {
+            Layout::AsTyped => 0.0,
+            Layout::Swapped => WRONG_LAYOUT,
+        };
+        self.strength.points() - penalty
     }
 }
 
-/// Matches `query` against `name`; `None` when it does not match at all.
+/// Matches `query` against `name`, as typed and as if typed in the other
+/// keyboard layout, and keeps the better; `None` when neither matches.
 pub fn find(query: &str, name: &str) -> Option<Match> {
-    let query: Vec<char> = query.chars().map(fold).collect();
     let letters: Vec<char> = name.chars().collect();
     let folded: Vec<char> = letters.iter().copied().map(fold).collect();
     let words = words(&letters);
-    let found_at = |start: &usize| folded[*start..].starts_with(&query);
-    let run = |strength, start: usize| Match {
-        strength,
-        positions: (start..start + query.len()).collect(),
-    };
+    let typed: Vec<char> = query.chars().map(fold).collect();
+    let swapped: Vec<char> = typed.iter().copied().map(keyboard::swap).collect();
+    [(Layout::AsTyped, typed), (Layout::Swapped, swapped)]
+        .into_iter()
+        .filter_map(|(layout, query)| {
+            let (strength, positions) = classify(&query, &folded, &words)?;
+            Some(Match {
+                strength,
+                layout,
+                positions,
+            })
+        })
+        .max_by(|one, other| one.points().total_cmp(&other.points()))
+}
+
+/// The strongest way a folded query matches a folded name, and where.
+fn classify(
+    query: &[char],
+    folded: &[char],
+    words: &[Range<usize>],
+) -> Option<(Strength, Vec<usize>)> {
+    let found_at = |start: &usize| folded[*start..].starts_with(query);
+    let run = |strength, start: usize| (strength, (start..start + query.len()).collect());
     if found_at(&0) {
         let strength = match query.len() == folded.len() {
             true => Strength::Exact,
@@ -67,24 +104,25 @@ pub fn find(query: &str, name: &str) -> Option<Match> {
     word_starts
         .find(&found_at)
         .map(|start| run(Strength::WordStart, start))
-        .or_else(|| acronym(&query, &folded, &words))
+        .or_else(|| acronym(query, folded, words))
         .or_else(|| {
             let start = (0..folded.len()).find(&found_at)?;
             Some(run(Strength::Substring, start))
         })
 }
 
-fn acronym(query: &[char], folded: &[char], words: &[Range<usize>]) -> Option<Match> {
+fn acronym(
+    query: &[char],
+    folded: &[char],
+    words: &[Range<usize>],
+) -> Option<(Strength, Vec<usize>)> {
     let mut search = Acronym {
         query,
         folded,
         words,
         tried: HashSet::new(),
     };
-    Some(Match {
-        strength: Strength::Acronym,
-        positions: search.positions(0, 0)?,
-    })
+    Some((Strength::Acronym, search.positions(0, 0)?))
 }
 
 /// Lowercases one `char` into one `char`, so positions in folded text are
@@ -318,5 +356,28 @@ mod tests {
             ladder.is_sorted_by(|stronger, weaker| stronger > weaker),
             "{ladder:?}"
         );
+    }
+
+    #[test]
+    fn a_query_typed_in_the_wrong_layout_still_matches() {
+        let found = find("мысщву", "Visual Studio Code").unwrap();
+        assert_eq!(found.strength, Strength::Acronym);
+        assert_eq!(found.layout, Layout::Swapped);
+        assert_eq!(found.positions, [0, 7, 14, 15, 16, 17]);
+        assert_eq!(strength("ЗЩЦУКЫРУДД", "PowerShell"), Some(Strength::Exact));
+        assert_eq!(strength(",kjryjn", "Блокнот"), Some(Strength::Exact));
+    }
+
+    #[test]
+    fn the_wrong_layout_scores_a_little_below_the_right_one() {
+        let points = |query, name| find(query, name).map(|found| found.points());
+        assert!(points("мысщву", "vscode") < points("vscode", "vscode"));
+        assert!(points("мысщву", "vscode") > points("vsc", "vscode"));
+    }
+
+    #[test]
+    fn a_query_that_reads_the_same_in_both_layouts_counts_as_typed() {
+        let found = find("7", "7-Zip").unwrap();
+        assert_eq!(found.layout, Layout::AsTyped);
     }
 }
