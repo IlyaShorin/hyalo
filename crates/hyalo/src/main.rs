@@ -1,28 +1,14 @@
 // Release builds have no console window; debug builds keep one for logs.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "listed once the window shows results")
-)]
 mod apps;
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "joined once the window lists apps")
-)]
+mod catalog;
 mod com;
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "drawn once the window lists results")
-)]
 mod highlight;
+mod keys;
 mod layout;
 mod query;
 mod render;
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "listed once the window shows results")
-)]
 mod results;
 #[cfg_attr(not(test), expect(dead_code, reason = "used once Enter records picks"))]
 mod store;

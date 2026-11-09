@@ -50,6 +50,20 @@ pub fn row_top(index: usize) -> f32 {
     BAR_HEIGHT + LIST_PADDING + index as f32 * ROW_HEIGHT
 }
 
+/// The side of a row's icon, in DIPs.
+pub const ICON_SIZE: f32 = 32.0;
+
+/// Pixels per DIP on a monitor with `dpi` dots per inch.
+pub fn scale(dpi: u32) -> f32 {
+    dpi as f32 / 96.0
+}
+
+/// The side of a row's icon in pixels at `dpi`, the size to ask the shell
+/// for so icons are drawn without scaling.
+pub fn icon_pixels(dpi: u32) -> u32 {
+    (ICON_SIZE * scale(dpi)).round() as u32
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -125,6 +139,19 @@ mod tests {
     fn rows_start_below_the_bar_and_its_padding() {
         assert_eq!(row_top(0), 72.0);
         assert_eq!(row_top(2), 168.0);
+    }
+
+    #[test]
+    fn the_scale_is_the_dpi_over_96() {
+        assert_eq!(scale(96), 1.0);
+        assert_eq!(scale(144), 1.5);
+    }
+
+    #[test]
+    fn row_icons_are_32_dips_in_whole_pixels() {
+        assert_eq!(icon_pixels(96), 32);
+        assert_eq!(icon_pixels(120), 40);
+        assert_eq!(icon_pixels(168), 56);
     }
 
     #[test]

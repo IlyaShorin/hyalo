@@ -59,7 +59,7 @@ use windows::core::{Interface, PCWSTR, Result, w};
 use windows_numerics::Vector2;
 
 use crate::apps::Icon;
-use crate::layout::{BAR_HEIGHT, ROW_HEIGHT, row_top};
+use crate::layout::{BAR_HEIGHT, ICON_SIZE, ROW_HEIGHT, row_top, scale};
 
 /// What to draw.
 pub struct Scene<'a> {
@@ -91,9 +91,8 @@ const CORNER_RADIUS: f32 = 8.0;
 const TEXT_LEFT: f32 = 56.0;
 const TEXT_RIGHT_PAD: f32 = 20.0;
 const ICON_CENTER_X: f32 = 30.0;
-/// A row's icon: its left edge and its side.
-const ROW_ICON_LEFT: f32 = 12.0;
-const ROW_ICON_SIZE: f32 = 32.0;
+/// The left edge of a row's icon.
+const ICON_LEFT: f32 = 12.0;
 /// The title line and the subtitle line: top edge in the row, height.
 const TITLE_LINE: (f32, f32) = (4.0, 22.0);
 const SUBTITLE_LINE: (f32, f32) = (25.0, 18.0);
@@ -207,7 +206,7 @@ impl Renderer {
     }
 
     fn draw_scene(&mut self, scene: &Scene) -> Result<()> {
-        let scale = self.dpi as f32 / 96.0;
+        let scale = scale(self.dpi);
         let (w, h) = (self.width as f32 / scale, self.height as f32 / scale);
         self.draw_glass(w, h)?;
         self.draw_search_icon()?;
@@ -392,12 +391,12 @@ impl Renderer {
     /// The icon, centred in the row's height.
     fn draw_icon(&mut self, id: &ItemId, icon: &Icon, top: f32) -> Result<()> {
         let bitmap = self.icon_bitmap(id, icon)?;
-        let y = top + (ROW_HEIGHT - ROW_ICON_SIZE) / 2.0;
+        let y = top + (ROW_HEIGHT - ICON_SIZE) / 2.0;
         let place = D2D_RECT_F {
-            left: ROW_ICON_LEFT,
+            left: ICON_LEFT,
             top: y,
-            right: ROW_ICON_LEFT + ROW_ICON_SIZE,
-            bottom: y + ROW_ICON_SIZE,
+            right: ICON_LEFT + ICON_SIZE,
+            bottom: y + ICON_SIZE,
         };
         let smooth = D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC;
         unsafe {

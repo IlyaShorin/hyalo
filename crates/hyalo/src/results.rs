@@ -41,6 +41,7 @@ impl Results {
     }
 
     /// The selected row: what Enter opens.
+    #[cfg_attr(not(test), expect(dead_code, reason = "opened once Enter opens items"))]
     pub fn picked(&self) -> Option<&Ranked> {
         self.rows.get(self.selected)
     }

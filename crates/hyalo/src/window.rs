@@ -1,11 +1,20 @@
 //! The launcher window: a borderless popup over a DWM Acrylic backdrop.
-//! A global hotkey toggles it; Esc, Enter or losing focus hides it.
+//! A global hotkey toggles it. Typing lists the matching items under the
+//! bar, the arrows move the selection, and Esc, Enter or losing focus
+//! hides it.
 //!
 //! The `windows` crate marks Win32 calls `unsafe`. The invariant they rely
 //! on: `hwnd` is the live launcher window, owned by the UI thread.
 
 use std::cell::RefCell;
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::sync::mpsc::{Receiver, Sender, channel};
+use std::time::{Instant, SystemTime};
 
+use hyalo_core::frecency::{Frecency, Timestamp};
+use hyalo_core::item::ItemId;
+use hyalo_core::rank::Ranked;
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Dwm::{
     DWMSBT_TRANSIENTWINDOW, DWMWA_BORDER_COLOR, DWMWA_COLOR_NONE, DWMWA_SYSTEMBACKDROP_TYPE,
@@ -18,75 +27,207 @@ use windows::Win32::Graphics::Gdi::{
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    MOD_ALT, MOD_NOREPEAT, RegisterHotKey, VIRTUAL_KEY, VK_ESCAPE, VK_RETURN, VK_SPACE,
+    GetKeyState, MOD_ALT, MOD_NOREPEAT, RegisterHotKey, VIRTUAL_KEY, VK_CONTROL, VK_SHIFT, VK_SPACE,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DispatchMessageW, GetCursorPos, GetMessageW, HTCLIENT,
-    HWND_TOPMOST, IDC_ARROW, IsWindowVisible, LoadCursorW, MSG, PostQuitMessage, RegisterClassExW,
-    SW_HIDE, SW_SHOW, SWP_NOACTIVATE, SetForegroundWindow, SetWindowPos, ShowWindow,
-    TranslateMessage, WA_INACTIVE, WM_ACTIVATE, WM_CHAR, WM_DESTROY, WM_HOTKEY, WM_KEYDOWN,
-    WM_NCCALCSIZE, WM_NCHITTEST, WNDCLASSEXW, WS_CAPTION, WS_EX_NOREDIRECTIONBITMAP,
-    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_THICKFRAME,
+    CW_USEDEFAULT, CreateWindowExW, DefWindowProcW, DispatchMessageW, GetCursorPos, GetMessageW,
+    HTCLIENT, HWND_TOPMOST, IDC_ARROW, IsWindowVisible, LoadCursorW, MSG, PostMessageW,
+    PostQuitMessage, RegisterClassExW, SW_HIDE, SW_SHOW, SWP_NOACTIVATE, SetForegroundWindow,
+    SetWindowPos, ShowWindow, TranslateMessage, WA_INACTIVE, WM_ACTIVATE, WM_APP, WM_CHAR,
+    WM_DESTROY, WM_HOTKEY, WM_KEYDOWN, WM_NCCALCSIZE, WM_NCHITTEST, WNDCLASSEXW, WS_CAPTION,
+    WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_THICKFRAME,
 };
 use windows::core::{BOOL, PCWSTR, Result, w};
 
+use crate::apps::Icon;
+use crate::catalog::{self, Catalog, Finder, Found, Request};
+use crate::highlight::utf16_ranges;
+use crate::keys::{self, Command, Held};
 use crate::layout::{self, Rect};
 use crate::query::Query;
-use crate::render::{Renderer, Scene};
+use crate::render::{Renderer, Row, Scene};
+use crate::results::Results;
 
 const HOTKEY_TOGGLE: i32 = 1;
+
+/// Posted by the finder's thread each time it hands over a piece.
+const WM_FOUND: u32 = WM_APP + 1;
+
+/// Where the launcher shows: its monitor's work area and DPI.
+#[derive(Debug, Clone, Copy)]
+struct Placement {
+    work_area: Rect,
+    dpi: u32,
+}
+
+impl Placement {
+    /// The launcher's rectangle with `rows` results listed.
+    fn rect(self, rows: usize) -> Rect {
+        layout::launcher_rect(self.work_area, layout::scale(self.dpi), rows)
+    }
+}
 
 struct App {
     hwnd: HWND,
     query: Query,
     renderer: Option<Renderer>,
+    placement: Placement,
+    catalog: Catalog,
+    results: Results,
+    frecency: Frecency,
+    finder: Finder,
+    /// When the finder last started; `None` before it ever did.
+    found_at: Option<Instant>,
+    /// The finder's thread sends here and posts WM_FOUND.
+    found: (Sender<Found>, Receiver<Found>),
 }
 
 impl App {
-    fn present(&mut self, rect: Rect, dpi: u32) -> Result<()> {
+    /// Sizes the window for the rows it lists and draws it.
+    fn present(&mut self) -> Result<()> {
+        let rect = self.placement.rect(self.results.rows().len());
         let (width, height) = (rect.width as u32, rect.height as u32);
+        let dpi = self.placement.dpi;
         match &mut self.renderer {
             Some(renderer) => renderer.resize(width, height, dpi)?,
             None => self.renderer = Some(Renderer::new(self.hwnd, width, height, dpi)?),
         }
-        self.redraw()
+        self.redraw()?;
+        // The picture first, then the window: growing, it never shows
+        // glass without the picture for a frame.
+        unsafe {
+            SetWindowPos(
+                self.hwnd,
+                Some(HWND_TOPMOST),
+                rect.x,
+                rect.y,
+                rect.width,
+                rect.height,
+                SWP_NOACTIVATE,
+            )
+        }
     }
 
     fn redraw(&mut self) -> Result<()> {
-        let scene = Scene {
-            query: self.query.text(),
-            rows: Vec::new(),
-            selected: 0,
-        };
+        let scene = scene(&self.query, &self.results, &self.catalog.icons);
         self.renderer
             .as_mut()
             .map_or(Ok(()), |renderer| renderer.draw(&scene))
     }
+
+    /// Moves the selection with `step` and shows where it went.
+    fn move_selection(&mut self, step: fn(&mut Results)) -> Result<()> {
+        step(&mut self.results);
+        self.redraw()
+    }
+
+    /// Lists what the query finds, best first, the first row selected.
+    fn search(&mut self) {
+        let items = &self.catalog.items;
+        self.results = Results::search(self.query.text(), items, &self.frecency, now());
+    }
+
+    /// Starts the finder on a thread of its own, unless the list it
+    /// last found is still fresh.
+    fn find_if_stale(&mut self) {
+        let now = Instant::now();
+        if !catalog::stale(self.found_at, now) {
+            return;
+        }
+        self.found_at = Some(now);
+        let request = Request {
+            icon_size: layout::icon_pixels(self.placement.dpi),
+            known: self.catalog.icons.keys().cloned().collect(),
+        };
+        let (finder, sender) = (self.finder.clone(), self.found.0.clone());
+        let window = self.hwnd.0 as isize;
+        std::thread::spawn(move || finder(&request, &|found| hand_over(&sender, window, found)));
+    }
+
+    /// Takes in what the finder handed over, searches again if the items
+    /// changed, and shows the result if the window is up.
+    fn take_found(&mut self) -> Result<()> {
+        let mut changed = false;
+        while let Ok(found) = self.found.1.try_recv() {
+            changed |= self.catalog.take(found);
+        }
+        if changed {
+            self.search();
+        }
+        match unsafe { IsWindowVisible(self.hwnd) }.as_bool() {
+            true => self.present(),
+            false => Ok(()),
+        }
+    }
+}
+
+/// Sends a piece to the window and wakes it up. The window travels as a
+/// number: a window handle may not cross threads.
+fn hand_over(sender: &Sender<Found>, window: isize, found: Found) {
+    let _ = sender.send(found);
+    let hwnd = HWND(window as *mut _);
+    // Posting to a window that is already gone fails, and nothing waits.
+    let _ = unsafe { PostMessageW(Some(hwnd), WM_FOUND, WPARAM(0), LPARAM(0)) };
+}
+
+/// What the window shows: the query and a row per result.
+fn scene<'a>(
+    query: &'a Query,
+    results: &'a Results,
+    icons: &'a HashMap<ItemId, Icon>,
+) -> Scene<'a> {
+    let row = |ranked: &'a Ranked| Row {
+        id: &ranked.item.id,
+        title: &ranked.item.title,
+        subtitle: &ranked.item.subtitle,
+        highlights: utf16_ranges(&ranked.item.title, &ranked.found.positions),
+        icon: icons.get(&ranked.item.id),
+    };
+    Scene {
+        query: query.text(),
+        rows: results.rows().iter().map(row).collect(),
+        selected: results.selected(),
+    }
+}
+
+/// The time frecency counts in.
+fn now() -> Timestamp {
+    let since_1970 = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH);
+    Timestamp(since_1970.unwrap_or_default().as_secs())
 }
 
 thread_local! {
     static APP: RefCell<Option<App>> = const { RefCell::new(None) };
 }
 
-/// Opens the launcher, binds the hotkey and runs until the window closes.
+/// Opens the launcher, listing the apps, and runs until the window closes.
 pub fn run() -> Result<()> {
-    let hwnd = open()?;
-    register_hotkey(hwnd);
+    open(Arc::new(catalog::find_apps))?;
     message_loop();
     Ok(())
 }
 
-/// Creates the launcher window on this thread and shows it.
-fn open() -> Result<HWND> {
+/// Creates the launcher window on this thread, binds the hotkey and shows
+/// the window; `finder` lists what it searches.
+fn open(finder: Finder) -> Result<HWND> {
     let hwnd = create_window()?;
+    let placement = placement_under_cursor()?;
     APP.with_borrow_mut(|app| {
         *app = Some(App {
             hwnd,
             query: Query::default(),
             renderer: None,
+            placement,
+            catalog: Catalog::default(),
+            results: Results::default(),
+            frecency: Frecency::default(),
+            finder,
+            found_at: None,
+            found: channel(),
         })
     });
     style_window(hwnd)?;
+    register_hotkey(hwnd);
     show(hwnd)?;
     Ok(hwnd)
 }
@@ -122,10 +263,11 @@ fn create_window() -> Result<HWND> {
             WINDOW_CLASS,
             w!("hyalo"),
             WS_POPUP | WS_THICKFRAME | WS_CAPTION,
-            0,
-            0,
-            0,
-            0,
+            // show() places and sizes the window.
+            CW_USEDEFAULT,
+            CW_USEDEFAULT,
+            CW_USEDEFAULT,
+            CW_USEDEFAULT,
             None,
             None,
             Some(instance),
@@ -180,23 +322,32 @@ extern "system" fn wndproc(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPA
         WM_NCCALCSIZE if wparam.0 != 0 => LRESULT(0),
         // No resize edges.
         WM_NCHITTEST => LRESULT(HTCLIENT as isize),
-        WM_HOTKEY => handled(toggle(hwnd)),
-        WM_ACTIVATE if (wparam.0 & 0xFFFF) as u32 == WA_INACTIVE => {
-            hide(hwnd);
-            handled(Ok(()))
-        }
-        WM_KEYDOWN => {
-            on_key(hwnd, VIRTUAL_KEY(wparam.0 as u16));
-            handled(Ok(()))
-        }
-        WM_CHAR => handled(on_char(wparam.0 as u16)),
         // No WM_PAINT: the picture lives in the DirectComposition swap chain
         // and survives without one; DefWindowProc validates the window.
         WM_DESTROY => {
             unsafe { PostQuitMessage(0) };
             handled(Ok(()))
         }
-        _ => unsafe { DefWindowProcW(hwnd, message, wparam, lparam) },
+        _ => match on_message(hwnd, message, wparam) {
+            Some(result) => handled(result),
+            None => unsafe { DefWindowProcW(hwnd, message, wparam, lparam) },
+        },
+    }
+}
+
+/// What the launcher does with a message; `None` for messages it leaves
+/// to Windows.
+fn on_message(hwnd: HWND, message: u32, wparam: WPARAM) -> Option<Result<()>> {
+    match message {
+        WM_HOTKEY => Some(toggle(hwnd)),
+        WM_ACTIVATE if (wparam.0 & 0xFFFF) as u32 == WA_INACTIVE => {
+            hide(hwnd);
+            Some(Ok(()))
+        }
+        WM_KEYDOWN => Some(on_key(hwnd, VIRTUAL_KEY(wparam.0 as u16))),
+        WM_CHAR => Some(on_char(wparam.0 as u16)),
+        WM_FOUND => Some(with_app(App::take_found).unwrap_or(Ok(()))),
+        _ => None,
     }
 }
 
@@ -218,19 +369,13 @@ fn toggle(hwnd: HWND) -> Result<()> {
 }
 
 fn show(hwnd: HWND) -> Result<()> {
-    let (rect, dpi) = placement_under_cursor()?;
-    unsafe {
-        SetWindowPos(
-            hwnd,
-            Some(HWND_TOPMOST),
-            rect.x,
-            rect.y,
-            rect.width,
-            rect.height,
-            SWP_NOACTIVATE,
-        )?;
-    }
-    with_app(|app| app.present(rect, dpi)).unwrap_or(Ok(()))?;
+    let placement = placement_under_cursor()?;
+    with_app(|app| {
+        app.placement = placement;
+        app.find_if_stale();
+        app.present()
+    })
+    .unwrap_or(Ok(()))?;
     unsafe {
         let _ = ShowWindow(hwnd, SW_SHOW);
         let _ = SetForegroundWindow(hwnd);
@@ -238,33 +383,56 @@ fn show(hwnd: HWND) -> Result<()> {
     Ok(())
 }
 
+/// Hides the window and forgets the query and its results.
 fn hide(hwnd: HWND) {
     unsafe {
         let _ = ShowWindow(hwnd, SW_HIDE);
     }
-    with_app(|app| app.query.clear());
+    with_app(|app| {
+        app.query.clear();
+        app.results = Results::default();
+    });
 }
 
-fn on_key(hwnd: HWND, key: VIRTUAL_KEY) {
-    if matches!(key, VK_ESCAPE | VK_RETURN) {
-        hide(hwnd);
+fn on_key(hwnd: HWND, key: VIRTUAL_KEY) -> Result<()> {
+    let moved = match keys::command(key, held()) {
+        Some(Command::Up) => with_app(|app| app.move_selection(Results::up)),
+        Some(Command::Down) => with_app(|app| app.move_selection(Results::down)),
+        Some(Command::Hide | Command::Open { .. }) => {
+            hide(hwnd);
+            None
+        }
+        None => None,
+    };
+    moved.unwrap_or(Ok(()))
+}
+
+/// Which modifiers are down, as of the key message being handled.
+fn held() -> Held {
+    let down = |key: VIRTUAL_KEY| unsafe { GetKeyState(i32::from(key.0)) } < 0;
+    Held {
+        ctrl: down(VK_CONTROL),
+        shift: down(VK_SHIFT),
     }
 }
 
 fn on_char(unit: u16) -> Result<()> {
     with_app(|app| match app.query.type_unit(unit) {
-        true => app.redraw(),
+        true => {
+            app.search();
+            app.present()
+        }
         false => Ok(()),
     })
     .unwrap_or(Ok(()))
 }
 
-/// Where the launcher goes on the monitor under the mouse cursor.
+/// Where the launcher goes: the monitor under the mouse cursor.
 ///
 /// Only a thread on the desktop that receives input may read the cursor
 /// (not, say, while the UAC secure desktop is up). Without it, use the
 /// primary monitor: it always contains (0, 0).
-fn placement_under_cursor() -> Result<(Rect, u32)> {
+fn placement_under_cursor() -> Result<Placement> {
     let cursor = cursor_position().unwrap_or_default();
     placement_on(unsafe { MonitorFromPoint(cursor, MONITOR_DEFAULTTONEAREST) })
 }
@@ -275,8 +443,8 @@ fn cursor_position() -> Result<POINT> {
     Ok(cursor)
 }
 
-/// The launcher's rectangle on `monitor`, and that monitor's DPI.
-fn placement_on(monitor: HMONITOR) -> Result<(Rect, u32)> {
+/// The work area and DPI of `monitor`.
+fn placement_on(monitor: HMONITOR) -> Result<Placement> {
     let mut info = MONITORINFO {
         cbSize: size_of::<MONITORINFO>() as u32,
         ..Default::default()
@@ -286,8 +454,10 @@ fn placement_on(monitor: HMONITOR) -> Result<(Rect, u32)> {
         GetMonitorInfoW(monitor, &mut info).ok()?;
         GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &mut dpi, &mut dpi_y)?;
     }
-    let scale = dpi as f32 / 96.0;
-    Ok((layout::launcher_rect(to_rect(info.rcWork), scale, 0), dpi))
+    Ok(Placement {
+        work_area: to_rect(info.rcWork),
+        dpi,
+    })
 }
 
 fn to_rect(rect: RECT) -> Rect {
@@ -313,26 +483,132 @@ fn with_app<R>(f: impl FnOnce(&mut App) -> R) -> Option<R> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    use hyalo_core::item::{Action, Item, Kind};
     use windows::Win32::Foundation::RECT;
     use windows::Win32::Graphics::Dwm::DwmGetWindowAttribute;
     use windows::Win32::Graphics::Gdi::MonitorFromWindow;
-    use windows::Win32::UI::Input::KeyboardAndMouse::VK_A;
+    use windows::Win32::UI::Input::KeyboardAndMouse::{VK_A, VK_DOWN, VK_ESCAPE, VK_RETURN, VK_UP};
     use windows::Win32::UI::WindowsAndMessaging::{
         DestroyWindow, GetClientRect, GetWindowRect, PM_QS_POSTMESSAGE, PM_REMOVE, PeekMessageW,
-        PostMessageW, SendMessageW, WA_ACTIVE, WM_NULL, WM_QUIT,
+        SendMessageW, WA_ACTIVE, WM_NULL, WM_QUIT,
     };
 
     use super::*;
     use crate::render::Frame;
     use crate::test_desktop::on_hidden_desktop;
 
+    fn app(title: &str) -> Item {
+        Item {
+            id: ItemId(title.to_string()),
+            title: title.to_string(),
+            subtitle: "App".to_string(),
+            kind: Kind::App,
+            action: Action::Open(format!("shell:AppsFolder\\{title}")),
+        }
+    }
+
+    /// An opaque red square, `side` pixels wide.
+    fn red(side: u32) -> Icon {
+        let pixels = (side * side) as usize;
+        Icon {
+            width: side,
+            height: side,
+            bgra: [0, 0, 255, 255].repeat(pixels),
+        }
+    }
+
+    /// A finder that lists apps with these titles, each with a red icon,
+    /// and counts how often it runs.
+    fn listing(titles: &[&str]) -> (Finder, Arc<AtomicUsize>) {
+        let items: Vec<Item> = titles.iter().map(|title| app(title)).collect();
+        let runs = Arc::new(AtomicUsize::new(0));
+        let counted = runs.clone();
+        let finder: Finder = Arc::new(move |request: &Request, report: &dyn Fn(Found)| {
+            counted.fetch_add(1, Ordering::SeqCst);
+            report(Found::Items(items.clone()));
+            for item in &items {
+                report(Found::Icon(item.id.clone(), red(request.icon_size)));
+            }
+        });
+        (finder, runs)
+    }
+
+    /// A finder that lists Notepad once the test lets it go.
+    fn gated() -> (Finder, Sender<()>) {
+        let (release, gate) = channel::<()>();
+        let gate = Mutex::new(gate);
+        let finder: Finder = Arc::new(move |_: &Request, report: &dyn Fn(Found)| {
+            let _ = gate.lock().expect("the gate").recv();
+            report(Found::Items(vec![app("Notepad")]));
+        });
+        (finder, release)
+    }
+
     /// The launcher as a test drives it: through the messages Windows
     /// would send. Destroyed while the thread's app state is still alive.
     struct Launcher(HWND);
 
     impl Launcher {
+        /// A launcher that finds nothing to list.
         fn open() -> Self {
-            Self(open().expect("open the launcher"))
+            Self::with(listing(&[]).0)
+        }
+
+        fn with(finder: Finder) -> Self {
+            Self(open(finder).expect("open the launcher"))
+        }
+
+        /// A launcher that lists apps with these titles, once it has them
+        /// all, icons too.
+        fn listing(titles: &[&str]) -> Self {
+            let launcher = Self::with(listing(titles).0);
+            let all = titles.len();
+            launcher.pump_until(|app| app.catalog.icons.len() == all);
+            launcher
+        }
+
+        /// Handles queued messages until `done` holds, as the message loop
+        /// would; fails after five seconds.
+        fn pump_until(&self, done: impl Fn(&App) -> bool) {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !with_app(|app| done(app)).expect("app state") {
+                assert!(Instant::now() < deadline, "timed out waiting");
+                let mut message = MSG::default();
+                while unsafe { PeekMessageW(&mut message, None, 0, 0, PM_REMOVE) }.as_bool() {
+                    unsafe {
+                        let _ = TranslateMessage(&message);
+                        DispatchMessageW(&message);
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+
+        fn placement(&self) -> Placement {
+            with_app(|app| app.placement).expect("app state")
+        }
+
+        /// Which of `rows` rows is lit, read off the frame: the left
+        /// margin, clear of icons and text, is only glass, plus the
+        /// highlight where the selected row is.
+        fn lit_row(&self, rows: usize) -> usize {
+            let frame = self.frame();
+            let scale = layout::scale(self.placement().dpi);
+            let x = (9.0 * scale) as usize;
+            let middle = |row| layout::row_top(row) + layout::ROW_HEIGHT / 2.0;
+            let alpha = |row| frame.pixel(x, (middle(row) * scale) as usize)[3];
+            (0..rows).max_by_key(|&row| alpha(row)).expect("rows")
+        }
+
+        /// The pixel at (x, y) in DIPs.
+        fn pixel_at(&self, x: f32, y: f32) -> [u8; 4] {
+            let scale = layout::scale(self.placement().dpi);
+            self.frame()
+                .pixel((x * scale) as usize, (y * scale) as usize)
         }
 
         fn send(&self, message: u32, wparam: usize) -> LRESULT {
@@ -431,8 +707,8 @@ mod tests {
             let launcher = Launcher::open();
             assert!(launcher.visible());
             let monitor = unsafe { MonitorFromWindow(launcher.0, MONITOR_DEFAULTTONEAREST) };
-            let (expected, _) = placement_on(monitor).expect("placement");
-            assert_eq!(launcher.rect(), expected);
+            let placement = placement_on(monitor).expect("placement");
+            assert_eq!(launcher.rect(), placement.rect(0));
         });
     }
 
@@ -569,6 +845,7 @@ mod tests {
             (WM_KEYDOWN, usize::from(VK_A.0)),
             (WM_ACTIVATE, WA_INACTIVE as usize),
             (WM_HOTKEY, HOTKEY_TOGGLE as usize),
+            (WM_FOUND, 0),
         ];
         on_hidden_desktop(move || {
             let launcher = Launcher::open();
@@ -582,12 +859,121 @@ mod tests {
     #[test]
     fn destroying_the_window_quits_the_app_with_exit_code_zero() {
         on_hidden_desktop(|| {
-            let hwnd = open().expect("open the launcher");
+            let hwnd = open(listing(&[]).0).expect("open the launcher");
             unsafe { DestroyWindow(hwnd) }.expect("destroy the window");
             let mut message = MSG::default();
             let quit = unsafe { PeekMessageW(&mut message, None, WM_QUIT, WM_QUIT, PM_REMOVE) };
             assert!(quit.as_bool());
             assert_eq!(message.wParam.0, 0, "exit code");
+        });
+    }
+
+    #[test]
+    fn typing_lists_the_matching_apps_and_grows_the_window_down() {
+        on_hidden_desktop(|| {
+            let launcher = Launcher::listing(&["Notepad", "Paint", "Sticky Notes"]);
+            let bar = launcher.rect();
+            launcher.type_text("note");
+            let list = launcher.rect();
+            assert_eq!((list.x, list.y, list.width), (bar.x, bar.y, bar.width));
+            assert_eq!(list, launcher.placement().rect(2));
+            assert_eq!(launcher.frame().height, list.height as usize);
+        });
+    }
+
+    #[test]
+    fn emptying_the_query_shrinks_the_window_to_the_bar() {
+        on_hidden_desktop(|| {
+            let launcher = Launcher::listing(&["Notepad"]);
+            launcher.type_text("no");
+            launcher.type_text("\u{8}\u{8}");
+            assert_eq!(launcher.rect(), launcher.placement().rect(0));
+        });
+    }
+
+    #[test]
+    fn a_row_shows_its_icon_and_marks_the_letters_typed() {
+        on_hidden_desktop(|| {
+            let launcher = Launcher::listing(&["Notepad"]);
+            launcher.type_text("note");
+            let top = layout::row_top(0);
+            assert_eq!(launcher.pixel_at(28.0, top + 24.0), [0, 0, 255, 255]);
+            let frame = launcher.frame();
+            let scale = layout::scale(launcher.placement().dpi);
+            let band = (top * scale) as usize..((top + 26.0) * scale) as usize;
+            let accent = band
+                .flat_map(|y| (0..frame.width).map(move |x| (x, y)))
+                .filter(|&(x, y)| {
+                    let [blue, _, red, _] = frame.pixel(x, y);
+                    blue > red.saturating_add(80)
+                })
+                .count();
+            assert!(accent > 20, "{accent} accent pixels in the title");
+        });
+    }
+
+    #[test]
+    fn the_arrows_move_the_selection_and_wrap() {
+        on_hidden_desktop(|| {
+            let launcher = Launcher::listing(&["a1", "a2", "a3"]);
+            launcher.type_text("a");
+            assert_eq!(launcher.lit_row(3), 0);
+            launcher.press(VK_DOWN);
+            assert_eq!(launcher.lit_row(3), 1);
+            launcher.press(VK_UP);
+            launcher.press(VK_UP);
+            assert_eq!(launcher.lit_row(3), 2);
+        });
+    }
+
+    #[test]
+    fn reopening_shows_the_bar_alone() {
+        on_hidden_desktop(|| {
+            let launcher = Launcher::listing(&["Notepad"]);
+            launcher.type_text("note");
+            launcher.press(VK_ESCAPE);
+            launcher.hotkey();
+            assert_eq!(launcher.rect(), launcher.placement().rect(0));
+        });
+    }
+
+    #[test]
+    fn showing_again_soon_does_not_list_the_apps_again() {
+        on_hidden_desktop(|| {
+            let (finder, runs) = listing(&["Notepad"]);
+            let launcher = Launcher::with(finder);
+            launcher.pump_until(|app| !app.catalog.items.is_empty());
+            launcher.hotkey();
+            launcher.hotkey();
+            assert_eq!(runs.load(Ordering::SeqCst), 1);
+        });
+    }
+
+    #[test]
+    fn apps_found_while_the_query_is_typed_are_listed_at_once() {
+        on_hidden_desktop(|| {
+            let (finder, release) = gated();
+            let launcher = Launcher::with(finder);
+            launcher.type_text("note");
+            assert_eq!(launcher.rect(), launcher.placement().rect(0));
+            release.send(()).expect("release the finder");
+            launcher.pump_until(|app| !app.catalog.items.is_empty());
+            assert_eq!(launcher.rect(), launcher.placement().rect(1));
+        });
+    }
+
+    #[test]
+    fn apps_found_while_hidden_wait_for_the_next_show() {
+        on_hidden_desktop(|| {
+            let (finder, release) = gated();
+            let launcher = Launcher::with(finder);
+            launcher.press(VK_ESCAPE);
+            release.send(()).expect("release the finder");
+            launcher.pump_until(|app| !app.catalog.items.is_empty());
+            assert!(!launcher.visible());
+            launcher.hotkey();
+            launcher.type_text("note");
+            assert_eq!(launcher.rect(), launcher.placement().rect(1));
         });
     }
 }
