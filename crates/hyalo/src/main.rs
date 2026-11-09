@@ -1,6 +1,11 @@
 // Release builds have no console window; debug builds keep one for logs.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "drawn once the window lists results")
+)]
+mod highlight;
 mod layout;
 mod query;
 mod render;
