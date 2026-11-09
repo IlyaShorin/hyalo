@@ -68,6 +68,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "hyalo-index"
+version = "0.0.1"
+dependencies = [
+ "hyalo-core",
+]
+
+[[package]]
 name = "itoa"
 version = "1.0.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
