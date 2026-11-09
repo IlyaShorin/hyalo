@@ -527,6 +527,11 @@ mod tests {
     }
 
     #[test]
+    fn an_acronym_may_take_every_piece_from_words_with_one_first_letter() {
+        assert_eq!(strength("aac", "ab ac"), Some(Strength::Acronym));
+    }
+
+    #[test]
     fn an_acronym_keeps_the_word_order_and_uses_each_word_once() {
         assert_eq!(find("cvs", "Visual Studio Code"), None);
         assert_eq!(find("vv", "Visual Studio"), None);

@@ -154,6 +154,31 @@ mod tests {
     #[test]
     fn a_drive_holds_its_root_and_as_many_entries_as_asked() {
         assert_eq!(drive(1000, 1).len(), 1001);
+        assert_eq!(drive(1, 1).len(), 2);
+    }
+
+    #[test]
+    fn a_seed_of_zero_makes_a_drive_as_varied_as_any() {
+        let names = names(&drive(100, 0));
+        let distinct: std::collections::HashSet<&String> = names.iter().collect();
+        assert!(distinct.len() > 50, "{} distinct names", distinct.len());
+    }
+
+    /// FNV-1a, 64 bits: enough to tell two drives apart.
+    fn fingerprint(text: &str) -> u64 {
+        let step = |hash: u64, byte: u8| (hash ^ u64::from(byte)).wrapping_mul(0x100_0000_01B3);
+        text.bytes().fold(0xCBF2_9CE4_8422_2325, step)
+    }
+
+    #[test]
+    fn a_drive_is_the_same_from_one_version_to_the_next() {
+        // Bench numbers compare only over the same names: a change to how
+        // they are made shows here, and is a decision.
+        let index = drive(3_000, 1);
+        let paths: Vec<String> = (0..index.len() as u32)
+            .filter_map(|at| index.path(EntryId(at)))
+            .collect();
+        assert_eq!(fingerprint(&paths.join("\n")), 0x4095_4C5A_D42B_F778);
     }
 
     #[test]

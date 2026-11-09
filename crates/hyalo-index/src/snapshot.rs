@@ -54,16 +54,19 @@ impl Index {
             return Err(LoadError::Foreign);
         }
         let lengths = exactly(input, 3 * 8)?;
+        // Offsets are u32: no part of a snapshot is longer.
         let mut lengths = lengths.as_chunks::<8>().0.iter().map(|&length| {
-            let length = usize::try_from(u64::from_le_bytes(length));
-            length.ok().filter(|&length| length <= u32::MAX as usize)
+            let length = u32::try_from(u64::from_le_bytes(length));
+            length.ok().map(|length| length as usize)
         });
         let mut next = || lengths.next().flatten().ok_or(LoadError::Damaged);
         let (entries, names, free) = (next()?, next()?, next()?);
         let entries = exactly(input, entries * 16)?;
         let names = String::from_utf8(exactly(input, names)?).map_err(|_| LoadError::Damaged)?;
         let free = exactly(input, free * 4)?;
-        if input.read(&mut [0]).map_err(LoadError::Io)? != 0 {
+        // Its first value never matters: a read either fills it or not.
+        let mut probe = [u8::MIN];
+        if input.read(&mut probe).map_err(LoadError::Io)? > 0 {
             return Err(LoadError::Damaged);
         }
         let entries = entries.as_chunks::<16>().0.iter();
@@ -136,7 +139,7 @@ mod tests {
         let places = Places::default();
         let ids = |index: &Index| -> Vec<String> {
             let found = index.search("rep", &places, 10);
-            found.into_iter().map(|row| row.item.id.0).collect()
+            found.rows.into_iter().map(|row| row.item.id.0).collect()
         };
         assert_eq!(ids(&back), ids(&index));
     }
@@ -151,9 +154,10 @@ mod tests {
 
     #[test]
     fn loading_takes_no_more_memory_than_it_needs() {
-        let index = synthetic::drive(5_000, 2);
-        let back = loaded(&saved(&index)).expect("load");
-        assert!(back.memory() <= index.memory());
+        let back = loaded(&saved(&small())).expect("load");
+        // Four entries; C:, a, gone and Ёлка.txt; the three live ones
+        // folded; one free place.
+        assert_eq!(back.memory(), 4 * 16 + 19 + 15 + 4);
     }
 
     #[test]
@@ -220,8 +224,6 @@ mod tests {
             "parent past the end"
         );
         assert!(damaged(&with(&bytes, field(1, 0), 1)), "its own parent");
-        assert!(damaged(&with(&bytes, field(1, 0), 3)), "a file as a parent");
-        assert!(damaged(&with(&bytes, field(1, 0), 2)), "a removed parent");
         assert!(
             damaged(&with(&bytes, field(1, 1), 999)),
             "name past the end"
@@ -235,9 +237,33 @@ mod tests {
             "an empty name"
         );
         assert!(
-            damaged(&with(&bytes, field(1, 3), 1 | 1 << 12 | 64 << 24)),
-            "unknown flag"
+            damaged(&with(&bytes, field(1, 3), 1 | 1 << 12 | (1 | 64) << 24)),
+            "a folder with an unknown flag"
         );
+    }
+
+    #[test]
+    fn only_a_live_folder_holds_entries() {
+        let mut index = Index::default();
+        let c = index.add_root("C:").unwrap();
+        index.add(c, "f.txt", false).unwrap();
+        let d = index.add(c, "d", true).unwrap();
+        index.add(c, "x.txt", false).unwrap();
+        index.remove(d).unwrap();
+        let bytes = saved(&index);
+        assert!(loaded(&bytes).is_ok());
+        assert!(damaged(&with(&bytes, field(3, 0), 1)), "in a file");
+        assert!(
+            damaged(&with(&bytes, field(3, 0), 2)),
+            "in a removed folder"
+        );
+    }
+
+    #[test]
+    fn a_root_inside_itself_is_refused() {
+        let mut index = Index::default();
+        index.add_root("C:").unwrap();
+        assert!(damaged(&with(&saved(&index), field(0, 0), 0)));
     }
 
     #[test]

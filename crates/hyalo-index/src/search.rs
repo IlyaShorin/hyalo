@@ -20,34 +20,48 @@ use crate::{EntryId, Index};
 /// The fewest entries worth a thread of their own.
 const CHUNK: usize = 4096;
 
+/// What a search found, and how much work it took.
+pub struct Searched {
+    /// Best first.
+    pub rows: Vec<Ranked>,
+    /// The names scored in full; their ceilings ruled the others out.
+    pub scored: usize,
+}
+
 impl Index {
     /// The `limit` best files and folders for `query`, best first, scored
     /// as `hyalo_core::rank` scores items (no picks: the caller ranks
     /// picked files itself). Equal scores keep the order of the index.
-    pub fn search(&self, query: &str, places: &Places, limit: usize) -> Vec<Ranked> {
+    pub fn search(&self, query: &str, places: &Places, limit: usize) -> Searched {
         let pattern = &Pattern::new(query);
-        let mut hits: Vec<Hit> = thread::scope(|scope| {
+        let (mut hits, scored) = thread::scope(|scope| {
             let threads: Vec<_> = self
                 .slices()
                 .map(|slice| scope.spawn(move || self.best_in(slice, pattern, places, limit)))
                 .collect();
             let found = threads.into_iter().map(|thread| thread.join());
-            found
-                .flat_map(|hits| hits.expect("a search thread"))
-                .collect()
+            let found = found.map(|scan| scan.expect("a search thread"));
+            found.fold((Vec::new(), 0), |(mut hits, scored), (more, also)| {
+                hits.extend(more);
+                (hits, scored + also)
+            })
         });
         // Stable: equal scores stay in the order of the slices.
         hits.sort_by(|one, other| other.score.total_cmp(&one.score));
         hits.truncate(limit);
-        hits.into_iter()
-            .map(|hit| self.ranked(hit, pattern))
-            .collect()
+        let rows = hits.into_iter().map(|hit| self.ranked(hit, pattern));
+        Searched {
+            rows: rows.collect(),
+            scored,
+        }
     }
 
     /// The entries cut into one slice per core, none under `CHUNK`.
     fn slices(&self) -> impl Iterator<Item = Range<usize>> {
         let all = self.entries.len();
-        let cores = thread::available_parallelism().map_or(1, NonZero::get);
+        let cores = thread::available_parallelism()
+            .unwrap_or(NonZero::<usize>::MIN)
+            .get();
         let size = all.div_ceil(cores).max(CHUNK);
         (0..all)
             .step_by(size)
@@ -61,7 +75,7 @@ impl Index {
         pattern: &Pattern,
         places: &Places,
         limit: usize,
-    ) -> Vec<Hit> {
+    ) -> (Vec<Hit>, usize) {
         let mut scan = Scan {
             index: self,
             pattern,
@@ -71,11 +85,12 @@ impl Index {
                 hits: Vec::new(),
             },
             seen: vec![(u32::MAX, 0.0); SEEN],
+            scored: 0,
         };
         for at in slice {
             scan.consider(at as u32);
         }
-        scan.best.hits
+        (scan.best.hits, scan.scored)
     }
 
     /// The folded names of the folders from a root down to `folder`.
@@ -112,6 +127,8 @@ struct Scan<'a> {
     best: Best,
     /// `(folder, points of its place)`, each folder in slot `folder % SEEN`.
     seen: Vec<(u32, f64)>,
+    /// Names that got past their ceilings.
+    scored: usize,
 }
 
 impl Scan<'_> {
@@ -131,11 +148,12 @@ impl Scan<'_> {
             .pattern
             .rough(folded)
             .filter(|rough| beats(rough.points()));
-        let Some((points, found)) = rough
-            .and_then(|rough| rough.ceiling(name))
-            .filter(|ceiling| beats(ceiling.points()))
-            .and_then(|ceiling| matched(self.pattern, name, ceiling))
-        else {
+        let ceiling = rough.and_then(|rough| rough.ceiling(name));
+        let Some(ceiling) = ceiling.filter(|ceiling| beats(ceiling.points())) else {
+            return;
+        };
+        self.scored += 1;
+        let Some((points, found)) = matched(self.pattern, name, ceiling) else {
             return;
         };
         let score = rank::score(points, kind, self.place(entry.parent), 0.0);
@@ -199,10 +217,8 @@ impl Best {
     /// came first.
     fn offer(&mut self, hit: Hit) {
         let place = self.hits.partition_point(|kept| kept.score >= hit.score);
-        if place < self.limit {
-            self.hits.insert(place, hit);
-            self.hits.truncate(self.limit);
-        }
+        self.hits.insert(place, hit);
+        self.hits.truncate(self.limit);
     }
 }
 
@@ -229,7 +245,11 @@ mod tests {
 
     fn titles(index: &Index, query: &str, limit: usize) -> Vec<String> {
         let found = index.search(query, &Places::default(), limit);
-        found.into_iter().map(|ranked| ranked.item.title).collect()
+        found
+            .rows
+            .into_iter()
+            .map(|ranked| ranked.item.title)
+            .collect()
     }
 
     #[test]
@@ -245,7 +265,7 @@ mod tests {
     fn a_row_is_the_entry_with_its_path_and_the_letters_matched() {
         let index = holding(&["Visual Studio Code\\"]);
         let found = index.search("vsc", &Places::default(), 10);
-        let row = &found[0];
+        let row = &found.rows[0];
         assert_eq!(
             row.item,
             Item::file(r"C:\in\Visual Studio Code".into(), true)
@@ -275,6 +295,33 @@ mod tests {
     }
 
     #[test]
+    fn an_entry_in_the_first_place_is_found() {
+        let mut index = Index::default();
+        let c = index.add_root("C:").unwrap();
+        let d = index.add_root("D:").unwrap();
+        index.remove(c).unwrap();
+        let file = index.add(d, "found.txt", false).unwrap();
+        assert_eq!(file, EntryId(0));
+        assert_eq!(titles(&index, "found", 5), ["found.txt"]);
+    }
+
+    #[test]
+    fn a_name_that_can_at_best_tie_the_rows_kept_is_not_scored() {
+        let mut index = Index::default();
+        let c = index.add_root("C:").unwrap();
+        let favoured = index.add(c, "fav", true).unwrap();
+        let other = index.add(c, "other", true).unwrap();
+        index.add(favoured, "note.txt", false).unwrap();
+        // A prefix, at best in a favoured place: a tie with note.txt.
+        index.add(other, "note.md", false).unwrap();
+        let places = Places::new(&[r"C:\fav"]);
+        let one = index.search("note", &places, 1);
+        assert_eq!(one.rows[0].item.title, "note.txt");
+        assert_eq!(one.scored, 1);
+        assert_eq!(index.search("note", &places, 2).scored, 2);
+    }
+
+    #[test]
     fn a_word_hidden_in_a_hump_is_not_passed_over() {
         let index = holding(&["a shell", "PowerShell\\"]);
         assert_eq!(titles(&index, "shell", 1), ["PowerShell"]);
@@ -299,7 +346,11 @@ mod tests {
         }
         let places = Places::new(&[r"C:\Desktop"]);
         let found = index.search("index", &places, 10);
-        let paths: Vec<&str> = found.iter().map(|row| row.item.id.0.as_str()).collect();
+        let paths: Vec<&str> = found
+            .rows
+            .iter()
+            .map(|row| row.item.id.0.as_str())
+            .collect();
         assert_eq!(
             paths,
             [
@@ -334,6 +385,7 @@ mod tests {
                 .collect();
             let found: Vec<(String, f64)> = index
                 .search(query, &places, 20)
+                .rows
                 .into_iter()
                 .map(|ranked| (ranked.item.id.0, ranked.score))
                 .collect();

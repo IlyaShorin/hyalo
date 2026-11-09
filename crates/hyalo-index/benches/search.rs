@@ -69,11 +69,12 @@ fn report(index: &Index, places: &Places, query: &str) {
     let mut times: Vec<Duration> = (0..RUNS).map(|_| timed(index, places, query)).collect();
     times.sort();
     let found = index.search(query, places, LIMIT);
-    let best = found.first().map_or("", |row| row.item.title.as_str());
+    let best = found.rows.first().map_or("", |row| row.item.title.as_str());
     println!(
-        "{query:>10}: median {:6.2?}, worst {:6.2?}, best row {best:?}",
+        "{query:>10}: median {:6.2?}, worst {:6.2?}, {} scored, best row {best:?}",
         times[RUNS / 2],
-        times[RUNS - 1]
+        times[RUNS - 1],
+        found.scored
     );
 }
 

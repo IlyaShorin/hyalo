@@ -77,12 +77,8 @@ impl Entry {
 
     /// The entry as a snapshot keeps it: its four fields, little-endian.
     pub(crate) fn to_bytes(self) -> [u8; 16] {
-        let fields = [self.parent, self.name, self.folded, self.lengths];
-        let mut bytes = [0; 16];
-        for (place, field) in bytes.as_chunks_mut::<4>().0.iter_mut().zip(fields) {
-            *place = field.to_le_bytes();
-        }
-        bytes
+        let fields = [self.parent, self.name, self.folded, self.lengths].map(u32::to_le_bytes);
+        std::array::from_fn(|at| fields[at / 4][at % 4])
     }
 
     pub(crate) fn from_bytes(bytes: [u8; 16]) -> Entry {
@@ -584,6 +580,34 @@ mod tests {
         assert_eq!(index.rename(users, users, "x"), Err(Error::WouldLoop));
         assert_eq!(index.rename(users, me, "x"), Err(Error::WouldLoop));
         assert_eq!(index.path(users).as_deref(), Some(r"C:\Users"));
+    }
+
+    #[test]
+    fn a_root_may_be_a_folder_with_backslashes_in_its_name() {
+        let mut index = Index::default();
+        let data = index.add_root(r"D:\Data").unwrap();
+        let file = index.add(data, "x.txt", false).unwrap();
+        assert_eq!(index.path(file).as_deref(), Some(r"D:\Data\x.txt"));
+    }
+
+    #[test]
+    fn a_rename_takes_one_name() {
+        let (mut index, [_, _, me, notes, ..]) = drive();
+        assert_eq!(index.rename(notes, me, r"a\b"), Err(Error::BadName));
+    }
+
+    #[test]
+    fn removing_a_folder_finds_what_was_put_in_the_first_place_under_it() {
+        let mut index = Index::default();
+        let c = index.add_root("C:").unwrap();
+        let d = index.add_root("D:").unwrap();
+        let folder = index.add(d, "folder", true).unwrap();
+        index.remove(c).unwrap();
+        let inside = index.add(folder, "inside.txt", false).unwrap();
+        assert_eq!(inside, EntryId(0));
+        index.remove(d).unwrap();
+        assert_eq!(index.path(inside), None);
+        assert!(index.is_empty());
     }
 
     #[test]
