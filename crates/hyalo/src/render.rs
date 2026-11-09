@@ -202,7 +202,10 @@ impl Renderer {
         let drawn = self.draw_scene(scene);
         unsafe { self.dc.EndDraw(None, None)? };
         drawn?;
-        unsafe { self.swap_chain.Present(1, DXGI_PRESENT(0)).ok() }
+        // Sync interval 0: DWM composes at the display's pace anyway (no
+        // tearing in a composition swap chain), and a burst of redraws
+        // while typing does not wait a refresh each.
+        unsafe { self.swap_chain.Present(0, DXGI_PRESENT(0)).ok() }
     }
 
     fn draw_scene(&mut self, scene: &Scene) -> Result<()> {
@@ -852,6 +855,21 @@ mod tests {
                 let frame = renderer.read_frame().expect("read the frame back");
                 assert_looks_like("list-150", &frame);
             }
+        });
+    }
+
+    #[test]
+    fn redrawing_does_not_wait_for_the_display() {
+        on_hidden_desktop(|| {
+            let canvas = Canvas::new();
+            let mut renderer = Renderer::new(canvas.0, 720, 64, 96).expect("a renderer");
+            let start = std::time::Instant::now();
+            for _ in 0..120 {
+                renderer.draw(&Scene::bar("notepad")).expect("draw");
+            }
+            // Paced by a 240 Hz display, 120 frames take half a second.
+            let spent = start.elapsed();
+            assert!(spent.as_millis() < 250, "120 redraws took {spent:?}");
         });
     }
 
