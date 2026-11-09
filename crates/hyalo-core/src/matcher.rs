@@ -108,7 +108,8 @@ fn classify(
         .map(|start| run(Strength::WordStart, start))
         .or_else(|| acronym(query, folded, words))
         .or_else(|| {
-            let start = (0..folded.len()).find(&found_at)?;
+            let mut windows = folded.windows(query.len());
+            let start = windows.position(|window| window == query)?;
             Some(run(Strength::Substring, start))
         })
 }
