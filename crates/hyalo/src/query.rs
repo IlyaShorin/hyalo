@@ -116,6 +116,11 @@ mod tests {
     }
 
     #[test]
+    fn the_first_half_of_a_pair_changes_nothing_yet() {
+        assert!(!Query::default().type_unit(0xD83D));
+    }
+
+    #[test]
     fn drops_a_high_surrogate_not_followed_by_its_pair() {
         let mut query = Query::default();
         query.type_unit(0xD83D);
@@ -133,7 +138,7 @@ mod tests {
     #[test]
     fn ignores_other_control_codes() {
         let mut query = typed("x");
-        for code in [0x01, 0x09, 0x0D, 0x1B, 0x1F] {
+        for code in [0x00, 0x01, 0x09, 0x0D, 0x1B, 0x1F] {
             assert!(!query.type_unit(code), "code {code:#04x}");
         }
         assert_eq!(query.text(), "x");
