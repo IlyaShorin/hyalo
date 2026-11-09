@@ -4,7 +4,7 @@ A fast, glassy Spotlight-style launcher for Windows 11. Press a hotkey, type a f
 
 *hyalo* comes from Greek ὕαλος, "glass".
 
-> **Status:** early prototype. Nothing to install yet.
+> **Status:** early prototype: finds and opens apps. Nothing to install yet.
 
 ## Goals
 
@@ -55,7 +55,14 @@ Requires the Rust MSVC toolchain and Visual Studio Build Tools with the C++ work
 cargo run -p hyalo
 ```
 
-The prototype is only the glass search bar: Alt+Space toggles it, Esc or Enter hides it, it hides when it loses focus. There is no tray icon yet, so stop it with `taskkill /IM hyalo.exe`.
+What the prototype does:
+
+- Alt+Space shows or hides the glass search bar; it also hides when it loses focus.
+- Typing lists up to eight matching apps (Start Menu desktop apps and Store apps, from `shell:AppsFolder`) with their icons, the matched letters highlighted.
+- Up and Down move the selection, Enter opens it, Ctrl+Shift+Enter opens it as administrator, Esc hides the launcher.
+- Picks are remembered per query (frecency) in `%APPDATA%\hyalo\frecency.json`, so what you open often rises.
+
+There is no tray icon yet, so stop it with `taskkill /IM hyalo.exe`.
 
 ## Development
 
@@ -71,7 +78,14 @@ The script expects the tools checked out side by side under `~/code/unclebob` (o
 To check the look, run the launcher and capture it over bright colour stripes:
 
 ```sh
-powershell -ExecutionPolicy Bypass -File scripts/snap.ps1 -Stripes   # writes target/snap.png
+powershell -ExecutionPolicy Bypass -File scripts/snap.ps1 -Stripes                   # writes target/snap.png
+powershell -ExecutionPolicy Bypass -File scripts/snap.ps1 -Stripes -Type "no{DOWN}"   # types first, shows the list
+```
+
+Rendering tests compare frames, pixel by pixel, with reference images in `crates/hyalo/reference`. A failing test writes what it saw to `target/frames`. After a deliberate change to the look, check the new frames by eye, then accept them:
+
+```sh
+HYALO_BLESS=1 cargo test -p hyalo
 ```
 
 ## Prior art
