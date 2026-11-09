@@ -2,8 +2,8 @@
 //!
 //! Strongest first: the whole name, the start of the name, the start of a
 //! later word, the starts of several words (an acronym), anywhere inside.
-//! Letters compare case-insensitively, Cyrillic included. A query typed in
-//! the wrong keyboard layout matches too, a little weaker.
+//! Letters compare case-insensitively, Cyrillic included, and ё as е. A
+//! query typed in the wrong keyboard layout matches too, a little weaker.
 
 use crate::keyboard;
 use std::collections::HashSet;
@@ -68,10 +68,12 @@ impl Match {
 /// keyboard layout, and keeps the better; `None` when neither matches.
 pub fn find(query: &str, name: &str) -> Option<Match> {
     let letters: Vec<char> = name.chars().collect();
-    let folded: Vec<char> = letters.iter().copied().map(fold).collect();
+    let folded: Vec<char> = letters.iter().copied().map(compared).collect();
     let words = words(&letters);
-    let typed: Vec<char> = query.chars().map(fold).collect();
-    let swapped: Vec<char> = typed.iter().copied().map(keyboard::swap).collect();
+    let typed: Vec<char> = query.chars().map(compared).collect();
+    // Swap before ё becomes е: they sit on different keys.
+    let swapped = query.chars().map(fold).map(keyboard::swap).map(compared);
+    let swapped: Vec<char> = swapped.collect();
     [(Layout::AsTyped, typed), (Layout::Swapped, swapped)]
         .into_iter()
         .filter_map(|(layout, query)| {
@@ -129,6 +131,16 @@ fn acronym(
 /// positions in the original.
 pub(crate) fn fold(letter: char) -> char {
     letter.to_lowercase().next().unwrap_or(letter)
+}
+
+/// A letter as matching compares it: folded, and ё as е, since Russian
+/// names are written both ways. Frecency keeps its queries in `fold`
+/// alone, so picks saved before still load.
+fn compared(letter: char) -> char {
+    match fold(letter) {
+        'ё' => 'е',
+        other => other,
+    }
 }
 
 /// The words of a name, each from its start up to the next word's start.
@@ -373,6 +385,26 @@ mod tests {
         let points = |query, name| find(query, name).map(|found| found.points());
         assert!(points("мысщву", "vscode") < points("vscode", "vscode"));
         assert!(points("мысщву", "vscode") > points("vsc", "vscode"));
+    }
+
+    #[test]
+    fn yo_and_ye_are_the_same_letter() {
+        assert_eq!(strength("елка", "Ёлка"), Some(Strength::Exact));
+        assert_eq!(strength("ЁЛКА", "Елка"), Some(Strength::Exact));
+        assert_eq!(strength("ёж", "Мой ежик"), Some(Strength::WordStart));
+        assert_eq!(positions("ёж", "Мой ежик"), [4, 5]);
+    }
+
+    #[test]
+    fn yo_typed_in_the_wrong_layout_is_ye_too() {
+        let found = find("`krf", "Елка").unwrap();
+        assert_eq!(found.strength, Strength::Exact);
+        assert_eq!(found.layout, Layout::Swapped);
+    }
+
+    #[test]
+    fn yo_on_the_wrong_layout_is_still_its_own_key() {
+        assert_eq!(strength("ё1", "`1"), Some(Strength::Exact));
     }
 
     #[test]
