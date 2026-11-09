@@ -16,6 +16,7 @@ use std::time::{Instant, SystemTime};
 
 use hyalo_core::frecency::{Frecency, Timestamp};
 use hyalo_core::item::{Action, ItemId, Kind};
+use hyalo_core::places::Places;
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Dwm::{
     DWMSBT_TRANSIENTWINDOW, DWMWA_BORDER_COLOR, DWMWA_COLOR_NONE, DWMWA_SYSTEMBACKDROP_TYPE,
@@ -114,6 +115,8 @@ struct App {
     catalog: Catalog,
     results: Results,
     frecency: Frecency,
+    /// The user's folders, whose files rank a little higher.
+    places: Places,
     services: Services,
     /// When the provider last started; `None` before it ever did.
     found_at: Option<Instant>,
@@ -214,7 +217,8 @@ impl App {
     /// Lists what the query finds, best first, the first row selected.
     fn search(&mut self) {
         let items = &self.catalog.items;
-        self.results = Results::search(self.query.text(), items, &self.frecency, now());
+        let places = &self.places;
+        self.results = Results::search(self.query.text(), items, &self.frecency, places, now());
     }
 
     /// Starts the provider on a thread of its own, unless the list it
@@ -243,7 +247,10 @@ impl App {
             self.catalog.take(found);
         }
         let (query, items) = (self.query.text(), &self.catalog.items);
-        self.results = self.results.refreshed(query, items, &self.frecency, now());
+        let places = &self.places;
+        self.results = self
+            .results
+            .refreshed(query, items, &self.frecency, places, now());
         match unsafe { IsWindowVisible(self.hwnd) }.as_bool() {
             true => self.present(),
             false => Ok(()),
@@ -317,6 +324,7 @@ fn open(services: Services) -> Result<HWND> {
             catalog: Catalog::default(),
             results: Results::default(),
             frecency,
+            places: Places::default(),
             services,
             found_at: None,
             found: channel(),

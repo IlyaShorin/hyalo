@@ -3,6 +3,7 @@
 use hyalo_core::calculator;
 use hyalo_core::frecency::{Frecency, Timestamp};
 use hyalo_core::item::Item;
+use hyalo_core::places::Places;
 use hyalo_core::rank::rank;
 
 /// The most rows the window lists.
@@ -32,6 +33,7 @@ impl Results {
         query: &str,
         items: impl IntoIterator<Item = &'a Item>,
         frecency: &Frecency,
+        places: &Places,
         now: Timestamp,
     ) -> Self {
         if query.is_empty() {
@@ -41,7 +43,7 @@ impl Results {
             item,
             matched: Vec::new(),
         });
-        let ranked = rank(query, items, frecency, now)
+        let ranked = rank(query, items, frecency, places, now)
             .into_iter()
             .map(|ranked| Listed {
                 item: ranked.item,
@@ -60,9 +62,10 @@ impl Results {
         query: &str,
         items: impl IntoIterator<Item = &'a Item>,
         frecency: &Frecency,
+        places: &Places,
         now: Timestamp,
     ) -> Self {
-        let mut fresh = Self::search(query, items, frecency, now);
+        let mut fresh = Self::search(query, items, frecency, places, now);
         let kept = self.picked().and_then(|picked| {
             let mut rows = fresh.rows.iter();
             rows.position(|row| row.item.id == picked.item.id)
@@ -129,7 +132,7 @@ mod tests {
     }
 
     fn search(query: &str, items: &[Item]) -> Results {
-        Results::search(query, items, &Frecency::default(), NOW)
+        Results::search(query, items, &Frecency::default(), &Places::default(), NOW)
     }
 
     fn titles(results: &Results) -> Vec<&str> {
@@ -214,7 +217,7 @@ mod tests {
     }
 
     fn refreshed(results: &Results, query: &str, items: &[Item]) -> Results {
-        results.refreshed(query, items, &Frecency::default(), NOW)
+        results.refreshed(query, items, &Frecency::default(), &Places::default(), NOW)
     }
 
     #[test]

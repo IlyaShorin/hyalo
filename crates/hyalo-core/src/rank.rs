@@ -6,6 +6,7 @@
 use crate::frecency::{Frecency, Timestamp};
 use crate::item::{Item, Kind};
 use crate::matcher::{self, Match};
+use crate::places::Places;
 
 /// One row of the ranked list.
 #[derive(Debug, Clone, PartialEq)]
@@ -22,15 +23,18 @@ pub fn rank<'a>(
     query: &str,
     items: impl IntoIterator<Item = &'a Item>,
     frecency: &Frecency,
+    places: &Places,
     now: Timestamp,
 ) -> Vec<Ranked> {
+    let pattern = matcher::Pattern::new(query);
     let mut ranked: Vec<Ranked> = items
         .into_iter()
         .filter_map(|item| {
-            let found = matcher::find(query, &item.title)?;
+            let found = pattern.find(&item.title)?;
             let picks = frecency.score(&item.id, query, now);
+            let place = item.path().map_or(0.0, |path| places.of_path(path));
             Some(Ranked {
-                score: found.points() + kind_weight(item.kind) + boost(picks),
+                score: score(found.points(), item.kind, place, picks),
                 item: item.clone(),
                 found,
             })
@@ -44,6 +48,12 @@ pub fn rank<'a>(
 /// little more than one kind of match, so an app outranks a file that
 /// matches one kind better, but not two.
 const KIND_STEP: f64 = 12.0;
+
+/// An item's score: the `points` its match is worth, its kind, the
+/// points of the place it lives in (see `places`) and its frecency score.
+pub fn score(points: f64, kind: Kind, place: f64, picks: f64) -> f64 {
+    points + kind_weight(kind) + place + boost(picks)
+}
 
 fn kind_weight(kind: Kind) -> f64 {
     let step = match kind {
@@ -91,7 +101,11 @@ mod tests {
     }
 
     fn order(query: &str, items: &[Item], frecency: &Frecency) -> Vec<String> {
-        rank(query, items, frecency, NOW)
+        order_in(query, items, frecency, &Places::default())
+    }
+
+    fn order_in(query: &str, items: &[Item], frecency: &Frecency, places: &Places) -> Vec<String> {
+        rank(query, items, frecency, places, NOW)
             .into_iter()
             .map(|ranked| ranked.item.id.0)
             .collect()
@@ -123,7 +137,7 @@ mod tests {
     #[test]
     fn a_ranked_item_carries_its_match() {
         let items = [file("Visual Studio Code")];
-        let ranked = rank("vsc", &items, &Frecency::default(), NOW);
+        let ranked = rank("vsc", &items, &Frecency::default(), &Places::default(), NOW);
         assert_eq!(ranked[0].found.positions, [0, 7, 14]);
     }
 
@@ -217,5 +231,57 @@ mod tests {
             order("notes", &items, &Frecency::default()),
             ["Notes b", "Notes a"]
         );
+    }
+
+    fn at(path: &str) -> Item {
+        Item::file(path.to_string(), false)
+    }
+
+    fn desktop() -> Places {
+        Places::new(&[r"C:\Users\Me\Desktop"])
+    }
+
+    #[test]
+    fn a_file_in_a_favoured_folder_ranks_above_an_equal_one_elsewhere() {
+        let items = [at(r"D:\notes.txt"), at(r"C:\Users\Me\Desktop\notes.txt")];
+        assert_eq!(
+            order_in("notes", &items, &Frecency::default(), &desktop()),
+            [r"C:\Users\Me\Desktop\notes.txt", r"D:\notes.txt"]
+        );
+    }
+
+    #[test]
+    fn a_file_in_a_buried_folder_ranks_below_an_equal_one() {
+        let items = [at(r"C:\app\node_modules\index.js"), at(r"C:\app\index.js")];
+        assert_eq!(
+            order_in("index", &items, &Frecency::default(), &desktop()),
+            [r"C:\app\index.js", r"C:\app\node_modules\index.js"]
+        );
+    }
+
+    #[test]
+    fn an_app_outranks_a_favoured_file_that_matches_one_kind_better() {
+        let items = [
+            at(r"C:\Users\Me\Desktop\code.txt"),
+            item("vscode", "Visual Studio Code", Kind::App),
+        ];
+        assert_eq!(
+            order_in("code", &items, &Frecency::default(), &desktop()),
+            ["vscode", r"C:\Users\Me\Desktop\code.txt"]
+        );
+    }
+
+    #[test]
+    fn a_ranked_score_is_the_score_of_its_parts() {
+        let file = at(r"C:\Users\Me\Desktop\Notes\code.txt");
+        let frecency = picked(&file.id.0, "code", 1);
+        let ranked = rank("co", [&file], &frecency, &desktop(), NOW);
+        let picks = frecency.score(&file.id, "co", NOW);
+        let parts = score(ranked[0].found.points(), Kind::File, 3.0, picks);
+        assert_eq!(ranked[0].score, parts);
+        assert!(score(80.0, Kind::Folder, 3.0, 0.0) > score(80.0, Kind::File, 3.0, 0.0));
+        assert!(score(80.0, Kind::File, 3.0, 0.0) > score(80.0, Kind::File, 0.0, 0.0));
+        assert!(score(80.0, Kind::File, 0.0, 1.0) > score(80.0, Kind::File, 0.0, 0.0));
+        assert!(score(81.0, Kind::File, 0.0, 0.0) > score(80.0, Kind::File, 0.0, 0.0));
     }
 }
