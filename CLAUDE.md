@@ -25,5 +25,8 @@ Spotlight-style launcher for Windows 11, written in Rust. Goals, architecture an
 - **Indexer**: the Windows service that holds the file index.
 - **Provider**: a source of results (apps, files, calculator, settings, windows).
 - **Item**: one row in the list (a "result" in the UI): id, title, subtitle, kind, the action Enter runs. Named `Item` so it does not clash with `std::result::Result`.
-- **Frecency**: a score from how often and how recently a result was picked for a query.
+- **Pick**: choosing an item with Enter. Frecency counts picks per item and query.
+- **Frecency**: a score from how often and how recently an item was picked for a query; a pick also counts, scaled down, while its query is still being typed. Halves every two weeks.
+- **Match strength**: how a query fits a name, strongest first: exact, prefix, word start, acronym (starts of words, in order: `vsc`, `vscode`), substring.
+- **Wrong layout**: a query typed with the other keyboard layout active (`мысщву` for `vscode`). It still matches, a little weaker.
 - **Backdrop**: the blurred glass behind the window, drawn by DWM.

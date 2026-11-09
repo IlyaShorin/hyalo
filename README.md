@@ -19,7 +19,7 @@ A fast, glassy Spotlight-style launcher for Windows 11. Press a hotkey, type a f
 | Crate | Role |
 |---|---|
 | `hyalo` | Launcher: window, hotkey, tray, rendering, providers (apps, calculator, settings, windows) |
-| `hyalo-core` | Index, query language, scoring, pipe protocol. Pure and tested |
+| `hyalo-core` | Items, matching (incl. wrong keyboard layout), ranking, frecency; later the query language and pipe protocol. Pure and tested |
 | `hyalo-indexer` | Windows service: reads the MFT, follows the USN journal, answers queries over a named pipe restricted to the user |
 
 The launcher never runs elevated. Only the indexer service does, because MFT access needs admin rights. Without the service the launcher falls back to walking directories.
