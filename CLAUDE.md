@@ -1,0 +1,27 @@
+# hyalo: notes for Claude
+
+Spotlight-style launcher for Windows 11, written in Rust. Goals, architecture and roadmap are in `README.md`.
+
+## Working rules
+
+- Follow `/ub-mode` (installed globally) for every code change: failing test first, smallest edit, pure logic, small ordered commits that say why, what changed, and how it was proved.
+- Platform glue (Win32, DirectX, COM) stays thin. Anything with a decision in it (layout math, text editing, query parsing, scoring) lives in a pure function with tests. Do not write fake tests for FFI glue.
+- Before a commit: `cargo fmt --all`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`, `scripts/gates.sh`.
+- Mutation testing on changed code: `scripts/gates.sh mutate --changed`. It needs Windows Developer Mode, because mutator links its workers with symlinks.
+- Check UI changes with your own eyes: run `target/debug/hyalo.exe`, then `powershell -ExecutionPolicy Bypass -File scripts/snap.ps1 -Stripes` and read `target/snap.png`. On a dark desktop the glass looks solid; the stripes show whether it really blurs.
+- Cargo is in `~/.cargo/bin`; a fresh shell may need `export PATH="$HOME/.cargo/bin:$PATH"`.
+
+## Windows specifics
+
+- Target Windows 11 (22H2+) for the DWM system backdrop. Older systems get a solid background.
+- The launcher process must never run elevated: launched apps would inherit elevation and drag-and-drop to normal windows breaks.
+- Use the `windows` crate for Win32 and COM. Keep each `unsafe` block small, with a comment stating the invariant it relies on.
+
+## Glossary
+
+- **Launcher**: the UI process, `hyalo.exe`.
+- **Indexer**: the Windows service that holds the file index.
+- **Provider**: a source of results (apps, files, calculator, settings, windows).
+- **Result**: one row in the list: title, subtitle, icon, actions.
+- **Frecency**: a score from how often and how recently a result was picked for a query.
+- **Backdrop**: the blurred glass behind the window, drawn by DWM.
