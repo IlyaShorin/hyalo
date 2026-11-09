@@ -74,6 +74,34 @@ impl Entry {
     pub(crate) fn is_root(self) -> bool {
         self.parent == NO_PARENT
     }
+
+    /// The entry as a snapshot keeps it: its four fields, little-endian.
+    pub(crate) fn to_bytes(self) -> [u8; 16] {
+        let fields = [self.parent, self.name, self.folded, self.lengths];
+        let mut bytes = [0; 16];
+        for (place, field) in bytes.as_chunks_mut::<4>().0.iter_mut().zip(fields) {
+            *place = field.to_le_bytes();
+        }
+        bytes
+    }
+
+    pub(crate) fn from_bytes(bytes: [u8; 16]) -> Entry {
+        let field = |at: usize| u32::from_le_bytes(bytes.as_chunks::<4>().0[at]);
+        Entry {
+            parent: field(0),
+            name: field(1),
+            folded: field(2),
+            lengths: field(3),
+        }
+    }
+}
+
+/// An index taken apart, as a snapshot holds it. The folded names are
+/// left out: they are folded again from the names.
+pub(crate) struct Parts {
+    pub(crate) entries: Vec<Entry>,
+    pub(crate) names: String,
+    pub(crate) free: Vec<u32>,
 }
 
 /// Every file and folder fed in so far.
@@ -168,6 +196,109 @@ impl Index {
             + self.names.capacity()
             + self.folded.capacity()
             + self.free.capacity() * size_of::<u32>()
+    }
+
+    /// The index's parts, for a snapshot: entries, names, folded names
+    /// and free places.
+    pub(crate) fn parts(&self) -> (&[Entry], &str, &[u32]) {
+        (&self.entries, &self.names, &self.free)
+    }
+
+    /// The index made of `parts`, if they hold together: known flags, every
+    /// live entry named within the arena and in a live folder, every folder
+    /// reaching a root, the free places exactly the removed entries, and
+    /// every name one `add` would take. The names are folded again here,
+    /// so the folded copy always is the fold of the name.
+    pub(crate) fn from_parts(parts: Parts) -> Option<Index> {
+        let mut index = Index {
+            entries: parts.entries,
+            names: parts.names,
+            folded: String::new(),
+            free: parts.free,
+        };
+        let sound = index.entries.iter().all(|&entry| index.sound(entry));
+        let whole = sound && index.rooted() && index.free_is_removed();
+        (whole && index.fold_names()).then_some(index)
+    }
+
+    fn sound(&self, entry: Entry) -> bool {
+        if entry.flags() & !(FOLDER | REMOVED) != 0 {
+            return false;
+        }
+        let start = entry.name as usize;
+        let named = self.names.get(start..start + entry.name_len()).is_some();
+        let in_folder = || {
+            let parent = self.entries.get(entry.parent as usize);
+            entry.is_root() || parent.is_some_and(|parent| parent.is_live() && parent.is_folder())
+        };
+        !entry.is_live() || (named && in_folder())
+    }
+
+    /// Folds every live name into a fresh arena; whether each was a name
+    /// `add` would take.
+    fn fold_names(&mut self) -> bool {
+        self.folded.reserve_exact(self.names.len());
+        for at in 0..self.entries.len() {
+            let entry = self.entries[at];
+            if !entry.is_live() {
+                continue;
+            }
+            let Ok(folded) = checked(self.name_of(entry), entry.is_root()) else {
+                return false;
+            };
+            self.entries[at] = Entry {
+                folded: offset(self.folded.len()),
+                lengths: entry.lengths & !(LENGTH_MASK << LENGTH_BITS)
+                    | (folded.len() as u32) << LENGTH_BITS,
+                ..entry
+            };
+            self.folded.push_str(&folded);
+        }
+        self.folded.shrink_to_fit();
+        true
+    }
+
+    /// Whether every live entry reaches a root: no folder is inside itself.
+    fn rooted(&self) -> bool {
+        // 0: not seen; 1: on the way up from the entry being checked; 2:
+        // reaches a root.
+        let mut state = vec![0_u8; self.entries.len()];
+        let mut chain = Vec::new();
+        (0..self.entries.len()).all(|start| self.reaches_root(start, &mut state, &mut chain))
+    }
+
+    fn reaches_root(&self, start: usize, state: &mut [u8], chain: &mut Vec<usize>) -> bool {
+        chain.clear();
+        let mut at = start;
+        while state[at] == 0 && self.entries[at].is_live() {
+            state[at] = 1;
+            chain.push(at);
+            if self.entries[at].is_root() {
+                break;
+            }
+            at = self.entries[at].parent as usize;
+        }
+        let looped = state[at] == 1 && !self.entries[at].is_root();
+        for &step in chain.iter() {
+            state[step] = 2;
+        }
+        !looped
+    }
+
+    /// Whether the free places are the removed entries, each listed once.
+    fn free_is_removed(&self) -> bool {
+        let removed = self.entries.iter().filter(|entry| !entry.is_live()).count();
+        let mut listed = vec![false; self.entries.len()];
+        let mut fresh = |at: &u32| {
+            let at = *at as usize;
+            let entry = self.entries.get(at);
+            let new = entry.is_some_and(|entry| !entry.is_live()) && !listed[at];
+            if new {
+                listed[at] = true;
+            }
+            new
+        };
+        removed == self.free.len() && self.free.iter().all(&mut fresh)
     }
 
     /// The entry `id`, if it is in the index.

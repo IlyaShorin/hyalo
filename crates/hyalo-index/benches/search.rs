@@ -40,10 +40,29 @@ fn main() {
         "{} entries, built in {built:.2?}, {memory:.0} MiB",
         index.len()
     );
+    let index = reloaded(&index);
+    let memory = index.memory() as f64 / 1_048_576.0;
+    println!("loaded back: {memory:.0} MiB");
     let places = Places::new(&[r"C:\Desktop", r"C:\Documents"]);
     for query in QUERIES {
         report(&index, &places, query);
     }
+}
+
+/// The index saved to memory and loaded back, as a restart loads it.
+fn reloaded(index: &Index) -> Index {
+    let started = Instant::now();
+    let mut bytes = Vec::new();
+    index.save(&mut bytes).expect("save to memory");
+    let saved = started.elapsed();
+    let started = Instant::now();
+    let back = Index::load(&mut bytes.as_slice()).expect("load");
+    let size = bytes.len() as f64 / 1_048_576.0;
+    println!(
+        "snapshot {size:.0} MiB, saved in {saved:.2?}, loaded in {:.2?}",
+        started.elapsed()
+    );
+    back
 }
 
 fn report(index: &Index, places: &Places, query: &str) {
