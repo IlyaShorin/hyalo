@@ -55,6 +55,10 @@ impl Entry {
         (self.lengths & LENGTH_MASK) as usize
     }
 
+    fn folded_len(self) -> usize {
+        (self.lengths >> LENGTH_BITS & LENGTH_MASK) as usize
+    }
+
     fn flags(self) -> u32 {
         self.lengths >> (2 * LENGTH_BITS)
     }
@@ -190,6 +194,11 @@ impl Index {
     pub(crate) fn name_of(&self, entry: Entry) -> &str {
         let start = entry.name as usize;
         &self.names[start..start + entry.name_len()]
+    }
+
+    pub(crate) fn folded_of(&self, entry: Entry) -> &str {
+        let start = entry.folded as usize;
+        &self.folded[start..start + entry.folded_len()]
     }
 
     fn name_at(&self, at: u32) -> &str {

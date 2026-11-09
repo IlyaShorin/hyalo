@@ -9,5 +9,7 @@
 //! the rows a search returns.
 
 mod index;
+mod search;
+pub mod synthetic;
 
-pub use index::{EntryId, Error, Index};
+pub use index::{EntryId, Error, Index, MAX_NAME};
