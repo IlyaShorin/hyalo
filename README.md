@@ -4,7 +4,7 @@ A fast, glassy Spotlight-style launcher for Windows 11. Press a hotkey, type a f
 
 *hyalo* comes from Greek ὕαλος, "glass".
 
-> **Status:** early prototype: finds and opens apps. Nothing to install yet.
+> **Status:** early prototype: finds and opens apps, answers arithmetic. Nothing to install yet.
 
 ## Goals
 
@@ -58,8 +58,9 @@ cargo run -p hyalo
 What the prototype does:
 
 - Alt+Space shows or hides the glass search bar; it also hides when it loses focus.
-- Typing lists up to eight matching apps (Start Menu desktop apps and Store apps, from `shell:AppsFolder`) with their icons, the matched letters highlighted.
-- Up and Down move the selection, Enter opens it, Ctrl+Shift+Enter opens it as administrator, Esc hides the launcher.
+- Typing lists up to eight matching apps (Start Menu desktop apps and Store apps, from `shell:AppsFolder`) with their icons, the matched letters highlighted. `ё` and `е` count as the same letter.
+- Arithmetic gets its answer as the first row: `+ - * /`, `^`, parentheses, `sqrt`, `round`, `abs`, decimals with a point or a comma (`2,5*3` answers `7,5`). `%` is per cent (`200+10%` is 220) unless an operand follows it (`7%3` is 1). Enter copies the answer.
+- Up and Down move the selection, or point at a row; Enter or a click opens it, Ctrl+Shift+Enter opens it as administrator, Esc hides the launcher.
 - Picks are remembered per query (frecency) in `%APPDATA%\hyalo\frecency.json`, so what you open often rises.
 
 There is no tray icon yet, so stop it with `taskkill /IM hyalo.exe`.
