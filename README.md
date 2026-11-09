@@ -4,7 +4,7 @@ A fast, glassy Spotlight-style launcher for Windows 11. Press a hotkey, type a f
 
 *hyalo* comes from Greek ὕαλος, "glass".
 
-> **Status:** early prototype: finds and opens apps, answers arithmetic. Nothing to install yet.
+> **Status:** early prototype: finds and opens apps, files and folders, answers arithmetic. Nothing to install yet.
 
 ## Goals
 
@@ -19,10 +19,11 @@ A fast, glassy Spotlight-style launcher for Windows 11. Press a hotkey, type a f
 | Crate | Role |
 |---|---|
 | `hyalo` | Launcher: window, hotkey, tray, rendering, providers (apps, calculator, settings, windows) |
-| `hyalo-core` | Items, matching (incl. wrong keyboard layout), ranking, frecency; later the query language and pipe protocol. Pure and tested |
+| `hyalo-core` | Items, matching (incl. wrong keyboard layout), ranking, frecency, location boosts; later the query language and pipe protocol. Pure and tested |
+| `hyalo-index` | The file index: every name once in an arena (and folded in another), 16-byte entries, search split over every core, a snapshot on disk. Pure: a directory walk feeds it now, the indexer service later |
 | `hyalo-indexer` | Windows service: reads the MFT, follows the USN journal, answers queries over a named pipe restricted to the user |
 
-The launcher never runs elevated. Only the indexer service does, because MFT access needs admin rights. Without the service the launcher falls back to walking directories.
+The launcher never runs elevated. Only the indexer service does, because MFT access needs admin rights. Without the service the launcher falls back to walking directories (what it does today).
 
 ## Roadmap
 
@@ -61,8 +62,10 @@ What the prototype does:
 - Alt+Space shows or hides the glass search bar; it also hides when it loses focus.
 - Typing lists up to eight matching apps (Start Menu desktop apps and Store apps, from `shell:AppsFolder`) with their icons, the matched letters highlighted. `ё` and `е` count as the same letter.
 - Arithmetic gets its answer as the first row: `+ - * /`, `^`, parentheses, `sqrt`, `round`, `abs`, decimals with a point or a comma (`2,5*3` answers `7,5`). `%` is per cent (`200+10%` is 220) unless an operand follows it (`7%3` is 1). Enter copies the answer.
-- Up and Down move the selection, or point at a row; Enter or a click opens it, Ctrl+Shift+Enter opens it as administrator, Esc hides the launcher.
-- Picks are remembered per query (frecency) in `%APPDATA%\hyalo\frecency.json`, so what you open often rises.
+- Files and folders from every fixed drive are listed too, with their shell icons and their folder as the second line. Apps rank above files that match as well; files under Desktop, Documents, Downloads and the project folders in your profile (`code`, `projects`, `source`, `src`, `dev`, `repos`, `git`) rank a little higher, files under `node_modules`, `AppData`, caches, `Windows` and folders whose names start with a dot (`.git`, `.vscode`) lower.
+- The files come from a walk of the fixed drives with your own rights (no admin). The first walk fills the list as it goes; the index is saved to `%LOCALAPPDATA%\hyalo\files.idx`, so the next start finds files at once, and showing the launcher walks again after 20 minutes. Junctions and symbolic links are listed but never followed; `$Recycle.Bin`, `System Volume Information` and the other `$` folders at a drive's root are left out.
+- Up and Down move the selection, or point at a row; Enter or a click opens it, Ctrl+Shift+Enter opens it as administrator, Ctrl+Enter shows a file or folder in its folder, Ctrl+C copies its full path, Esc hides the launcher.
+- Picks are remembered per query (frecency) in `%APPDATA%\hyalo\frecency.json`, so what you open often rises, files included.
 
 There is no tray icon yet, so stop it with `taskkill /IM hyalo.exe`.
 
@@ -73,6 +76,8 @@ Changes follow [ub-mode](https://github.com/unclebob/ub-mode): test first, small
 ```sh
 scripts/gates.sh          # CRAP < 10 and duplication < 0.8
 scripts/gates.sh mutate   # mutation testing
+cargo bench -p hyalo-index                            # search a million made-up names
+HYALO_BENCH_NAMES=3000000 cargo bench -p hyalo-index  # or as many as you like
 ```
 
 The script expects the tools checked out side by side under `~/code/unclebob` (override with `UNCLEBOB_TOOLS`), each with its own `.venv`. Stock mutator does not run on Windows yet: it builds its workers from symlinks, which Windows refuses without Developer Mode, and stops timed-out tests with a POSIX-only call. The fixes (copies where links are refused, a warm-up build per worker, process-tree kill) are on the `windows-support` branch of the local mutator clone and not upstream yet.

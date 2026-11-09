@@ -6,14 +6,16 @@ Spotlight-style launcher for Windows 11, written in Rust. Goals, architecture an
 
 - Follow `/ub-mode` (installed globally) for every code change: failing test first, smallest edit, pure logic, small ordered commits that say why, what changed, and how it was proved.
 - Platform glue (Win32, DirectX, COM) stays thin. Anything with a decision in it (layout math, text editing, query parsing, scoring) lives in a pure function with tests. Do not write fake tests for FFI glue.
-- Test the glue the way Windows drives it: `test_desktop::on_hidden_desktop` runs a test on a thread attached to a hidden desktop (no flashing windows, no stolen focus); the `Launcher` driver in `window.rs` tests sends real messages (keys, characters, mouse) and takes stand-in `Services` (provider, runner, picks file); `Renderer::read_frame` reads back the last presented frame so tests can check pixels. Never repaint before reading a frame: the test must see what the code put on screen.
+- Test the glue the way Windows drives it: `test_desktop::on_hidden_desktop` runs a test on a thread attached to a hidden desktop (no flashing windows, no stolen focus); the `Launcher` driver in `window.rs` tests sends real messages (keys, characters, mouse) and takes stand-in `Services` (sources, file index, icons, places, runner, picks file); file tests walk real trees made with `scratch::Scratch` (under `%TEMP%`, so inside `AppData`: their files carry the AppData penalty, so compare scores with a neighbour's); `Renderer::read_frame` reads back the last presented frame so tests can check pixels. Never repaint before reading a frame: the test must see what the code put on screen.
 - A test that touches the clipboard runs through `test_desktop::in_own_window_station`, in a child process with a window station of its own: the hidden desktop shares the user's clipboard, and a test must never overwrite what the user copied.
 - Drawing is pinned by reference images (`crates/hyalo/reference`, compared by `reference::assert_looks_like`). Change the look on purpose, look at the new frames, then accept them with `HYALO_BLESS=1 cargo test -p hyalo`. Never bless a frame you have not looked at.
 - Before a commit: `cargo fmt --all`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`, `scripts/gates.sh`.
-- Mutation testing on changed code: `scripts/gates.sh mutate --changed`. Goal: no survivors, no uncovered sites. Stock mutator fails on Windows; `~/code/unclebob/mutator` is on the `windows-support` branch, which fixes it. Do not run heavy builds while mutator runs: a mutant that times out counts as killed. For the launcher crate pass `--max-workers 8`: 24 workers linking at once have failed with LNK1201.
+- Mutation testing on changed code: `scripts/gates.sh mutate --changed` (it reads `git status`: once committed, name the files instead). Goal: no survivors, no uncovered sites. Stock mutator fails on Windows; `~/code/unclebob/mutator` is on the `windows-support` branch, which fixes it. Do not run heavy builds while mutator runs: a mutant that times out counts as killed. For the launcher crate pass `--max-workers 8`: 24 workers linking at once have failed with LNK1201.
 - Gate thresholds follow ub-mode: every function under CRAP 10, no duplicate candidates at similarity 0.8 or above.
 - Check UI changes with your own eyes: run `target/debug/hyalo.exe`, then `powershell -ExecutionPolicy Bypass -File scripts/snap.ps1 -Stripes` (add `-Type "no{DOWN}"` to see the list) and read `target/snap.png`. On a dark desktop the glass looks solid; the stripes show whether it really blurs.
 - Cargo is in `~/.cargo/bin`; a fresh shell may need `export PATH="$HOME/.cargo/bin:$PATH"`.
+- The repository uses LF. Python in text mode on Windows writes CRLF: open files with `newline='\n'`. Shell heredocs here may eat a backslash (`'\\'` came out as `'\'`); edit Rust with backslashes through the editor tool.
+- Search speed: `cargo bench -p hyalo-index` (a million synthetic names; `HYALO_BENCH_NAMES` for more). Keep every query under 20 ms in release.
 
 ## Windows specifics
 
@@ -24,7 +26,13 @@ Spotlight-style launcher for Windows 11, written in Rust. Goals, architecture an
 ## Glossary
 
 - **Launcher**: the UI process, `hyalo.exe`.
-- **Indexer**: the Windows service that holds the file index.
+- **Indexer**: the Windows service that will hold the file index (a later step). Until then the launcher holds it.
+- **Index**: every file and folder name the launcher can find (`hyalo-index`): names in one arena, folded names in another, one 16-byte **entry** per file or folder (its folder, where its names are, flags). Changed only by add, remove (with everything under it) and rename, so a walk or the NTFS journal can drive it.
+- **Root**: an entry with no folder, such as `C:`; holds entries but is never a result.
+- **Walk**: the files provider reading the fixed drives folder by folder with the user's rights. Lists junctions and symbolic links, never enters them.
+- **Snapshot**: the index on disk (`%LOCALAPPDATA%\hyalo\files.idx`), checked where it is read; the folded names are made again on load.
+- **Ceiling**: the most points a name could score, read cheaply from its folded text (rough) and its word starts; the search scores in full only names whose ceiling beats the rows already kept.
+- **Places**: where a file lives, in points: favoured folders (Desktop, Documents, Downloads, projects) +3, buried ones (`node_modules`, `AppData`, caches, `Windows`, any name starting with a dot) −10.
 - **Provider**: a source of results (apps, files, calculator, settings, windows). Runs off the UI thread and hands what it finds to the window piece by piece.
 - **Catalog**: what the launcher can search right now: the items providers found, and their icons.
 - **Item**: one row in the list (a "result" in the UI): id, title, subtitle, kind, the action Enter runs. Named `Item` so it does not clash with `std::result::Result`.
