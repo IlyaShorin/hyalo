@@ -56,35 +56,127 @@ pub struct Match {
 impl Match {
     /// How good the match is; more is better.
     pub fn points(&self) -> f64 {
-        let penalty = match self.layout {
-            Layout::AsTyped => 0.0,
-            Layout::Swapped => WRONG_LAYOUT,
-        };
-        self.strength.points() - penalty
+        points(self.strength, self.layout)
     }
+}
+
+fn points(strength: Strength, layout: Layout) -> f64 {
+    let penalty = match layout {
+        Layout::AsTyped => 0.0,
+        Layout::Swapped => WRONG_LAYOUT,
+    };
+    strength.points() - penalty
+}
+
+/// A query made ready to match many names: folded once, as typed and as
+/// read in the other keyboard layout.
+pub struct Pattern {
+    layouts: [(Layout, Folded); 2],
+}
+
+/// A query's letters as matching compares them, as `char`s and as text.
+struct Folded {
+    letters: Vec<char>,
+    text: String,
+}
+
+impl Folded {
+    fn new(letters: impl Iterator<Item = char>) -> Self {
+        let letters: Vec<char> = letters.collect();
+        let text = letters.iter().collect();
+        Self { letters, text }
+    }
+}
+
+impl Pattern {
+    pub fn new(query: &str) -> Self {
+        let typed = Folded::new(query.chars().map(compared));
+        // Swap before ё becomes е: they sit on different keys.
+        let swapped = query.chars().map(fold).map(keyboard::swap).map(compared);
+        Self {
+            layouts: [
+                (Layout::AsTyped, typed),
+                (Layout::Swapped, Folded::new(swapped)),
+            ],
+        }
+    }
+
+    /// Matches `name` in both layouts and keeps the better; `None` when
+    /// neither matches.
+    pub fn find(&self, name: &str) -> Option<Match> {
+        let letters: Vec<char> = name.chars().collect();
+        let folded: Vec<char> = letters.iter().copied().map(compared).collect();
+        let words = words(&letters);
+        self.layouts
+            .iter()
+            .filter_map(|(layout, query)| {
+                let (strength, positions) = classify(&query.letters, &folded, &words)?;
+                Some(Match {
+                    strength,
+                    layout: *layout,
+                    positions,
+                })
+            })
+            .max_by(|one, other| one.points().total_cmp(&other.points()))
+    }
+
+    /// The most points `find` could give a name, judged cheaply from the
+    /// name as `folded` gives it, without working out where words start;
+    /// `None` when the query's letters are not all in it in order, in
+    /// either layout, so `find` gives `None` too.
+    pub fn ceiling(&self, folded: &str) -> Option<f64> {
+        self.layouts
+            .iter()
+            .filter_map(|(layout, query)| {
+                let strength = best_possible(&query.text, folded)?;
+                Some(points(strength, *layout))
+            })
+            .max_by(f64::total_cmp)
+    }
+}
+
+/// The strongest kind of match a folded query could make in a folded
+/// name: one at the start is what it is; one later in a single run is a
+/// word start at best; letters apart, an acronym at best.
+fn best_possible(query: &str, folded: &str) -> Option<Strength> {
+    if !in_order(query, folded) {
+        return None;
+    }
+    if folded.starts_with(query) {
+        return Some(at_start(query.len(), folded.len()));
+    }
+    match folded.contains(query) {
+        true => Some(Strength::WordStart),
+        false => Some(Strength::Acronym),
+    }
+}
+
+/// Whether the bytes of `query` appear in `text` in order. Letters in
+/// order have their bytes in order, so this never refuses a match.
+fn in_order(query: &str, text: &str) -> bool {
+    let mut rest = text.bytes();
+    query.bytes().all(|byte| rest.any(|other| other == byte))
+}
+
+/// A name as matching compares it: every letter folded, ё as е. Indexes
+/// keep this beside the name for `Pattern::ceiling`.
+pub fn folded(name: &str) -> String {
+    name.chars().map(compared).collect()
 }
 
 /// Matches `query` against `name`, as typed and as if typed in the other
 /// keyboard layout, and keeps the better; `None` when neither matches.
 pub fn find(query: &str, name: &str) -> Option<Match> {
-    let letters: Vec<char> = name.chars().collect();
-    let folded: Vec<char> = letters.iter().copied().map(compared).collect();
-    let words = words(&letters);
-    let typed: Vec<char> = query.chars().map(compared).collect();
-    // Swap before ё becomes е: they sit on different keys.
-    let swapped = query.chars().map(fold).map(keyboard::swap).map(compared);
-    let swapped: Vec<char> = swapped.collect();
-    [(Layout::AsTyped, typed), (Layout::Swapped, swapped)]
-        .into_iter()
-        .filter_map(|(layout, query)| {
-            let (strength, positions) = classify(&query, &folded, &words)?;
-            Some(Match {
-                strength,
-                layout,
-                positions,
-            })
-        })
-        .max_by(|one, other| one.points().total_cmp(&other.points()))
+    Pattern::new(query).find(name)
+}
+
+/// A match from the start of a name: the whole of it, or its start. The
+/// lengths are in any one unit.
+fn at_start(query: usize, name: usize) -> Strength {
+    match query == name {
+        true => Strength::Exact,
+        false => Strength::Prefix,
+    }
 }
 
 /// The strongest way a folded query matches a folded name, and where.
@@ -96,11 +188,7 @@ fn classify(
     let found_at = |start: &usize| folded[*start..].starts_with(query);
     let run = |strength, start: usize| (strength, (start..start + query.len()).collect());
     if found_at(&0) {
-        let strength = match query.len() == folded.len() {
-            true => Strength::Exact,
-            false => Strength::Prefix,
-        };
-        return Some(run(strength, 0));
+        return Some(run(at_start(query.len(), folded.len()), 0));
     }
     let mut word_starts = words.iter().map(|word| word.start);
     word_starts
@@ -412,5 +500,83 @@ mod tests {
     fn a_query_that_reads_the_same_in_both_layouts_counts_as_typed() {
         let found = find("7", "7-Zip").unwrap();
         assert_eq!(found.layout, Layout::AsTyped);
+    }
+
+    #[test]
+    fn a_name_is_folded_as_matching_compares_it() {
+        assert_eq!(folded("Ёлка.TXT"), "елка.txt");
+    }
+
+    #[test]
+    fn a_prepared_pattern_finds_what_find_finds() {
+        let pattern = Pattern::new("мысщву");
+        assert_eq!(
+            pattern.find("Visual Studio Code"),
+            find("мысщву", "Visual Studio Code")
+        );
+    }
+
+    fn ceiling(query: &str, name: &str) -> Option<f64> {
+        Pattern::new(query).ceiling(&folded(name))
+    }
+
+    #[test]
+    fn the_ceiling_of_a_match_at_the_start_is_its_points() {
+        assert_eq!(ceiling("code", "Code"), Some(100.0));
+        assert_eq!(ceiling("co", "Code"), Some(80.0));
+    }
+
+    #[test]
+    fn the_ceiling_of_letters_together_later_is_a_word_start() {
+        assert_eq!(ceiling("ode", "Code"), Some(60.0));
+    }
+
+    #[test]
+    fn the_ceiling_of_letters_apart_in_order_is_an_acronym() {
+        assert_eq!(ceiling("vsc", "Visual Studio Code"), Some(40.0));
+        assert_eq!(ceiling("ae", "table"), Some(40.0), "only a bound");
+    }
+
+    #[test]
+    fn letters_out_of_order_have_no_ceiling() {
+        assert_eq!(ceiling("cvs", "Visual Studio Code"), None);
+        assert_eq!(ceiling("codes", "Code"), None);
+    }
+
+    #[test]
+    fn the_ceiling_counts_the_wrong_layout_a_little_lower() {
+        assert_eq!(ceiling("мысщву", "vscode"), Some(95.0));
+        assert_eq!(ceiling("мысщву", "vscode!"), Some(75.0));
+    }
+
+    /// Every text of `1..=longest` letters taken from `alphabet`.
+    fn texts(alphabet: &[char], longest: usize) -> Vec<String> {
+        let mut all = vec![String::new()];
+        let mut last = vec![String::new()];
+        for _ in 0..longest {
+            last = last
+                .iter()
+                .flat_map(|text| alphabet.iter().map(move |letter| format!("{text}{letter}")))
+                .collect();
+            all.extend(last.iter().cloned());
+        }
+        all
+    }
+
+    #[test]
+    fn the_ceiling_is_never_below_what_find_gives() {
+        // Names mix case (a hump), a gap, ё, and ф, which the 'a' key
+        // types in the other layout.
+        let names = texts(&['a', 'B', ' ', 'ё', 'ф'], 4);
+        let queries = texts(&['a', 'b', 'е', 'ф'], 3);
+        for query in &queries {
+            let pattern = Pattern::new(query);
+            for name in &names {
+                let found = pattern.find(name).map(|found| found.points());
+                let ceiling = pattern.ceiling(&folded(name));
+                let below = found.is_some_and(|points| ceiling.is_none_or(|top| top < points));
+                assert!(!below, "{query:?} in {name:?}: {found:?} over {ceiling:?}");
+            }
+        }
     }
 }
