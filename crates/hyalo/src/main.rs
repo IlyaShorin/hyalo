@@ -6,11 +6,11 @@ mod catalog;
 mod com;
 mod highlight;
 mod keys;
+mod launch;
 mod layout;
 mod query;
 mod render;
 mod results;
-#[cfg_attr(not(test), expect(dead_code, reason = "used once Enter records picks"))]
 mod store;
 mod window;
 

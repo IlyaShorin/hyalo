@@ -1,6 +1,7 @@
 //! The launcher window: a borderless popup over a DWM Acrylic backdrop.
 //! A global hotkey toggles it. Typing lists the matching items under the
-//! bar, the arrows move the selection, and Esc, Enter or losing focus
+//! bar, the arrows move the selection, Enter opens the selected item
+//! (Ctrl+Shift+Enter as administrator), and Esc, Enter or losing focus
 //! hides it.
 //!
 //! The `windows` crate marks Win32 calls `unsafe`. The invariant they rely
@@ -8,12 +9,13 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::{Instant, SystemTime};
 
 use hyalo_core::frecency::{Frecency, Timestamp};
-use hyalo_core::item::ItemId;
+use hyalo_core::item::{Action, ItemId};
 use hyalo_core::rank::Ranked;
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Dwm::{
@@ -47,6 +49,7 @@ use crate::layout::{self, Rect};
 use crate::query::Query;
 use crate::render::{Renderer, Row, Scene};
 use crate::results::Results;
+use crate::{launch, store};
 
 const HOTKEY_TOGGLE: i32 = 1;
 
@@ -67,6 +70,41 @@ impl Placement {
     }
 }
 
+/// Carries out a picked item's action, as administrator or not.
+pub type Runner = Box<dyn Fn(&Action, bool)>;
+
+/// What the window relies on from outside: the real ones in `run`,
+/// stand-ins in tests.
+pub struct Services {
+    /// Lists what the launcher searches.
+    pub finder: Finder,
+    pub run: Runner,
+    /// Where picks are kept between runs; `None` keeps them in memory.
+    pub picks: Option<PathBuf>,
+}
+
+impl Services {
+    /// The apps, opened by the shell, picks in `%APPDATA%\hyalo`.
+    fn real() -> Self {
+        Self {
+            finder: Arc::new(catalog::find_apps),
+            run: Box::new(run_in_background),
+            picks: store::default_path(),
+        }
+    }
+}
+
+/// Carries out `action` on a thread of its own: the shell can take a
+/// while, and the UAC prompt waits for the user.
+fn run_in_background(action: &Action, as_admin: bool) {
+    let action = action.clone();
+    std::thread::spawn(move || {
+        if let Err(error) = launch::run(&action, as_admin) {
+            eprintln!("hyalo: cannot run {action:?}: {error}");
+        }
+    });
+}
+
 struct App {
     hwnd: HWND,
     query: Query,
@@ -75,7 +113,7 @@ struct App {
     catalog: Catalog,
     results: Results,
     frecency: Frecency,
-    finder: Finder,
+    services: Services,
     /// When the finder last started; `None` before it ever did.
     found_at: Option<Instant>,
     /// The finder's thread sends here and posts WM_FOUND.
@@ -121,6 +159,21 @@ impl App {
         self.redraw()
     }
 
+    /// Carries out the selected row's action and notes the pick, on disk
+    /// too when there is a picks file.
+    fn open_picked(&mut self, as_admin: bool) {
+        let Some(row) = self.results.picked() else {
+            return;
+        };
+        (self.services.run)(&row.item.action, as_admin);
+        self.frecency.record(&row.item.id, self.query.text(), now());
+        if let Some(path) = &self.services.picks
+            && let Err(error) = store::save(path, &self.frecency)
+        {
+            eprintln!("hyalo: cannot save picks to {}: {error}", path.display());
+        }
+    }
+
     /// Lists what the query finds, best first, the first row selected.
     fn search(&mut self) {
         let items = &self.catalog.items;
@@ -139,7 +192,7 @@ impl App {
             icon_size: layout::icon_pixels(self.placement.dpi),
             known: self.catalog.icons.keys().cloned().collect(),
         };
-        let (finder, sender) = (self.finder.clone(), self.found.0.clone());
+        let (finder, sender) = (self.services.finder.clone(), self.found.0.clone());
         let window = self.hwnd.0 as isize;
         std::thread::spawn(move || finder(&request, &|found| hand_over(&sender, window, found)));
     }
@@ -202,16 +255,21 @@ thread_local! {
 
 /// Opens the launcher, listing the apps, and runs until the window closes.
 pub fn run() -> Result<()> {
-    open(Arc::new(catalog::find_apps))?;
+    open(Services::real())?;
     message_loop();
     Ok(())
 }
 
 /// Creates the launcher window on this thread, binds the hotkey and shows
-/// the window; `finder` lists what it searches.
-fn open(finder: Finder) -> Result<HWND> {
+/// the window, with the picks saved before.
+fn open(services: Services) -> Result<HWND> {
     let hwnd = create_window()?;
     let placement = placement_under_cursor()?;
+    let frecency = services
+        .picks
+        .as_deref()
+        .map(store::load)
+        .unwrap_or_default();
     APP.with_borrow_mut(|app| {
         *app = Some(App {
             hwnd,
@@ -220,8 +278,8 @@ fn open(finder: Finder) -> Result<HWND> {
             placement,
             catalog: Catalog::default(),
             results: Results::default(),
-            frecency: Frecency::default(),
-            finder,
+            frecency,
+            services,
             found_at: None,
             found: channel(),
         })
@@ -398,7 +456,12 @@ fn on_key(hwnd: HWND, key: VIRTUAL_KEY) -> Result<()> {
     let moved = match keys::command(key, held()) {
         Some(Command::Up) => with_app(|app| app.move_selection(Results::up)),
         Some(Command::Down) => with_app(|app| app.move_selection(Results::down)),
-        Some(Command::Hide | Command::Open { .. }) => {
+        Some(Command::Open { as_admin }) => {
+            with_app(|app| app.open_picked(as_admin));
+            hide(hwnd);
+            None
+        }
+        Some(Command::Hide) => {
             hide(hwnd);
             None
         }
@@ -483,6 +546,9 @@ fn with_app<R>(f: impl FnOnce(&mut App) -> R) -> Option<R> {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
+    use std::path::PathBuf;
+    use std::rc::Rc;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
@@ -491,7 +557,9 @@ mod tests {
     use windows::Win32::Foundation::RECT;
     use windows::Win32::Graphics::Dwm::DwmGetWindowAttribute;
     use windows::Win32::Graphics::Gdi::MonitorFromWindow;
-    use windows::Win32::UI::Input::KeyboardAndMouse::{VK_A, VK_DOWN, VK_ESCAPE, VK_RETURN, VK_UP};
+    use windows::Win32::UI::Input::KeyboardAndMouse::{
+        SetKeyboardState, VK_A, VK_DOWN, VK_ESCAPE, VK_RETURN, VK_UP,
+    };
     use windows::Win32::UI::WindowsAndMessaging::{
         DestroyWindow, GetClientRect, GetWindowRect, PM_QS_POSTMESSAGE, PM_REMOVE, PeekMessageW,
         SendMessageW, WA_ACTIVE, WM_NULL, WM_QUIT,
@@ -537,6 +605,55 @@ mod tests {
         (finder, runs)
     }
 
+    /// What the launcher was asked to run, and whether as administrator.
+    type Ran = Rc<RefCell<Vec<(Action, bool)>>>;
+
+    /// Services for a test: `finder`, a runner that only notes what it is
+    /// asked to run, and `picks` as the picks file.
+    fn services(finder: Finder, picks: Option<PathBuf>) -> (Services, Ran) {
+        let ran = Ran::default();
+        let noted = ran.clone();
+        let services = Services {
+            finder,
+            run: Box::new(move |action: &Action, as_admin| {
+                noted.borrow_mut().push((action.clone(), as_admin));
+            }),
+            picks,
+        };
+        (services, ran)
+    }
+
+    fn opened(title: &str, as_admin: bool) -> (Action, bool) {
+        (app(title).action, as_admin)
+    }
+
+    /// Holds these keys down for the messages this thread handles next.
+    fn hold(keys: &[VIRTUAL_KEY]) {
+        let mut state = [0_u8; 256];
+        for key in keys {
+            state[usize::from(key.0)] = 0x80;
+        }
+        unsafe { SetKeyboardState(&state) }.expect("set the keyboard state");
+    }
+
+    /// A picks file of its own for one test, removed afterwards.
+    struct PicksFile(PathBuf);
+
+    impl PicksFile {
+        fn new(test: &str) -> Self {
+            let name = format!("hyalo-{}-{test}.json", std::process::id());
+            let path = std::env::temp_dir().join(name);
+            let _ = std::fs::remove_file(&path);
+            Self(path)
+        }
+    }
+
+    impl Drop for PicksFile {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
     /// A finder that lists Notepad once the test lets it go.
     fn gated() -> (Finder, Sender<()>) {
         let (release, gate) = channel::<()>();
@@ -559,16 +676,26 @@ mod tests {
         }
 
         fn with(finder: Finder) -> Self {
-            Self(open(finder).expect("open the launcher"))
+            Self::serving(services(finder, None).0)
+        }
+
+        fn serving(services: Services) -> Self {
+            Self(open(services).expect("open the launcher"))
         }
 
         /// A launcher that lists apps with these titles, once it has them
         /// all, icons too.
         fn listing(titles: &[&str]) -> Self {
-            let launcher = Self::with(listing(titles).0);
+            Self::listing_with(titles, None).0
+        }
+
+        /// The same, keeping picks in `picks`; also what it was asked to run.
+        fn listing_with(titles: &[&str], picks: Option<PathBuf>) -> (Self, Ran) {
+            let (services, ran) = services(listing(titles).0, picks);
+            let launcher = Self::serving(services);
             let all = titles.len();
             launcher.pump_until(|app| app.catalog.icons.len() == all);
-            launcher
+            (launcher, ran)
         }
 
         /// Handles queued messages until `done` holds, as the message loop
@@ -859,7 +986,7 @@ mod tests {
     #[test]
     fn destroying_the_window_quits_the_app_with_exit_code_zero() {
         on_hidden_desktop(|| {
-            let hwnd = open(listing(&[]).0).expect("open the launcher");
+            let hwnd = open(services(listing(&[]).0, None).0).expect("open the launcher");
             unsafe { DestroyWindow(hwnd) }.expect("destroy the window");
             let mut message = MSG::default();
             let quit = unsafe { PeekMessageW(&mut message, None, WM_QUIT, WM_QUIT, PM_REMOVE) };
@@ -974,6 +1101,58 @@ mod tests {
             launcher.hotkey();
             launcher.type_text("note");
             assert_eq!(launcher.rect(), launcher.placement().rect(1));
+        });
+    }
+
+    #[test]
+    fn enter_opens_the_selected_app_and_hides() {
+        on_hidden_desktop(|| {
+            let (launcher, ran) = Launcher::listing_with(&["Notes", "Notepad"], None);
+            launcher.type_text("note");
+            launcher.press(VK_DOWN);
+            launcher.press(VK_RETURN);
+            assert_eq!(*ran.borrow(), [opened("Notepad", false)]);
+            assert!(!launcher.visible());
+        });
+    }
+
+    #[test]
+    fn ctrl_shift_enter_opens_it_as_administrator() {
+        on_hidden_desktop(|| {
+            let (launcher, ran) = Launcher::listing_with(&["Notepad"], None);
+            launcher.type_text("note");
+            hold(&[VK_CONTROL, VK_SHIFT]);
+            launcher.press(VK_RETURN);
+            assert_eq!(*ran.borrow(), [opened("Notepad", true)]);
+        });
+    }
+
+    #[test]
+    fn enter_with_nothing_listed_only_hides() {
+        on_hidden_desktop(|| {
+            let (launcher, ran) = Launcher::listing_with(&["Notepad"], None);
+            launcher.type_text("xyz");
+            launcher.press(VK_RETURN);
+            assert!(ran.borrow().is_empty());
+            assert!(!launcher.visible());
+        });
+    }
+
+    #[test]
+    fn a_pick_survives_a_restart_and_lifts_its_app() {
+        let picks = PicksFile::new("restart");
+        let path = picks.0.clone();
+        on_hidden_desktop(move || {
+            let titles = ["Notes", "Notepad"];
+            let (first, _) = Launcher::listing_with(&titles, Some(path.clone()));
+            first.type_text("note");
+            first.press(VK_DOWN);
+            first.press(VK_RETURN);
+            drop(first);
+            let (second, ran) = Launcher::listing_with(&titles, Some(path));
+            second.type_text("note");
+            second.press(VK_RETURN);
+            assert_eq!(*ran.borrow(), [opened("Notepad", false)]);
         });
     }
 }
