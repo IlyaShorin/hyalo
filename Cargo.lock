@@ -54,6 +54,7 @@ name = "hyalo"
 version = "0.0.1"
 dependencies = [
  "hyalo-core",
+ "hyalo-index",
  "png",
  "windows",
  "windows-numerics",

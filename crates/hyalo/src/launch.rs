@@ -1,17 +1,18 @@
-//! Carrying out what was picked: opening it the way Explorer opens it, or
-//! copying it.
+//! Carrying out what was picked: opening it the way Explorer opens it,
+//! showing it in its folder, or copying it.
 //!
 //! The launcher never runs elevated, so what it opens is not elevated
 //! either, unless asked: the `runas` verb shows the UAC prompt.
 
 use hyalo_core::item::Action;
-use windows::Win32::Foundation::{GlobalFree, HANDLE, HGLOBAL};
+use windows::Win32::Foundation::{ERROR_FILE_NOT_FOUND, GlobalFree, HANDLE, HGLOBAL};
 use windows::Win32::System::DataExchange::{
     CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData,
 };
 use windows::Win32::System::Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalUnlock};
 use windows::Win32::UI::Shell::{
-    SEE_MASK_FLAG_NO_UI, SEE_MASK_NOASYNC, SHELLEXECUTEINFOW, ShellExecuteExW,
+    ILCreateFromPathW, ILFree, SEE_MASK_FLAG_NO_UI, SEE_MASK_NOASYNC, SHELLEXECUTEINFOW,
+    SHOpenFolderAndSelectItems, ShellExecuteExW,
 };
 use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 use windows::core::{Error, HSTRING, PCWSTR, Result, w};
@@ -23,7 +24,25 @@ use crate::com::Com;
 pub fn run(action: &Action, as_admin: bool) -> Result<()> {
     match action {
         Action::Open(target) => open(target, as_admin),
+        Action::Reveal(path) => reveal(path),
         Action::CopyText(text) => copy(text),
+    }
+}
+
+/// Opens the folder `path` is in, in Explorer, with it selected. Waits
+/// for the shell, so call it off the UI thread.
+fn reveal(path: &str) -> Result<()> {
+    let _com = Com::init()?;
+    // SAFETY: the item list ILCreateFromPathW gives is ours: used once,
+    // then freed once.
+    unsafe {
+        let item = ILCreateFromPathW(&HSTRING::from(path));
+        if item.is_null() {
+            return Err(ERROR_FILE_NOT_FOUND.to_hresult().into());
+        }
+        let shown = SHOpenFolderAndSelectItems(item, None, 0);
+        ILFree(Some(item));
+        shown
     }
 }
 
@@ -126,6 +145,13 @@ mod tests {
         let missing = r"shell:AppsFolder\hyalo.test.no-such-app";
         let error = run(&Action::Open(missing.to_string()), false).expect_err("no such app");
         assert_ne!(error.code(), E_NOTIMPL);
+    }
+
+    #[test]
+    fn a_file_that_is_not_there_is_not_shown() {
+        let missing = r"C:\no such folder here\no such file.txt";
+        let error = run(&Action::Reveal(missing.to_string()), false).expect_err("not there");
+        assert_eq!(error.code(), ERROR_FILE_NOT_FOUND.to_hresult());
     }
 
     /// The text on the clipboard, if it holds text.

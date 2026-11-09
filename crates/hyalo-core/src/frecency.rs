@@ -70,6 +70,11 @@ impl Frecency {
             .map(|pick| pick.weight_at(now) * typed / pick.query.chars().count() as f64)
             .sum()
     }
+
+    /// Every item picked, each once.
+    pub fn ids(&self) -> impl Iterator<Item = &ItemId> {
+        self.picks.keys()
+    }
 }
 
 impl Pick {
@@ -226,6 +231,16 @@ mod tests {
         let frecency = picked(&[("code", START)]);
         let other = ItemId("chrome".to_string());
         assert_eq!(frecency.score(&other, "code", START), 0.0);
+    }
+
+    #[test]
+    fn lists_every_item_picked_once() {
+        let mut frecency = Frecency::default();
+        let (one, other) = (ItemId("one".to_string()), ItemId("other".to_string()));
+        for (id, query) in [(&one, "o"), (&other, "ot"), (&one, "on")] {
+            frecency.record(id, query, START);
+        }
+        assert_eq!(frecency.ids().collect::<Vec<_>>(), [&one, &other]);
     }
 
     #[test]

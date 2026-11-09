@@ -15,10 +15,10 @@ use windows::Win32::Graphics::Gdi::{DIBSECTION, DeleteObject, GetObjectW, HBITMA
 use windows::Win32::System::Com::CoTaskMemFree;
 use windows::Win32::UI::Shell::{
     BHID_EnumItems, FOLDERID_AppsFolder, IEnumShellItems, IShellItem, IShellItemImageFactory,
-    KF_FLAG_DEFAULT, SHGetKnownFolderItem, SIGDN, SIGDN_NORMALDISPLAY, SIGDN_PARENTRELATIVEPARSING,
-    SIIGBF_ICONONLY,
+    KF_FLAG_DEFAULT, SHCreateItemFromParsingName, SHGetKnownFolderItem, SIGDN, SIGDN_NORMALDISPLAY,
+    SIGDN_PARENTRELATIVEPARSING, SIIGBF_ICONONLY,
 };
-use windows::core::{Interface, Result};
+use windows::core::{HSTRING, Interface, Result};
 
 /// Prefixed to a parsing name, opens that entry of the Applications folder.
 const APPS_FOLDER: &str = "shell:AppsFolder\\";
@@ -104,18 +104,32 @@ impl Entry {
     /// item found by `find` is several times faster than parsing the
     /// name again (0.5 s against 2 to 7 s for 239 apps).
     pub fn icon(&self, size: u32) -> Result<Icon> {
-        let side = size as i32;
-        // SAFETY: COM is initialized on this thread; the bitmap GetImage
-        // hands over is ours, read once and deleted once.
-        unsafe {
-            let factory: IShellItemImageFactory = self.shell.cast()?;
-            let bitmap = factory.GetImage(SIZE { cx: side, cy: side }, SIIGBF_ICONONLY)?;
-            let icon = pixels(bitmap);
-            let _ = DeleteObject(bitmap.into());
-            let mut icon = icon?;
-            premultiply(&mut icon.bgra);
-            Ok(icon)
-        }
+        image(&self.shell, size)
+    }
+}
+
+/// The shell's icon for the file or folder at `path`, `size` pixels
+/// square: a program's own, or its type's. COM must be initialized on
+/// this thread.
+pub fn icon_at(path: &str, size: u32) -> Result<Icon> {
+    // SAFETY: COM is initialized on this thread; the item is ours.
+    let shell: IShellItem = unsafe { SHCreateItemFromParsingName(&HSTRING::from(path), None)? };
+    image(&shell, size)
+}
+
+/// A shell item's icon, `size` pixels square, premultiplied.
+fn image(shell: &IShellItem, size: u32) -> Result<Icon> {
+    let side = size as i32;
+    // SAFETY: COM is initialized on this thread; the bitmap GetImage
+    // hands over is ours, read once and deleted once.
+    unsafe {
+        let factory: IShellItemImageFactory = shell.cast()?;
+        let bitmap = factory.GetImage(SIZE { cx: side, cy: side }, SIIGBF_ICONONLY)?;
+        let icon = pixels(bitmap);
+        let _ = DeleteObject(bitmap.into());
+        let mut icon = icon?;
+        premultiply(&mut icon.bgra);
+        Ok(icon)
     }
 }
 

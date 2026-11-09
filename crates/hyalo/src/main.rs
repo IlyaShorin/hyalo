@@ -4,6 +4,7 @@
 mod apps;
 mod catalog;
 mod com;
+mod files;
 mod highlight;
 mod keys;
 mod launch;
@@ -16,6 +17,8 @@ mod window;
 
 #[cfg(test)]
 mod reference;
+#[cfg(test)]
+mod scratch;
 #[cfg(test)]
 mod test_desktop;
 

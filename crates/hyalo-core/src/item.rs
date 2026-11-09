@@ -38,6 +38,8 @@ pub enum Action {
     /// Hand the target to the shell: a path, or a `shell:AppsFolder\…` URI
     /// for a Store app.
     Open(String),
+    /// Open the folder a file or folder is in, with it selected.
+    Reveal(String),
     /// Put the text on the clipboard, such as a calculator answer.
     CopyText(String),
 }

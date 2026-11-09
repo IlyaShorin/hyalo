@@ -1,22 +1,24 @@
 //! The launcher window: a borderless popup over a DWM Acrylic backdrop.
-//! A global hotkey toggles it. Typing lists the matching items under the
-//! bar, the arrows move the selection, Enter opens the selected item
-//! (Ctrl+Shift+Enter as administrator), and Esc, Enter or losing focus
-//! hides it.
+//! A global hotkey toggles it. Typing lists the matching apps, files and
+//! folders under the bar, the arrows move the selection, Enter opens the
+//! selected item (Ctrl+Shift+Enter as administrator), Ctrl+Enter shows a
+//! file in its folder, Ctrl+C copies its path, and Esc, Enter or losing
+//! focus hides it.
 //!
 //! The `windows` crate marks Win32 calls `unsafe`. The invariant they rely
 //! on: `hwnd` is the live launcher window, owned by the UI thread.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, channel};
-use std::time::{Instant, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use hyalo_core::frecency::{Frecency, Timestamp};
-use hyalo_core::item::{Action, ItemId, Kind};
+use hyalo_core::item::{Action, Item, ItemId, Kind};
 use hyalo_core::places::Places;
+use hyalo_core::rank::Ranked;
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Dwm::{
     DWMSBT_TRANSIENTWINDOW, DWMWA_BORDER_COLOR, DWMWA_COLOR_NONE, DWMWA_SYSTEMBACKDROP_TYPE,
@@ -44,13 +46,14 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use windows::core::{BOOL, PCWSTR, Result, w};
 
 use crate::apps::Icon;
-use crate::catalog::{self, Catalog, Found, Provider, Request};
+use crate::catalog::{self, Catalog, FileIcons, Found, Provider, Request};
+use crate::files::{self, Files, Roots};
 use crate::highlight::utf16_ranges;
 use crate::keys::{self, Command, Held};
 use crate::layout::{self, Rect};
 use crate::query::Query;
 use crate::render::{Renderer, Row, Scene};
-use crate::results::{Listed, Results};
+use crate::results::{Listed, MAX_ROWS, Results};
 use crate::{launch, store};
 
 const HOTKEY_TOGGLE: i32 = 1;
@@ -75,21 +78,49 @@ impl Placement {
 /// Carries out a picked item's action, as administrator or not.
 pub type Runner = Box<dyn Fn(&Action, bool)>;
 
+/// A provider, and how long what it found is trusted.
+pub struct Source {
+    pub provider: Provider,
+    pub trusted: Duration,
+}
+
 /// What the window relies on from outside: the real ones in `run`,
 /// stand-ins in tests.
 pub struct Services {
-    /// Lists what the launcher searches.
-    pub provider: Provider,
+    /// Find what the launcher searches.
+    pub sources: Vec<Source>,
+    /// The file index a provider fills.
+    pub files: Files,
+    pub icons: FileIcons,
+    /// The user's folders, whose files rank a little higher.
+    pub places: Places,
     pub run: Runner,
     /// Where picks are kept between runs; `None` keeps them in memory.
     pub picks: Option<PathBuf>,
 }
 
 impl Services {
-    /// The apps, opened by the shell, picks in `%APPDATA%\hyalo`.
+    /// The apps; the files of the fixed drives, with their snapshot in
+    /// `%LOCALAPPDATA%\hyalo`; opened by the shell; picks in
+    /// `%APPDATA%\hyalo`.
     fn real() -> Self {
+        let (files, writer) = Files::new();
+        let drives: Roots = Arc::new(files::fixed_drives);
+        let walk = files::provider(writer, drives, files::default_snapshot());
         Self {
-            provider: Arc::new(catalog::find_apps),
+            sources: vec![
+                Source {
+                    provider: Arc::new(catalog::find_apps),
+                    trusted: catalog::REFRESH_AFTER,
+                },
+                Source {
+                    provider: walk,
+                    trusted: files::REFRESH_AFTER,
+                },
+            ],
+            files,
+            icons: Arc::new(catalog::file_icons),
+            places: files::places(),
             run: Box::new(run_in_background),
             picks: store::default_path(),
         }
@@ -115,11 +146,12 @@ struct App {
     catalog: Catalog,
     results: Results,
     frecency: Frecency,
-    /// The user's folders, whose files rank a little higher.
-    places: Places,
     services: Services,
-    /// When the provider last started; `None` before it ever did.
-    found_at: Option<Instant>,
+    /// When each source's provider last started; `None` before it ever
+    /// did.
+    found_at: Vec<Option<Instant>>,
+    /// Files and folders whose icons were asked for.
+    asked: HashSet<ItemId>,
     /// The provider's thread sends here and posts WM_FOUND.
     found: (Sender<Found>, Receiver<Found>),
     /// Where the pointer was last seen, in client pixels; `None` when not
@@ -191,54 +223,114 @@ impl App {
             return false;
         };
         self.results.select(row);
-        self.open_picked(false);
+        self.act(Command::Open { as_admin: false });
         true
     }
 
-    /// Carries out the selected row's action and notes the pick, on disk
-    /// too when there is a picks file. A calculator answer is not noted:
-    /// it already comes first, and each sum would leave a pick behind.
-    fn open_picked(&mut self, as_admin: bool) {
-        let Some(row) = self.results.picked() else {
-            return;
+    /// Carries out what `command` does with the selected row and notes
+    /// the pick; whether it did anything.
+    fn act(&mut self, command: Command) -> bool {
+        let Some(item) = self.results.picked().map(|row| row.item.clone()) else {
+            return false;
         };
-        (self.services.run)(&row.item.action, as_admin);
-        if row.item.kind == Kind::Calculator {
+        let Some((action, as_admin)) = keys::action(command, &item) else {
+            return false;
+        };
+        (self.services.run)(&action, as_admin);
+        self.note(item);
+        true
+    }
+
+    /// Notes a pick, on disk too when there is a picks file; a file or
+    /// folder is kept to rank with the apps from now on. A calculator
+    /// answer is not noted: it already comes first, and each sum would
+    /// leave a pick behind.
+    fn note(&mut self, item: Item) {
+        if item.kind == Kind::Calculator {
             return;
         }
-        self.frecency.record(&row.item.id, self.query.text(), now());
+        self.frecency.record(&item.id, self.query.text(), now());
         if let Some(path) = &self.services.picks
             && let Err(error) = store::save(path, &self.frecency)
         {
             eprintln!("hyalo: cannot save picks to {}: {error}", path.display());
         }
+        if item.path().is_some() {
+            self.catalog.pick(item);
+        }
     }
 
     /// Lists what the query finds, best first, the first row selected.
     fn search(&mut self) {
-        let items = &self.catalog.items;
-        let places = &self.places;
-        self.results = Results::search(self.query.text(), items, &self.frecency, places, now());
+        let files = self.file_hits();
+        let items = self.catalog.items.iter().chain(&self.catalog.picked);
+        let (frecency, places) = (&self.frecency, &self.services.places);
+        self.results = Results::search(self.query.text(), items, files, frecency, places, now());
+        self.fetch_icons();
     }
 
-    /// Starts the provider on a thread of its own, unless the list it
-    /// last found is still fresh.
-    fn find_if_stale(&mut self) {
-        let now = Instant::now();
-        if !catalog::stale(self.found_at, now) {
+    /// The files and folders the index finds for the query: enough to
+    /// fill the list even when every picked file is among them.
+    fn file_hits(&self) -> Vec<Ranked> {
+        let query = self.query.text();
+        if query.is_empty() {
+            return Vec::new();
+        }
+        let enough = MAX_ROWS + self.catalog.picked.len();
+        self.services
+            .files
+            .search(query, &self.services.places, enough)
+    }
+
+    /// Asks for the icons of the files and folders listed that have none
+    /// yet, once each, on a thread of its own.
+    fn fetch_icons(&mut self) {
+        let rows = self.results.rows().iter();
+        let files = rows.filter(|row| row.item.path().is_some());
+        let wanted: Vec<ItemId> = files
+            .map(|row| row.item.id.clone())
+            .filter(|id| !self.catalog.icons.contains_key(id) && self.asked.insert(id.clone()))
+            .collect();
+        if wanted.is_empty() {
             return;
         }
-        self.found_at = Some(now);
-        let request = Request {
-            icon_size: layout::icon_pixels(self.placement.dpi),
-            known: self.catalog.icons.keys().cloned().collect(),
-        };
-        let (provider, sender) = (self.services.provider.clone(), self.found.0.clone());
+        let size = layout::icon_pixels(self.placement.dpi);
+        let (icons, sender) = (self.services.icons.clone(), self.found.0.clone());
         let window = self.hwnd.0 as isize;
-        std::thread::spawn(move || provider(&request, &|found| hand_over(&sender, window, found)));
+        std::thread::spawn(move || {
+            icons(&wanted, size, &|found| hand_over(&sender, window, found))
+        });
     }
 
-    /// Takes in what the provider handed over, searches again (keeping
+    /// Starts each source's provider on a thread of its own, unless what
+    /// it last found is still fresh.
+    fn find_if_stale(&mut self) {
+        let now = Instant::now();
+        for (source, found_at) in self.services.sources.iter().zip(&mut self.found_at) {
+            if !catalog::stale(*found_at, now, source.trusted) {
+                continue;
+            }
+            *found_at = Some(now);
+            let request = Request {
+                icon_size: layout::icon_pixels(self.placement.dpi),
+                known: self.catalog.icons.keys().cloned().collect(),
+            };
+            let (provider, sender) = (source.provider.clone(), self.found.0.clone());
+            let window = self.hwnd.0 as isize;
+            let find = move || provider(&request, &|found| hand_over(&sender, window, found));
+            std::thread::spawn(find);
+        }
+    }
+
+    /// Looks, on a thread of its own, for the picked files and folders
+    /// that are still there, so they rank with the apps.
+    fn find_picked(&self) {
+        let ids: Vec<ItemId> = self.frecency.ids().cloned().collect();
+        let (sender, window) = (self.found.0.clone(), self.hwnd.0 as isize);
+        std::thread::spawn(move || hand_over(&sender, window, Found::Picked(files::picked(&ids))));
+    }
+
+    /// Takes in what the providers handed over, searches again (keeping
     /// the selected item selected), and shows the result if the window is
     /// up. After an icon the search finds the same rows; it costs less
     /// than the redraw that follows.
@@ -246,11 +338,13 @@ impl App {
         for found in self.found.1.try_iter() {
             self.catalog.take(found);
         }
-        let (query, items) = (self.query.text(), &self.catalog.items);
-        let places = &self.places;
+        let files = self.file_hits();
+        let items = self.catalog.items.iter().chain(&self.catalog.picked);
+        let (query, frecency, places) = (self.query.text(), &self.frecency, &self.services.places);
         self.results = self
             .results
-            .refreshed(query, items, &self.frecency, places, now());
+            .refreshed(query, items, files, frecency, places, now());
+        self.fetch_icons();
         match unsafe { IsWindowVisible(self.hwnd) }.as_bool() {
             true => self.present(),
             false => Ok(()),
@@ -315,8 +409,9 @@ fn open(services: Services) -> Result<HWND> {
         .as_deref()
         .map(store::load)
         .unwrap_or_default();
+    let sources = services.sources.len();
     APP.with_borrow_mut(|app| {
-        *app = Some(App {
+        let opened = App {
             hwnd,
             query: Query::default(),
             renderer: None,
@@ -324,12 +419,14 @@ fn open(services: Services) -> Result<HWND> {
             catalog: Catalog::default(),
             results: Results::default(),
             frecency,
-            places: Places::default(),
             services,
-            found_at: None,
+            found_at: vec![None; sources],
+            asked: HashSet::new(),
             found: channel(),
             pointer: None,
-        })
+        };
+        opened.find_picked();
+        *app = Some(opened);
     });
     style_window(hwnd)?;
     register_hotkey(hwnd);
@@ -521,17 +618,26 @@ fn hide(hwnd: HWND) {
     });
 }
 
+/// Moves the selection, or acts on the selected row. Enter hides the
+/// launcher even with nothing to open; Ctrl+Enter and Ctrl+C hide it only
+/// when the row has a folder to show or a path to copy.
 fn on_key(hwnd: HWND, key: VIRTUAL_KEY) -> Result<()> {
     let moved = match keys::command(key, held()) {
         Some(Command::Up) => with_app(|app| app.move_selection(Results::up)),
         Some(Command::Down) => with_app(|app| app.move_selection(Results::down)),
-        Some(Command::Open { as_admin }) => {
-            with_app(|app| app.open_picked(as_admin));
+        Some(Command::Hide) => {
             hide(hwnd);
             None
         }
-        Some(Command::Hide) => {
+        Some(command @ Command::Open { .. }) => {
+            with_app(|app| app.act(command));
             hide(hwnd);
+            None
+        }
+        Some(command) => {
+            if with_app(|app| app.act(command)) == Some(true) {
+                hide(hwnd);
+            }
             None
         }
         None => None,
@@ -637,7 +743,7 @@ mod tests {
     use windows::Win32::Graphics::Dwm::DwmGetWindowAttribute;
     use windows::Win32::Graphics::Gdi::MonitorFromWindow;
     use windows::Win32::UI::Input::KeyboardAndMouse::{
-        SetKeyboardState, VK_A, VK_DOWN, VK_ESCAPE, VK_RETURN, VK_UP,
+        SetKeyboardState, VK_A, VK_C, VK_DOWN, VK_ESCAPE, VK_RETURN, VK_UP,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
         DestroyWindow, GetClientRect, GetWindowRect, PM_QS_POSTMESSAGE, PM_REMOVE, PeekMessageW,
@@ -646,7 +752,9 @@ mod tests {
 
     use super::*;
     use crate::render::Frame;
+    use crate::scratch::Scratch;
     use crate::test_desktop::on_hidden_desktop;
+    use std::path::Path;
 
     fn app(title: &str) -> Item {
         Item {
@@ -687,19 +795,54 @@ mod tests {
     /// What the launcher was asked to run, and whether as administrator.
     type Ran = Rc<RefCell<Vec<(Action, bool)>>>;
 
-    /// Services for a test: `provider`, a runner that only notes what it is
-    /// asked to run, and `picks` as the picks file.
+    /// Services for a test: `provider`, no files, red icons for files, a
+    /// runner that only notes what it is asked to run, and `picks` as the
+    /// picks file.
     fn services(provider: Provider, picks: Option<PathBuf>) -> (Services, Ran) {
         let ran = Ran::default();
         let noted = ran.clone();
+        let icons: FileIcons = Arc::new(|ids: &[ItemId], size, report: &dyn Fn(Found)| {
+            for id in ids {
+                report(Found::Icon(id.clone(), red(size)));
+            }
+        });
         let services = Services {
-            provider,
+            sources: vec![Source {
+                provider,
+                trusted: catalog::REFRESH_AFTER,
+            }],
+            files: Files::default(),
+            icons,
+            places: Places::default(),
             run: Box::new(move |action: &Action, as_admin| {
                 noted.borrow_mut().push((action.clone(), as_admin));
             }),
             picks,
         };
         (services, ran)
+    }
+
+    /// The same, finding files by walking what `roots` gives.
+    fn walking(roots: Roots, picks: Option<PathBuf>) -> (Services, Ran) {
+        let (mut services, ran) = services(listing(&[]).0, picks);
+        let (files, writer) = Files::new();
+        services.files = files;
+        services.sources.push(Source {
+            provider: files::provider(writer, roots, None),
+            trusted: files::REFRESH_AFTER,
+        });
+        (services, ran)
+    }
+
+    /// Roots that are just `folder`.
+    fn just(folder: &Path) -> Roots {
+        let folder = folder.to_path_buf();
+        Arc::new(move || vec![folder.clone()])
+    }
+
+    fn titles(app: &App) -> Vec<String> {
+        let rows = app.results.rows().iter();
+        rows.map(|row| row.item.title.clone()).collect()
     }
 
     fn opened(title: &str, as_admin: bool) -> (Action, bool) {
@@ -774,6 +917,19 @@ mod tests {
         /// all, icons too.
         fn listing(titles: &[&str]) -> Self {
             Self::listing_with(titles, None).0
+        }
+
+        /// A launcher that finds the files and folders in `folder`, and
+        /// what it was asked to run.
+        fn finding(folder: &Path, picks: Option<PathBuf>) -> (Self, Ran) {
+            let (services, ran) = walking(just(folder), picks);
+            (Self::serving(services), ran)
+        }
+
+        /// Types `query` and waits for `rows` rows.
+        fn search_for(&self, query: &str, rows: usize) {
+            self.type_text(query);
+            self.pump_until(|app| app.results.rows().len() == rows);
         }
 
         /// The same, keeping picks in `picks`; also what it was asked to run.
@@ -1343,6 +1499,117 @@ mod tests {
             launcher.press(VK_RETURN);
             assert_eq!(ran.borrow().len(), 1, "the answer was copied");
             assert!(!path.exists(), "no picks saved");
+        });
+    }
+
+    #[test]
+    fn typing_lists_files_and_folders_with_their_icons() {
+        on_hidden_desktop(|| {
+            let tree = Scratch::new("window-files").with(&["notes.txt", "Notes\\", "other.md"]);
+            let (launcher, _) = Launcher::finding(&tree.0, None);
+            launcher.search_for("notes", 2);
+            launcher.pump_until(|app| app.catalog.icons.len() == 2);
+            assert_eq!(
+                with_app(|app| titles(app)).expect("app state"),
+                ["Notes", "notes.txt"]
+            );
+            assert_eq!(launcher.rect(), launcher.placement().rect(2));
+            let red = [0, 0, 255, 255];
+            assert_eq!(launcher.pixel_at(28.0, layout::row_top(1) + 24.0), red);
+        });
+    }
+
+    #[test]
+    fn files_found_while_the_query_is_typed_are_listed_at_once() {
+        on_hidden_desktop(|| {
+            let tree = Scratch::new("window-later").with(&["report.pdf"]);
+            let (release, gate) = channel::<()>();
+            let (gate, root) = (Mutex::new(gate), tree.0.clone());
+            let roots: Roots = Arc::new(move || {
+                let _ = gate.lock().expect("the gate").recv();
+                vec![root.clone()]
+            });
+            let launcher = Launcher::serving(walking(roots, None).0);
+            launcher.type_text("report");
+            assert_eq!(launcher.rect(), launcher.placement().rect(0));
+            release.send(()).expect("release the walk");
+            launcher.pump_until(|app| !app.results.rows().is_empty());
+            assert_eq!(launcher.rect(), launcher.placement().rect(1));
+        });
+    }
+
+    #[test]
+    fn enter_opens_a_file() {
+        on_hidden_desktop(|| {
+            let tree = Scratch::new("window-open").with(&["report.pdf"]);
+            let (launcher, ran) = Launcher::finding(&tree.0, None);
+            launcher.search_for("report", 1);
+            launcher.press(VK_RETURN);
+            let opened = Action::Open(tree.path("report.pdf"));
+            assert_eq!(*ran.borrow(), [(opened, false)]);
+            assert!(!launcher.visible());
+        });
+    }
+
+    #[test]
+    fn ctrl_enter_shows_a_file_in_its_folder() {
+        on_hidden_desktop(|| {
+            let tree = Scratch::new("window-reveal").with(&["report.pdf"]);
+            let (launcher, ran) = Launcher::finding(&tree.0, None);
+            launcher.search_for("report", 1);
+            hold(&[VK_CONTROL]);
+            launcher.press(VK_RETURN);
+            let shown = Action::Reveal(tree.path("report.pdf"));
+            assert_eq!(*ran.borrow(), [(shown, false)]);
+            assert!(!launcher.visible());
+        });
+    }
+
+    #[test]
+    fn ctrl_c_copies_the_path_of_a_folder() {
+        on_hidden_desktop(|| {
+            let tree = Scratch::new("window-copy").with(&["Reports\\"]);
+            let (launcher, ran) = Launcher::finding(&tree.0, None);
+            launcher.search_for("reports", 1);
+            hold(&[VK_CONTROL]);
+            launcher.press(VK_C);
+            let copied = Action::CopyText(tree.path("Reports"));
+            assert_eq!(*ran.borrow(), [(copied, false)]);
+            assert!(!launcher.visible());
+        });
+    }
+
+    #[test]
+    fn ctrl_enter_and_ctrl_c_leave_an_app_alone() {
+        on_hidden_desktop(|| {
+            let (launcher, ran) = Launcher::listing_with(&["Notepad"], None);
+            launcher.type_text("note");
+            hold(&[VK_CONTROL]);
+            launcher.press(VK_RETURN);
+            launcher.press(VK_C);
+            assert!(ran.borrow().is_empty());
+            assert!(launcher.visible());
+        });
+    }
+
+    #[test]
+    fn a_picked_file_rises_above_an_equal_one_after_a_restart() {
+        let picks = PicksFile::new("file");
+        let path = picks.0.clone();
+        on_hidden_desktop(move || {
+            let tree = Scratch::new("window-picked").with(&["notes a.txt", "notes b.txt"]);
+            let (first, _) = Launcher::finding(&tree.0, Some(path.clone()));
+            first.search_for("notes", 2);
+            first.press(VK_DOWN);
+            first.press(VK_RETURN);
+            drop(first);
+            let (second, ran) = Launcher::finding(&tree.0, Some(path));
+            // As at a real start: the picks are back long before typing.
+            second.pump_until(|app| !app.catalog.picked.is_empty());
+            second.search_for("notes", 2);
+            second.press(VK_RETURN);
+            let opened = Action::Open(tree.path("notes b.txt"));
+            assert_eq!(*ran.borrow(), [(opened, false)]);
         });
     }
 

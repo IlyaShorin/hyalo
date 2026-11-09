@@ -17,6 +17,10 @@ pub enum Found {
     Items(Vec<Item>),
     /// The icon of one item.
     Icon(ItemId, Icon),
+    /// The file index changed: search it again.
+    Files,
+    /// Picked files and folders that are still there.
+    Picked(Vec<Item>),
 }
 
 /// What the window asks a provider for.
@@ -31,11 +35,19 @@ pub struct Request {
 /// as it goes.
 pub type Provider = Arc<dyn Fn(&Request, &dyn Fn(Found)) + Send + Sync>;
 
+/// Finds the icons of the files and folders `ids` names, `size` pixels
+/// square, on a thread of its own, reporting each as `Found::Icon`.
+pub type FileIcons = Arc<dyn Fn(&[ItemId], u32, &dyn Fn(Found)) + Send + Sync>;
+
 /// The items to search and the icons found for them so far.
 #[derive(Default)]
 pub struct Catalog {
+    /// What the apps provider lists.
     pub items: Vec<Item>,
     pub icons: HashMap<ItemId, Icon>,
+    /// Files and folders picked before, ranked with the items so that
+    /// frecency lifts them however many files match as well.
+    pub picked: Vec<Item>,
 }
 
 impl Catalog {
@@ -46,6 +58,15 @@ impl Catalog {
             Found::Icon(id, icon) => {
                 self.icons.insert(id, icon);
             }
+            Found::Files => {}
+            Found::Picked(items) => items.into_iter().for_each(|item| self.pick(item)),
+        }
+    }
+
+    /// Remembers a picked file or folder, once.
+    pub fn pick(&mut self, item: Item) {
+        if !self.picked.iter().any(|picked| picked.id == item.id) {
+            self.picked.push(item);
         }
     }
 }
@@ -77,15 +98,29 @@ fn report_apps(request: &Request, report: &dyn Fn(Found)) -> Result<()> {
     Ok(())
 }
 
-/// How long a list is trusted before showing the launcher looks again.
-/// Listing the apps costs half a second of a core, too much for every
-/// show.
-const REFRESH_AFTER: Duration = Duration::from_secs(5 * 60);
+/// The shell's icons for files and folders, one by one.
+pub fn file_icons(ids: &[ItemId], size: u32, report: &dyn Fn(Found)) {
+    let com = Com::init();
+    if let Err(error) = com {
+        eprintln!("hyalo: no icons for files: {error}");
+        return;
+    }
+    for id in ids {
+        match apps::icon_at(&id.0, size) {
+            Ok(icon) => report(Found::Icon(id.clone(), icon)),
+            Err(error) => eprintln!("hyalo: no icon for {}: {error}", id.0),
+        }
+    }
+}
+
+/// How long the apps are trusted before showing the launcher looks again.
+/// Listing them costs half a second of a core, too much for every show.
+pub const REFRESH_AFTER: Duration = Duration::from_secs(5 * 60);
 
 /// Whether a list found at `found_at` (`None`: never) is due for
-/// another look at `now`.
-pub fn stale(found_at: Option<Instant>, now: Instant) -> bool {
-    found_at.is_none_or(|at| now.duration_since(at) >= REFRESH_AFTER)
+/// another look at `now`, when it is trusted for `trusted`.
+pub fn stale(found_at: Option<Instant>, now: Instant, trusted: Duration) -> bool {
+    found_at.is_none_or(|at| now.duration_since(at) >= trusted)
 }
 
 #[cfg(test)]
@@ -130,16 +165,49 @@ mod tests {
 
     #[test]
     fn a_list_never_found_is_stale() {
-        assert!(stale(None, Instant::now()));
+        assert!(stale(None, Instant::now(), REFRESH_AFTER));
     }
 
     #[test]
-    fn a_list_is_trusted_for_five_minutes() {
+    fn a_list_is_trusted_as_long_as_it_says() {
         let found = Instant::now();
         let later = |seconds| found + Duration::from_secs(seconds);
-        assert!(!stale(Some(found), found));
-        assert!(!stale(Some(found), later(299)));
-        assert!(stale(Some(found), later(300)));
+        let five_minutes = Duration::from_secs(300);
+        assert!(!stale(Some(found), found, five_minutes));
+        assert!(!stale(Some(found), later(299), five_minutes));
+        assert!(stale(Some(found), later(300), five_minutes));
+        assert_eq!(REFRESH_AFTER, five_minutes, "the apps");
+    }
+
+    #[test]
+    fn picked_files_are_kept_once() {
+        let mut catalog = Catalog::default();
+        let file = Item::file(r"C:\a.txt".to_string(), false);
+        catalog.pick(file.clone());
+        catalog.take(Found::Picked(vec![
+            file.clone(),
+            Item::file(r"C:\b".to_string(), true),
+        ]));
+        catalog.take(Found::Files);
+        assert_eq!(
+            catalog.picked,
+            [file, Item::file(r"C:\b".to_string(), true)]
+        );
+    }
+
+    #[test]
+    fn a_files_icon_comes_from_the_shell() {
+        let windows = std::env::var("SystemRoot").expect("SystemRoot is set");
+        let ids = [
+            ItemId(format!(r"{windows}\explorer.exe")),
+            ItemId(format!(r"{windows}\no such file.exe")),
+        ];
+        let found = RefCell::new(Vec::new());
+        file_icons(&ids, 32, &|piece| found.borrow_mut().push(piece));
+        let found = found.into_inner();
+        assert_eq!(found.len(), 1, "one icon, none for what is not there");
+        let icon = icon_of(&found, &ids[0].0).expect("explorer's icon");
+        assert_eq!((icon.width, icon.height), (32, 32));
     }
 
     const EXPLORER: &str = "Microsoft.Windows.Explorer";

@@ -11,8 +11,14 @@ use hyalo_core::frecency::Frecency;
 
 /// `%APPDATA%\hyalo\frecency.json`, so picks follow a roaming profile.
 pub fn default_path() -> Option<PathBuf> {
-    let app_data = std::env::var_os("APPDATA")?;
-    Some(PathBuf::from(app_data).join("hyalo").join("frecency.json"))
+    ours("APPDATA", "frecency.json")
+}
+
+/// The file `name` in hyalo's folder inside the folder the environment
+/// variable `variable` names.
+pub fn ours(variable: &str, name: &str) -> Option<PathBuf> {
+    let folder = std::env::var_os(variable)?;
+    Some(PathBuf::from(folder).join("hyalo").join(name))
 }
 
 /// The picks saved at `path`, or none if nothing could be read. A file
@@ -133,5 +139,10 @@ mod tests {
         let app_data = std::env::var_os("APPDATA").expect("APPDATA is set on Windows");
         let expected = PathBuf::from(app_data).join("hyalo").join("frecency.json");
         assert_eq!(default_path(), Some(expected));
+    }
+
+    #[test]
+    fn without_the_folder_there_is_no_file() {
+        assert_eq!(ours("HYALO_NO_SUCH_FOLDER", "frecency.json"), None);
     }
 }

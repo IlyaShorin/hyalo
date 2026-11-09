@@ -1,10 +1,12 @@
 //! The rows the window lists for a query, and which one Enter picks.
 
+use std::collections::HashSet;
+
 use hyalo_core::calculator;
 use hyalo_core::frecency::{Frecency, Timestamp};
 use hyalo_core::item::Item;
 use hyalo_core::places::Places;
-use hyalo_core::rank::rank;
+use hyalo_core::rank::{Ranked, rank};
 
 /// The most rows the window lists.
 pub const MAX_ROWS: usize = 8;
@@ -27,11 +29,14 @@ pub struct Results {
 
 impl Results {
     /// The calculator's answer if the query is arithmetic, then the best
-    /// items for `query`: `MAX_ROWS` in all, the first one selected. An
+    /// of the items ranked for `query` and of the `files` the index found
+    /// for it: `MAX_ROWS` in all, the first one selected. Equal scores
+    /// list items first; something found both ways is listed once. An
     /// empty query lists nothing: it would match everything equally.
     pub fn search<'a>(
         query: &str,
         items: impl IntoIterator<Item = &'a Item>,
+        files: Vec<Ranked>,
         frecency: &Frecency,
         places: &Places,
         now: Timestamp,
@@ -43,8 +48,13 @@ impl Results {
             item,
             matched: Vec::new(),
         });
-        let ranked = rank(query, items, frecency, places, now)
+        let mut ranked = rank(query, items, frecency, places, now);
+        ranked.extend(files);
+        ranked.sort_by(|one, other| other.score.total_cmp(&one.score));
+        let mut listed = HashSet::new();
+        let ranked = ranked
             .into_iter()
+            .filter(|ranked| listed.insert(ranked.item.id.clone()))
             .map(|ranked| Listed {
                 item: ranked.item,
                 matched: ranked.found.positions,
@@ -61,11 +71,12 @@ impl Results {
         &self,
         query: &str,
         items: impl IntoIterator<Item = &'a Item>,
+        files: Vec<Ranked>,
         frecency: &Frecency,
         places: &Places,
         now: Timestamp,
     ) -> Self {
-        let mut fresh = Self::search(query, items, frecency, places, now);
+        let mut fresh = Self::search(query, items, files, frecency, places, now);
         let kept = self.picked().and_then(|picked| {
             let mut rows = fresh.rows.iter();
             rows.position(|row| row.item.id == picked.item.id)
@@ -132,7 +143,36 @@ mod tests {
     }
 
     fn search(query: &str, items: &[Item]) -> Results {
-        Results::search(query, items, &Frecency::default(), &Places::default(), NOW)
+        found(query, items, &[])
+    }
+
+    /// The rows for `query` when the index finds `files`.
+    fn found(query: &str, items: &[Item], files: &[Item]) -> Results {
+        let ranking = (&Frecency::default(), &Places::default());
+        let files = rank(query, files, ranking.0, ranking.1, NOW);
+        Results::search(query, items, files, ranking.0, ranking.1, NOW)
+    }
+
+    fn file(path: &str) -> Item {
+        Item::file(path.to_string(), false)
+    }
+
+    #[test]
+    fn files_found_join_the_items_by_score() {
+        let files = [file(r"C:\notes"), file(r"C:\my notes.md")];
+        let results = found("notes", &apps(&["Sticky Notes", "Notes"]), &files);
+        assert_eq!(
+            titles(&results),
+            ["Notes", "notes", "Sticky Notes", "my notes.md"]
+        );
+    }
+
+    #[test]
+    fn a_file_found_both_picked_and_by_the_index_is_listed_once() {
+        let picked = file(r"C:\notes.txt");
+        let both = std::slice::from_ref(&picked);
+        let results = found("notes", both, both);
+        assert_eq!(titles(&results), ["notes.txt"]);
     }
 
     fn titles(results: &Results) -> Vec<&str> {
@@ -217,7 +257,16 @@ mod tests {
     }
 
     fn refreshed(results: &Results, query: &str, items: &[Item]) -> Results {
-        results.refreshed(query, items, &Frecency::default(), &Places::default(), NOW)
+        let (frecency, places) = (&Frecency::default(), &Places::default());
+        results.refreshed(query, items, Vec::new(), frecency, places, NOW)
+    }
+
+    #[test]
+    fn a_refresh_lists_the_files_found_too() {
+        let (frecency, places) = (&Frecency::default(), &Places::default());
+        let files = rank("notes", &[file(r"C:\notes.txt")], frecency, places, NOW);
+        let results = Results::default().refreshed("notes", [], files, frecency, places, NOW);
+        assert_eq!(titles(&results), ["notes.txt"]);
     }
 
     #[test]
