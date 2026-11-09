@@ -68,6 +68,23 @@ fn points(strength: Strength, layout: Layout) -> f64 {
     strength.points() - penalty
 }
 
+/// What `Pattern::ceiling` knows of the points `find` gives a name.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Ceiling {
+    /// These points: the kind of match is known.
+    Exactly(f64),
+    /// At most these: an acronym only `find` can confirm.
+    AtMost(f64),
+}
+
+impl Ceiling {
+    pub fn points(self) -> f64 {
+        match self {
+            Ceiling::Exactly(points) | Ceiling::AtMost(points) => points,
+        }
+    }
+}
+
 /// A query made ready to match many names: folded once, as typed and as
 /// read in the other keyboard layout.
 pub struct Pattern {
@@ -120,25 +137,69 @@ impl Pattern {
             .max_by(|one, other| one.points().total_cmp(&other.points()))
     }
 
-    /// The most points `find` could give a name, judged cheaply from the
-    /// name as `folded` gives it, without working out where words start;
-    /// `None` when the query's letters are not all in it in order, in
-    /// either layout, so `find` gives `None` too.
-    pub fn ceiling(&self, folded: &str) -> Option<f64> {
-        self.layouts
-            .iter()
-            .filter_map(|(layout, query)| {
-                let strength = best_possible(&query.text, folded)?;
-                Some(points(strength, *layout))
-            })
-            .max_by(f64::total_cmp)
+    /// A first, cheap look at a name, from its `folded` text alone (as
+    /// `folded` gives it); `None` when the query's letters are not all in
+    /// it in order, in either layout, so `find` gives `None` too.
+    pub fn rough<'a>(&'a self, folded: &'a str) -> Option<Rough<'a>> {
+        let kinds = self.layouts.each_ref().map(|(layout, query)| {
+            let query = query.text.as_str();
+            (*layout, query, roughly(query, folded))
+        });
+        let (_, points) = best(kinds.iter().map(|&(layout, _, kind)| (layout, kind)))?;
+        Some(Rough {
+            folded,
+            kinds,
+            points,
+        })
+    }
+
+    /// The most points `find` could give `name`, judged from it and its
+    /// `folded` text without finding where it matches.
+    pub fn ceiling(&self, folded: &str, name: &str) -> Option<Ceiling> {
+        self.rough(folded)?.ceiling(name)
     }
 }
 
+/// What a first look at a folded name found: per layout, the query and
+/// the strongest kind of match the folded text allows.
+pub struct Rough<'a> {
+    folded: &'a str,
+    kinds: [(Layout, &'a str, Option<Strength>); 2],
+    points: f64,
+}
+
+impl Rough<'_> {
+    /// At most the points `find` gives; never below the ceiling's.
+    pub fn points(&self) -> f64 {
+        self.points
+    }
+
+    /// A closer look, with the words of `name`, the name folded here.
+    pub fn ceiling(&self, name: &str) -> Option<Ceiling> {
+        let closer = self.kinds.iter().map(|&(layout, query, kind)| {
+            let kind = kind.and_then(|kind| closer(query, self.folded, name, kind));
+            (layout, kind)
+        });
+        let (strength, points) = best(closer)?;
+        Some(match strength {
+            Strength::Acronym => Ceiling::AtMost(points),
+            _ => Ceiling::Exactly(points),
+        })
+    }
+}
+
+/// The kind of match, over the layouts, that gives the most points, and
+/// its points.
+fn best(kinds: impl Iterator<Item = (Layout, Option<Strength>)>) -> Option<(Strength, f64)> {
+    let found = kinds.filter_map(|(layout, kind)| Some((kind?, points(kind?, layout))));
+    found.max_by(|(_, one), (_, other)| one.total_cmp(other))
+}
+
 /// The strongest kind of match a folded query could make in a folded
-/// name: one at the start is what it is; one later in a single run is a
-/// word start at best; letters apart, an acronym at best.
-fn best_possible(query: &str, folded: &str) -> Option<Strength> {
+/// name, not knowing where words start: one at the start is what it is,
+/// one later in a single run a word start at best, letters apart an
+/// acronym at best.
+fn roughly(query: &str, folded: &str) -> Option<Strength> {
     if !in_order(query, folded) {
         return None;
     }
@@ -149,6 +210,60 @@ fn best_possible(query: &str, folded: &str) -> Option<Strength> {
         true => Some(Strength::WordStart),
         false => Some(Strength::Acronym),
     }
+}
+
+/// The strongest kind of match a folded query could make in `name`, with
+/// its words, where a first look found `rough`: past the start, a run at
+/// a word start is a word start, the first letter at one with the rest
+/// after it an acronym at best, a run anywhere a substring.
+fn closer(query: &str, folded: &str, name: &str, rough: Strength) -> Option<Strength> {
+    match rough {
+        Strength::WordStart => among_words(query, folded, name, true),
+        Strength::Acronym => among_words(query, folded, name, false),
+        known => Some(known),
+    }
+}
+
+/// The kind of match past the start: looks for word starts only where
+/// the query's first letter is. `run` says whether the query is in the
+/// name in one run.
+fn among_words(query: &str, folded: &str, name: &str, run: bool) -> Option<Strength> {
+    let first = query.chars().next()?;
+    let rest = &query[first.len_utf8()..];
+    let ascii = name.is_ascii();
+    let mut acronym = false;
+    for (at, _) in folded.match_indices(first) {
+        if !starts_word_at(name, folded, at, ascii) {
+            continue;
+        }
+        let word = &folded[at..];
+        if run && word.starts_with(query) {
+            return Some(Strength::WordStart);
+        }
+        acronym = acronym || in_order(rest, &word[first.len_utf8()..]);
+    }
+    match acronym {
+        true => Some(Strength::Acronym),
+        false => run.then_some(Strength::Substring),
+    }
+}
+
+/// Whether a word of `name` starts at byte `at` of its `folded` text. An
+/// `ascii` name folds byte for byte, so `at` is a place in it too.
+fn starts_word_at(name: &str, folded: &str, at: usize, ascii: bool) -> bool {
+    if ascii {
+        let letter = |at: usize| char::from(name.as_bytes()[at]);
+        return starts_word(at.checked_sub(1).map(letter), letter(at));
+    }
+    let index = folded[..at].chars().count();
+    let mut letters = name.chars().skip(index.saturating_sub(1));
+    let before = match index {
+        0 => None,
+        _ => letters.next(),
+    };
+    letters
+        .next()
+        .is_some_and(|letter| starts_word(before, letter))
 }
 
 /// Whether the bytes of `query` appear in `text` in order. Letters in
@@ -207,6 +322,12 @@ fn acronym(
     folded: &[char],
     words: &[Range<usize>],
 ) -> Option<(Strength, Vec<usize>)> {
+    // The first piece starts a word with the first letter: without one,
+    // there is nothing to search.
+    let first = query.first()?;
+    if !words.iter().any(|word| folded[word.start] == *first) {
+        return None;
+    }
     let mut search = Acronym {
         query,
         folded,
@@ -517,7 +638,24 @@ mod tests {
     }
 
     fn ceiling(query: &str, name: &str) -> Option<f64> {
-        Pattern::new(query).ceiling(&folded(name))
+        let ceiling = Pattern::new(query).ceiling(&folded(name), name);
+        ceiling.map(Ceiling::points)
+    }
+
+    fn exactly(query: &str, name: &str) -> bool {
+        let ceiling = Pattern::new(query).ceiling(&folded(name), name);
+        matches!(ceiling, Some(Ceiling::Exactly(_)))
+    }
+
+    #[test]
+    fn the_ceiling_is_exact_unless_it_is_an_acronym() {
+        assert!(exactly("code", "Code"));
+        assert!(exactly("co", "Code"));
+        assert!(exactly("code", "Visual Studio Code"));
+        assert!(exactly("ode", "Code"));
+        assert!(exactly("мысщву", "vscode"));
+        assert!(!exactly("vsc", "Visual Studio Code"));
+        assert!(!exactly("ae", "a table"));
     }
 
     #[test]
@@ -528,13 +666,50 @@ mod tests {
 
     #[test]
     fn the_ceiling_of_letters_together_later_is_a_word_start() {
-        assert_eq!(ceiling("ode", "Code"), Some(60.0));
+        assert_eq!(ceiling("code", "Visual Studio Code"), Some(60.0));
     }
 
     #[test]
     fn the_ceiling_of_letters_apart_in_order_is_an_acronym() {
         assert_eq!(ceiling("vsc", "Visual Studio Code"), Some(40.0));
-        assert_eq!(ceiling("ae", "table"), Some(40.0), "only a bound");
+        assert_eq!(ceiling("ae", "a table"), Some(40.0), "only a bound");
+    }
+
+    fn rough(query: &str, name: &str) -> Option<f64> {
+        let folded = folded(name);
+        Pattern::new(query)
+            .rough(&folded)
+            .map(|rough| rough.points())
+    }
+
+    #[test]
+    fn a_rough_ceiling_does_not_know_where_words_start() {
+        assert_eq!(rough("code", "Code"), Some(100.0));
+        assert_eq!(rough("co", "Code"), Some(80.0));
+        assert_eq!(rough("ode", "Code"), Some(60.0));
+        assert_eq!(rough("ae", "table"), Some(40.0));
+        assert_eq!(rough("cvs", "Visual Studio Code"), None);
+        assert_eq!(rough("мысщву", "vscode"), Some(95.0));
+    }
+
+    #[test]
+    fn the_ceiling_sees_where_words_start() {
+        assert_eq!(ceiling("e", "invoice.exe"), Some(60.0), "exe starts a word");
+        assert_eq!(ceiling("e", "invoice"), Some(20.0), "inside a word");
+        assert_eq!(ceiling("ae", "a table"), Some(40.0), "a starts a word");
+        assert_eq!(ceiling("ae", "table"), None, "neither a run nor an acronym");
+        assert_eq!(
+            ceiling(".md", "readme.md"),
+            Some(20.0),
+            "a dot starts no word"
+        );
+    }
+
+    #[test]
+    fn the_ceiling_sees_the_humps_folding_hides() {
+        assert_eq!(ceiling("shell", "PowerShell"), Some(60.0));
+        assert_eq!(ceiling("hell", "PowerShell"), Some(20.0));
+        assert_eq!(ceiling("ps", "PowerShell"), Some(40.0));
     }
 
     #[test]
@@ -573,9 +748,17 @@ mod tests {
             let pattern = Pattern::new(query);
             for name in &names {
                 let found = pattern.find(name).map(|found| found.points());
-                let ceiling = pattern.ceiling(&folded(name));
+                let exact = pattern.ceiling(&folded(name), name);
+                if let Some(Ceiling::Exactly(points)) = exact {
+                    assert_eq!(found, Some(points), "{query:?} in {name:?}");
+                }
+                let ceiling = exact.map(Ceiling::points);
                 let below = found.is_some_and(|points| ceiling.is_none_or(|top| top < points));
                 assert!(!below, "{query:?} in {name:?}: {found:?} over {ceiling:?}");
+                let folded = folded(name);
+                let rough = pattern.rough(&folded).map(|rough| rough.points());
+                let below = ceiling.is_some_and(|points| rough.is_none_or(|top| top < points));
+                assert!(!below, "{query:?} in {name:?}: {ceiling:?} over {rough:?}");
             }
         }
     }

@@ -93,18 +93,14 @@ impl Index {
     /// Roots hold entries but are not found by a search.
     pub fn add_root(&mut self, name: &str) -> Result<EntryId, Error> {
         let folded = checked(name, true)?;
-        Ok(self.place(NO_PARENT, name, &folded, FOLDER))
+        Ok(self.place(NO_PARENT, name, &folded, true))
     }
 
     /// Adds a file or folder named `name` to the folder `parent`.
     pub fn add(&mut self, parent: EntryId, name: &str, folder: bool) -> Result<EntryId, Error> {
         self.folder(parent)?;
         let folded = checked(name, false)?;
-        let flags = match folder {
-            true => FOLDER,
-            false => 0,
-        };
-        Ok(self.place(parent.0, name, &folded, flags))
+        Ok(self.place(parent.0, name, &folded, folder))
     }
 
     /// Removes an entry and, if it is a folder, everything under it. A
@@ -129,7 +125,7 @@ impl Index {
             return Err(Error::WouldLoop);
         }
         let folded = checked(name, false)?;
-        self.entries[id.0 as usize] = self.store(parent.0, name, &folded, entry.flags());
+        self.entries[id.0 as usize] = self.store(parent.0, name, &folded, entry.is_folder());
         Ok(())
     }
 
@@ -214,8 +210,8 @@ impl Index {
     }
 
     /// Stores a new entry, in the place of a removed one if there is one.
-    fn place(&mut self, parent: u32, name: &str, folded: &str, flags: u32) -> EntryId {
-        let entry = self.store(parent, name, folded, flags);
+    fn place(&mut self, parent: u32, name: &str, folded: &str, folder: bool) -> EntryId {
+        let entry = self.store(parent, name, folded, folder);
         match self.free.pop() {
             Some(at) => {
                 self.entries[at as usize] = entry;
@@ -229,7 +225,11 @@ impl Index {
     }
 
     /// Appends both names to the arenas, and gives the entry for them.
-    fn store(&mut self, parent: u32, name: &str, folded: &str, flags: u32) -> Entry {
+    fn store(&mut self, parent: u32, name: &str, folded: &str, folder: bool) -> Entry {
+        let flags = match folder {
+            true => FOLDER,
+            false => 0,
+        };
         let lengths = name.len() as u32 | (folded.len() as u32) << LENGTH_BITS;
         let entry = Entry {
             parent,

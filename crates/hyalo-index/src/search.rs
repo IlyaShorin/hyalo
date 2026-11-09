@@ -10,7 +10,7 @@ use std::ops::Range;
 use std::thread;
 
 use hyalo_core::item::Kind;
-use hyalo_core::matcher::{Match, Pattern};
+use hyalo_core::matcher::{Ceiling, Match, Pattern};
 use hyalo_core::places::{self, Places};
 use hyalo_core::rank::{self, Ranked};
 
@@ -39,7 +39,9 @@ impl Index {
         // Stable: equal scores stay in the order of the slices.
         hits.sort_by(|one, other| other.score.total_cmp(&one.score));
         hits.truncate(limit);
-        hits.into_iter().map(|hit| self.ranked(hit)).collect()
+        hits.into_iter()
+            .map(|hit| self.ranked(hit, pattern))
+            .collect()
     }
 
     /// The entries cut into one slice per core, none under `CHUNK`.
@@ -60,39 +62,25 @@ impl Index {
         places: &Places,
         limit: usize,
     ) -> Vec<Hit> {
-        let mut best = Best {
-            limit,
-            hits: Vec::new(),
+        let mut scan = Scan {
+            index: self,
+            pattern,
+            places,
+            best: Best {
+                limit,
+                hits: Vec::new(),
+            },
+            seen: vec![(u32::MAX, 0.0); SEEN],
         };
         for at in slice {
-            self.consider(at as u32, pattern, places, &mut best);
+            scan.consider(at as u32);
         }
-        best.hits
+        scan.best.hits
     }
 
-    fn consider(&self, at: u32, pattern: &Pattern, places: &Places, best: &mut Best) {
-        let entry = self.entries[at as usize];
-        if !entry.is_live() || entry.is_root() {
-            return;
-        }
-        let Some(ceiling) = pattern.ceiling(self.folded_of(entry)) else {
-            return;
-        };
-        let kind = kind_of(entry);
-        if rank::score(ceiling, kind, places::BOOST, 0.0) <= best.floor() {
-            return;
-        }
-        let Some(found) = pattern.find(self.name_of(entry)) else {
-            return;
-        };
-        let place = places.points(&self.folders(entry));
-        let score = rank::score(found.points(), kind, place, 0.0);
-        best.offer(Hit { at, score, found });
-    }
-
-    /// The folded names of the folders `entry` is in, from its root down.
-    fn folders(&self, entry: Entry) -> Vec<&str> {
-        let above = self.ancestry(entry.parent);
+    /// The folded names of the folders from a root down to `folder`.
+    fn folders(&self, folder: u32) -> Vec<&str> {
+        let above = self.ancestry(folder);
         let mut folders: Vec<&str> = above
             .map(|at| self.folded_of(self.entries[at as usize]))
             .collect();
@@ -100,11 +88,79 @@ impl Index {
         folders
     }
 
-    fn ranked(&self, hit: Hit) -> Ranked {
+    /// The row for a hit, with the letters its name matched.
+    fn ranked(&self, hit: Hit, pattern: &Pattern) -> Ranked {
+        let item = self.item(EntryId(hit.at)).expect("a hit is in the index");
+        let found = hit.found.or_else(|| pattern.find(&item.title));
         Ranked {
-            item: self.item(EntryId(hit.at)).expect("a hit is in the index"),
-            found: hit.found,
+            item,
+            found: found.expect("an exact ceiling is a match"),
             score: hit.score,
+        }
+    }
+}
+
+/// Folders whose place points one thread remembers: siblings come one
+/// after another, so most entries find their folder here.
+const SEEN: usize = 256;
+
+/// One thread's look through its slice.
+struct Scan<'a> {
+    index: &'a Index,
+    pattern: &'a Pattern,
+    places: &'a Places,
+    best: Best,
+    /// `(folder, points of its place)`, each folder in slot `folder % SEEN`.
+    seen: Vec<(u32, f64)>,
+}
+
+impl Scan<'_> {
+    /// Offers the entry at `at` to `best`, unless it cannot beat what is
+    /// there: judged roughly from the folded name, then from the name's
+    /// words; only a possible acronym needs `find` to know its points.
+    fn consider(&mut self, at: u32) {
+        let index = self.index;
+        let entry = index.entries[at as usize];
+        if !entry.is_live() || entry.is_root() {
+            return;
+        }
+        let (folded, name, kind) = (index.folded_of(entry), index.name_of(entry), kind_of(entry));
+        let floor = self.best.floor();
+        let beats = |points: f64| rank::score(points, kind, places::BOOST, 0.0) > floor;
+        let rough = self
+            .pattern
+            .rough(folded)
+            .filter(|rough| beats(rough.points()));
+        let Some((points, found)) = rough
+            .and_then(|rough| rough.ceiling(name))
+            .filter(|ceiling| beats(ceiling.points()))
+            .and_then(|ceiling| matched(self.pattern, name, ceiling))
+        else {
+            return;
+        };
+        let score = rank::score(points, kind, self.place(entry.parent), 0.0);
+        self.best.offer(Hit { at, score, found });
+    }
+
+    /// The points of the place of what is in `folder`.
+    fn place(&mut self, folder: u32) -> f64 {
+        let slot = folder as usize % SEEN;
+        if self.seen[slot].0 != folder {
+            let points = self.places.points(&self.index.folders(folder));
+            self.seen[slot] = (folder, points);
+        }
+        self.seen[slot].1
+    }
+}
+
+/// The points a name's match is worth, with the match itself when finding
+/// it was the only way to know them.
+fn matched(pattern: &Pattern, name: &str, ceiling: Ceiling) -> Option<(f64, Option<Match>)> {
+    match ceiling {
+        Ceiling::Exactly(points) => Some((points, None)),
+        Ceiling::AtMost(_) => {
+            let found = pattern.find(name)?;
+            Some((found.points(), Some(found)))
         }
     }
 }
@@ -120,7 +176,8 @@ fn kind_of(entry: Entry) -> Kind {
 struct Hit {
     at: u32,
     score: f64,
-    found: Match,
+    /// Found while searching only when needed; the rows shown find it.
+    found: Option<Match>,
 }
 
 /// The best hits so far, best first, at most `limit`.
@@ -215,6 +272,12 @@ mod tests {
         let mut index = holding(&["cat.txt", "cow.txt"]);
         index.remove(EntryId(2)).unwrap();
         assert_eq!(titles(&index, "c", 10), ["cow.txt"]);
+    }
+
+    #[test]
+    fn a_word_hidden_in_a_hump_is_not_passed_over() {
+        let index = holding(&["a shell", "PowerShell\\"]);
+        assert_eq!(titles(&index, "shell", 1), ["PowerShell"]);
     }
 
     #[test]

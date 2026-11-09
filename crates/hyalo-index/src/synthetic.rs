@@ -65,20 +65,26 @@ const EXTENSIONS: [&str; 18] = [
 const FOLDERS: [&str; 5] = ["Desktop", "node_modules", ".git", "AppData", "Documents"];
 
 /// The same drive for the same `seed`: a root `C:` and `count` files and
-/// folders under it, about one in eight a folder.
+/// folders under it, about one in eight a folder. As a walk does, it adds
+/// a folder's entries one after another, a run of up to 16 at a time.
 pub fn drive(count: usize, seed: u64) -> Index {
     let mut index = Index::default();
     let root = index.add_root("C:").expect("a root name");
     let mut folders: Vec<EntryId> = vec![root];
     let mut random = Random(seed | 1);
-    for _ in 0..count {
+    let mut left = count;
+    while left > 0 {
         let parent = folders[random.below(folders.len())];
-        let folder = random.below(8) == 0;
-        let name = name(&mut random, folder);
-        let id = index.add(parent, &name, folder).expect("a made-up name");
-        if folder {
-            folders.push(id);
+        let run = (1 + random.below(16)).min(left);
+        for _ in 0..run {
+            let folder = random.below(8) == 0;
+            let name = name(&mut random, folder);
+            let id = index.add(parent, &name, folder).expect("a made-up name");
+            if folder {
+                folders.push(id);
+            }
         }
+        left -= run;
     }
     index
 }

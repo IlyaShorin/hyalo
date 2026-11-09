@@ -11,3 +11,7 @@ workspace = true
 
 [dependencies]
 hyalo-core = { path = "../hyalo-core" }
+
+[[bench]]
+name = "search"
+harness = false
