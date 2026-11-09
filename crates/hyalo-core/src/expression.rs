@@ -5,7 +5,8 @@
 //! ```text
 //! sum     = product (("+" | "-") product)*
 //! product = signed (("*" | "/") signed)*
-//! signed  = "-" signed | atom
+//! signed  = "-" signed | power
+//! power   = atom ("^" signed)?
 //! atom    = number | "(" sum ")"
 //! ```
 //!
@@ -34,7 +35,7 @@ enum Token {
     Symbol(char),
 }
 
-const SYMBOLS: &str = "+-*/()";
+const SYMBOLS: &str = "+-*/^()";
 
 /// The tokens of `text`; `None` at a character that starts none.
 fn tokens(text: &str) -> Option<Vec<Token>> {
@@ -111,7 +112,17 @@ impl Parser {
     fn signed(&mut self) -> Option<f64> {
         match self.eat('-') {
             true => Some(-self.signed()?),
-            false => self.atom(),
+            false => self.power(),
+        }
+    }
+
+    /// A power, stacking from the right: 2^3^2 is 2^9. Its exponent may
+    /// carry a sign (2^-1), its base may not: -2^2 is -(2^2).
+    fn power(&mut self) -> Option<f64> {
+        let base = self.atom()?;
+        match self.eat('^') {
+            true => Some(base.powf(self.signed()?)),
+            false => Some(base),
         }
     }
 
@@ -171,6 +182,29 @@ mod tests {
         assert_eq!(value("2*-3"), -6.0);
         assert_eq!(value("-(2+3)"), -5.0);
         assert_eq!(value("--2"), 2.0);
+    }
+
+    #[test]
+    fn raises_to_a_power_before_multiplying() {
+        assert_eq!(value("2^10"), 1024.0);
+        assert_eq!(value("2*3^2"), 18.0);
+        assert_eq!(value("(1+1)^3"), 8.0);
+    }
+
+    #[test]
+    fn powers_stack_from_the_right() {
+        assert_eq!(value("2^3^2"), 512.0);
+    }
+
+    #[test]
+    fn a_power_binds_tighter_than_a_minus_sign() {
+        assert_eq!(value("-2^2"), -4.0);
+        assert_eq!(value("2^-1"), 0.5);
+    }
+
+    #[test]
+    fn a_power_too_large_for_a_number_has_no_value() {
+        assert_eq!(evaluate("10^400"), None);
     }
 
     #[test]
