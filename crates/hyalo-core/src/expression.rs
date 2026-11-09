@@ -4,11 +4,17 @@
 //!
 //! ```text
 //! sum     = product (("+" | "-") product)*
-//! product = signed (("*" | "/") signed)*
+//! product = signed (("*" | "/" | "%") signed)*
 //! signed  = "-" signed | power
-//! power   = atom ("^" signed)?
+//! power   = percent ("^" signed)?
+//! percent = atom "%"?         (when no operand follows the "%")
 //! atom    = number | "(" sum ")"
 //! ```
+//!
+//! "%" reads as calculators read it: before an operand it takes the
+//! remainder (7%3 is 1); otherwise it is per cent (50% is 0.5), and a
+//! number with a percent sign, standing alone after + or -, is a share of
+//! what came before (200+10% is 220).
 //!
 //! A number takes a point or a comma before its decimals ("2.5", "2,5"),
 //! as the user writes them in English or Russian. Spaces do not matter.
@@ -35,7 +41,7 @@ enum Token {
     Symbol(char),
 }
 
-const SYMBOLS: &str = "+-*/^()";
+const SYMBOLS: &str = "+-*/^%()";
 
 /// The tokens of `text`; `None` at a character that starts none.
 fn tokens(text: &str) -> Option<Vec<Token>> {
@@ -92,7 +98,10 @@ impl Parser {
             } else {
                 return Some(total);
             };
-            total += sign * self.product()?;
+            let start = self.at;
+            let term = self.product()?;
+            let share = self.at == start + 2 && self.tokens[start + 1] == Token::Symbol('%');
+            total += sign * if share { total * term } else { term };
         }
     }
 
@@ -103,6 +112,8 @@ impl Parser {
                 total *= self.signed()?;
             } else if self.eat('/') {
                 total /= self.signed()?;
+            } else if self.eat('%') {
+                total %= self.signed()?;
             } else {
                 return Some(total);
             }
@@ -119,10 +130,21 @@ impl Parser {
     /// A power, stacking from the right: 2^3^2 is 2^9. Its exponent may
     /// carry a sign (2^-1), its base may not: -2^2 is -(2^2).
     fn power(&mut self) -> Option<f64> {
-        let base = self.atom()?;
+        let base = self.percent()?;
         match self.eat('^') {
             true => Some(base.powf(self.signed()?)),
             false => Some(base),
+        }
+    }
+
+    /// Per cent, unless an operand follows: then "%" takes the remainder.
+    fn percent(&mut self) -> Option<f64> {
+        let value = self.atom()?;
+        let after = self.tokens.get(self.at + 1);
+        let operand = matches!(after, Some(Token::Number(_) | Token::Symbol('(')));
+        match !operand && self.eat('%') {
+            true => Some(value / 100.0),
+            false => Some(value),
         }
     }
 
@@ -205,6 +227,35 @@ mod tests {
     #[test]
     fn a_power_too_large_for_a_number_has_no_value() {
         assert_eq!(evaluate("10^400"), None);
+    }
+
+    #[test]
+    fn a_percent_is_hundredths() {
+        assert_eq!(value("50%"), 0.5);
+        assert_eq!(value("2*50%"), 1.0);
+        assert_eq!(value("25%*4"), 1.0);
+        assert_eq!(value("-50%"), -0.5);
+    }
+
+    #[test]
+    fn a_lone_percent_after_plus_or_minus_is_a_share_of_what_came_before() {
+        assert_eq!(value("200+10%"), 220.0);
+        assert_eq!(value("200-10%"), 180.0);
+        assert_eq!(value("100+50%+50%"), 225.0);
+    }
+
+    #[test]
+    fn a_percent_with_more_after_it_is_no_share() {
+        assert_eq!(value("200+50%*2"), 201.0);
+        assert_eq!(value("3+-2"), 1.0);
+    }
+
+    #[test]
+    fn a_percent_sign_before_an_operand_takes_the_remainder() {
+        assert_eq!(value("7%3"), 1.0);
+        assert_eq!(value("7 % (2+1)"), 1.0);
+        assert_eq!(value("10%4*2"), 4.0);
+        assert_eq!(value("200+7%3"), 201.0);
     }
 
     #[test]
