@@ -1,4 +1,4 @@
-//! Arithmetic typed into the search bar: "2+2*2", "2,5 * 4".
+//! Arithmetic typed into the search bar: "2+2*2", "2,5 * 4", "sqrt(2)".
 //!
 //! The grammar, loosest first:
 //!
@@ -8,13 +8,17 @@
 //! signed  = "-" signed | power
 //! power   = percent ("^" signed)?
 //! percent = atom "%"?         (when no operand follows the "%")
-//! atom    = number | "(" sum ")"
+//! atom    = number | "(" sum ")" | function atom
 //! ```
 //!
 //! "%" reads as calculators read it: before an operand it takes the
 //! remainder (7%3 is 1); otherwise it is per cent (50% is 0.5), and a
 //! number with a percent sign, standing alone after + or -, is a share of
 //! what came before (200+10% is 220).
+//!
+//! The functions are `sqrt`, `round` (halves away from zero) and `abs`, in
+//! any case. A function applies to the atom right after it, so
+//! round(2.4)^2 is 4 and "sqrt 2" works without parentheses.
 //!
 //! A number takes a point or a comma before its decimals ("2.5", "2,5"),
 //! as the user writes them in English or Russian. Spaces do not matter.
@@ -39,6 +43,33 @@ enum Token {
     Number(f64),
     /// An operator or a parenthesis.
     Symbol(char),
+    Function(Function),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Function {
+    Sqrt,
+    Round,
+    Abs,
+}
+
+impl Function {
+    fn named(name: &str) -> Option<Self> {
+        match name {
+            "sqrt" => Some(Self::Sqrt),
+            "round" => Some(Self::Round),
+            "abs" => Some(Self::Abs),
+            _ => None,
+        }
+    }
+
+    fn apply(self, number: f64) -> f64 {
+        match self {
+            Self::Sqrt => number.sqrt(),
+            Self::Round => number.round(),
+            Self::Abs => number.abs(),
+        }
+    }
 }
 
 const SYMBOLS: &str = "+-*/^%()";
@@ -47,18 +78,34 @@ const SYMBOLS: &str = "+-*/^%()";
 fn tokens(text: &str) -> Option<Vec<Token>> {
     let mut chars = text.chars().peekable();
     let mut tokens = Vec::new();
-    while let Some(&next) = chars.peek() {
-        if next.is_whitespace() {
-            chars.next();
-            continue;
-        }
-        let token = match SYMBOLS.contains(next) {
-            true => Token::Symbol(chars.next()?),
-            false => number(&mut chars)?,
+    loop {
+        while chars.next_if(|next| next.is_whitespace()).is_some() {}
+        let Some(&next) = chars.peek() else {
+            return Some(tokens);
         };
-        tokens.push(token);
+        tokens.push(token(next, &mut chars)?);
     }
-    Some(tokens)
+}
+
+/// The token that starts with `next`.
+fn token(next: char, chars: &mut Peekable<Chars>) -> Option<Token> {
+    if SYMBOLS.contains(next) {
+        chars.next();
+        return Some(Token::Symbol(next));
+    }
+    match next.is_alphabetic() {
+        true => function(chars),
+        false => number(chars),
+    }
+}
+
+/// A word that names a function, in any case.
+fn function(chars: &mut Peekable<Chars>) -> Option<Token> {
+    let mut name = String::new();
+    while let Some(letter) = chars.next_if(|next| next.is_alphabetic()) {
+        name.extend(letter.to_lowercase());
+    }
+    Function::named(&name).map(Token::Function)
 }
 
 /// Digits with a point or a comma among them; `None` for anything else,
@@ -157,6 +204,7 @@ impl Parser {
                 let inner = self.sum()?;
                 self.eat(')').then_some(inner)
             }
+            Token::Function(function) => Some(function.apply(self.atom()?)),
             Token::Symbol(_) => None,
         }
     }
@@ -256,6 +304,39 @@ mod tests {
         assert_eq!(value("7 % (2+1)"), 1.0);
         assert_eq!(value("10%4*2"), 4.0);
         assert_eq!(value("200+7%3"), 201.0);
+    }
+
+    #[test]
+    fn takes_square_roots_rounds_and_drops_signs() {
+        assert_eq!(value("sqrt(16)"), 4.0);
+        assert_eq!(value("abs(-3)"), 3.0);
+        assert_eq!(value("round(2.4)"), 2.0);
+    }
+
+    #[test]
+    fn rounds_halves_away_from_zero() {
+        assert_eq!(value("round(2,5)"), 3.0);
+        assert_eq!(value("round(-2.5)"), -3.0);
+    }
+
+    #[test]
+    fn a_function_applies_to_what_follows_it_directly() {
+        assert_eq!(value("2*sqrt(9)+1"), 7.0);
+        assert_eq!(value("sqrt 2,25"), 1.5);
+        assert_eq!(value("round(2.4)^2"), 4.0);
+        assert_eq!(value("abs(-3)-abs(-1)"), 2.0);
+    }
+
+    #[test]
+    fn function_names_take_any_case() {
+        assert_eq!(value("SQRT(4)"), 2.0);
+    }
+
+    #[test]
+    fn names_that_are_not_functions_have_no_value() {
+        for text in ["log(10)", "sqrt", "sqrt()", "sqrt(-1)", "квадрат(4)"] {
+            assert_eq!(evaluate(text), None, "{text:?}");
+        }
     }
 
     #[test]
