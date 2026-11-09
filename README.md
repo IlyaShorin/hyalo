@@ -33,6 +33,7 @@ The launcher never runs elevated. Only the indexer service does, because MFT acc
 - Ranking: match quality (prefix, word start, acronym, substring), type, location boosts and penalties, frecency
 - Actions: open, open containing folder, run as admin, copy path
 - Inline calculator
+- Currency conversion as a calculator answer: `100 usd` converts to roubles, `400 rub` to dollars, `10 usd in eur` (or `в eur`) to the currency named. Rates cached on disk and refreshed daily, so it works offline with the last known rates and shows their date. Enter copies the result
 - TOML config with hot reload, tray icon, autostart
 
 **v0.2**
