@@ -24,6 +24,6 @@ Spotlight-style launcher for Windows 11, written in Rust. Goals, architecture an
 - **Launcher**: the UI process, `hyalo.exe`.
 - **Indexer**: the Windows service that holds the file index.
 - **Provider**: a source of results (apps, files, calculator, settings, windows).
-- **Result**: one row in the list: title, subtitle, icon, actions.
+- **Item**: one row in the list (a "result" in the UI): id, title, subtitle, kind, the action Enter runs. Named `Item` so it does not clash with `std::result::Result`.
 - **Frecency**: a score from how often and how recently a result was picked for a query.
 - **Backdrop**: the blurred glass behind the window, drawn by DWM.
