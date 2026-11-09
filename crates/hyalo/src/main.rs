@@ -19,6 +19,11 @@ mod highlight;
 mod layout;
 mod query;
 mod render;
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "listed once the window shows results")
+)]
+mod results;
 #[cfg_attr(not(test), expect(dead_code, reason = "used once Enter records picks"))]
 mod store;
 mod window;
