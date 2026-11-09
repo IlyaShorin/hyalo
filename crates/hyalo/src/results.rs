@@ -45,11 +45,11 @@ impl Results {
         self.rows.get(self.selected)
     }
 
-    /// One row down; from the last row back to the first.
+    /// One row down; from the last row back to the first. With no rows
+    /// there is nowhere to go.
     pub fn down(&mut self) {
-        self.selected = (self.selected + 1)
-            .checked_rem(self.rows.len())
-            .unwrap_or(0);
+        let next = (self.selected + 1).checked_rem(self.rows.len());
+        self.selected = next.unwrap_or(self.selected);
     }
 
     /// One row up; from the first row round to the last.
