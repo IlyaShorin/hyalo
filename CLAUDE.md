@@ -8,7 +8,8 @@ Spotlight-style launcher for Windows 11, written in Rust. Goals, architecture an
 - Platform glue (Win32, DirectX, COM) stays thin. Anything with a decision in it (layout math, text editing, query parsing, scoring) lives in a pure function with tests. Do not write fake tests for FFI glue.
 - Test the glue the way Windows drives it: `test_desktop::on_hidden_desktop` runs a test on a thread attached to a hidden desktop (no flashing windows, no stolen focus); the `Launcher` driver in `window.rs` tests sends real messages; `Renderer::read_frame` reads back the last presented frame so tests can check pixels. Never repaint before reading a frame: the test must see what the code put on screen.
 - Before a commit: `cargo fmt --all`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`, `scripts/gates.sh`.
-- Mutation testing on changed code: `scripts/gates.sh mutate --changed`. It needs Windows Developer Mode, because mutator links its workers with symlinks.
+- Mutation testing on changed code: `scripts/gates.sh mutate --changed`. Goal: no survivors, no uncovered sites. Stock mutator fails on Windows; `~/code/unclebob/mutator` is on the `windows-support` branch, which fixes it. Do not run heavy builds while mutator runs: a mutant that times out counts as killed.
+- Gate thresholds follow ub-mode: every function under CRAP 10, no duplicate candidates at similarity 0.8 or above.
 - Check UI changes with your own eyes: run `target/debug/hyalo.exe`, then `powershell -ExecutionPolicy Bypass -File scripts/snap.ps1 -Stripes` and read `target/snap.png`. On a dark desktop the glass looks solid; the stripes show whether it really blurs.
 - Cargo is in `~/.cargo/bin`; a fresh shell may need `export PATH="$HOME/.cargo/bin:$PATH"`.
 

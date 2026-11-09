@@ -66,7 +66,7 @@ scripts/gates.sh          # CRAP < 10 and duplication < 0.8
 scripts/gates.sh mutate   # mutation testing
 ```
 
-The script expects the tools checked out side by side under `~/code/unclebob` (override with `UNCLEBOB_TOOLS`), each with its own `.venv`. mutator builds its workers out of symlinks, so on Windows it needs Developer Mode (Settings → System → For developers).
+The script expects the tools checked out side by side under `~/code/unclebob` (override with `UNCLEBOB_TOOLS`), each with its own `.venv`. Stock mutator does not run on Windows yet: it builds its workers from symlinks, which Windows refuses without Developer Mode, and stops timed-out tests with a POSIX-only call. The fixes (copies where links are refused, a warm-up build per worker, process-tree kill) are on the `windows-support` branch of the local mutator clone and not upstream yet.
 
 To check the look, run the launcher and capture it over bright colour stripes:
 

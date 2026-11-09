@@ -6,7 +6,7 @@
 # each with its own .venv. Their bundled launchers assume a Unix venv layout
 # (.venv/bin), so this script calls each venv's python directly.
 #
-#   scripts/gates.sh                 crap + dry
+#   scripts/gates.sh                 crap + dry (exit 2 when either fails)
 #   scripts/gates.sh crap [args]     crapper only
 #   scripts/gates.sh dry [args]      dryer only
 #   scripts/gates.sh mutate [args]   mutator (slow; try --changed)
@@ -37,17 +37,34 @@ run() {
   "$py" -m "$tool" --root "$ROOT" "$@"
 }
 
+# ub-mode wants every function under CRAP 10; crapper fails only when the
+# worst score is above its threshold, so the threshold sits just below 10.
+crap() {
+  run crapper --threshold 9.999 "$@"
+}
+
+# dryer reports and exits 0 either way; the gate fails on any candidate.
+dry() {
+  report=$(run dryer --threshold 0.8 "$@")
+  printf '%s\n' "$report"
+  case "$report" in
+    *"No duplicate candidates found."*) return 0 ;;
+  esac
+  printf 'gates: duplicate candidates at similarity 0.8 or above\n' >&2
+  return 2
+}
+
 cd "$ROOT"
 cmd="${1:-all}"
 [ $# -gt 0 ] && shift
 
 case "$cmd" in
-  crap)   run crapper --threshold 10 "$@" ;;
-  dry)    run dryer --threshold 0.8 "$@" ;;
+  crap)   crap "$@" ;;
+  dry)    dry "$@" ;;
   mutate) run mutator "$@" ;;
   all)
-    run crapper --threshold 10
-    run dryer --threshold 0.8
+    crap
+    dry
     ;;
   *)
     printf 'usage: %s [crap|dry|mutate|all] [tool args]\n' "$0" >&2
