@@ -5,3 +5,4 @@ pub mod frecency;
 pub mod item;
 pub mod keyboard;
 pub mod matcher;
+pub mod rank;
