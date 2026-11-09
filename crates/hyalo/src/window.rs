@@ -6,9 +6,7 @@
 
 use std::cell::RefCell;
 
-use windows::Win32::Foundation::{
-    ERROR_CLASS_ALREADY_EXISTS, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM,
-};
+use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Dwm::{
     DWMSBT_TRANSIENTWINDOW, DWMWA_BORDER_COLOR, DWMWA_COLOR_NONE, DWMWA_SYSTEMBACKDROP_TYPE,
     DWMWA_USE_IMMERSIVE_DARK_MODE, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND,
@@ -30,7 +28,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WM_NCCALCSIZE, WM_NCHITTEST, WNDCLASSEXW, WS_CAPTION, WS_EX_NOREDIRECTIONBITMAP,
     WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_THICKFRAME,
 };
-use windows::core::{BOOL, Error, PCWSTR, Result, w};
+use windows::core::{BOOL, PCWSTR, Result, w};
 
 use crate::layout::{self, Rect};
 use crate::query::Query;
@@ -93,8 +91,10 @@ fn open() -> Result<HWND> {
 
 const WINDOW_CLASS: PCWSTR = w!("hyalo.launcher");
 
-/// Registers the window class. Registering it again is a no-op, so every
-/// thread that opens a launcher can call this.
+/// Registers the window class, so every thread that opens a launcher can
+/// call this. Its result is not checked: the second registration fails
+/// because the class exists, and if registering failed for any other
+/// reason, CreateWindowExW reports the missing class.
 fn register_class(instance: HINSTANCE) -> Result<()> {
     let window_class = WNDCLASSEXW {
         cbSize: size_of::<WNDCLASSEXW>() as u32,
@@ -104,17 +104,8 @@ fn register_class(instance: HINSTANCE) -> Result<()> {
         lpszClassName: WINDOW_CLASS,
         ..Default::default()
     };
-    match unsafe { RegisterClassExW(&window_class) } {
-        0 => already_registered_is_fine(Error::from_thread()),
-        _ => Ok(()),
-    }
-}
-
-fn already_registered_is_fine(error: Error) -> Result<()> {
-    match error.code() == ERROR_CLASS_ALREADY_EXISTS.to_hresult() {
-        true => Ok(()),
-        false => Err(error),
-    }
+    unsafe { RegisterClassExW(&window_class) };
+    Ok(())
 }
 
 fn create_window() -> Result<HWND> {
