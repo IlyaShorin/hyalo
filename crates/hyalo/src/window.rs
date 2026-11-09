@@ -479,13 +479,14 @@ fn held() -> Held {
     }
 }
 
+/// Types one UTF-16 unit; a change to the query searches again.
 fn on_char(unit: u16) -> Result<()> {
-    with_app(|app| match app.query.type_unit(unit) {
-        true => {
-            app.search();
-            app.present()
+    with_app(|app| {
+        if !app.query.type_unit(unit) {
+            return Ok(());
         }
-        false => Ok(()),
+        app.search();
+        app.present()
     })
     .unwrap_or(Ok(()))
 }
