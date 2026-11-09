@@ -14,17 +14,21 @@ pub const BOOST: f64 = 3.0;
 pub const PENALTY: f64 = 10.0;
 
 /// Folders of tool output, caches and the system, by folded name: what
-/// lives under one, at any depth, ranks lower.
-const BURIED: [&str; 8] = [
+/// lives under one, at any depth, ranks lower. So does what lives under
+/// a folder whose name starts with a dot (`.git`, `.cache`, `.vscode`):
+/// tools keep their state there.
+const BURIED: [&str; 6] = [
     "node_modules",
-    ".git",
     "appdata",
     "cache",
-    ".cache",
     "caches",
     "__pycache__",
     "windows",
 ];
+
+fn buried(folder: &str) -> bool {
+    folder.starts_with('.') || BURIED.contains(&folder)
+}
 
 /// The user's folders, whose contents rank a little higher.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -57,7 +61,7 @@ impl Places {
             true => BOOST,
             false => 0.0,
         };
-        let penalty = match folders.iter().any(|folder| BURIED.contains(folder)) {
+        let penalty = match folders.iter().any(|folder| buried(folder)) {
             true => PENALTY,
             false => 0.0,
         };
@@ -117,6 +121,16 @@ mod tests {
             let folders = ["d:", "work", folder, "lib"];
             assert_eq!(Places::default().points(&folders), -PENALTY, "{folder}");
         }
+    }
+
+    #[test]
+    fn a_folder_whose_name_starts_with_a_dot_holds_tool_state() {
+        for folder in [".fingerprint", ".vscode", ".metrics"] {
+            let folders = ["c:", "code", "app", folder];
+            assert_eq!(Places::default().points(&folders), -PENALTY, "{folder}");
+        }
+        let named = ["c:", "work", "v1.2", "docs.old"];
+        assert_eq!(Places::default().points(&named), 0.0, "a dot inside a name");
     }
 
     #[test]
