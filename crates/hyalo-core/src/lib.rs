@@ -2,4 +2,5 @@
 //! and how they are ranked. No Win32 here; everything is tested directly.
 
 pub mod item;
+pub mod keyboard;
 pub mod matcher;
