@@ -42,7 +42,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use windows::core::{BOOL, PCWSTR, Result, w};
 
 use crate::apps::Icon;
-use crate::catalog::{self, Catalog, Finder, Found, Request};
+use crate::catalog::{self, Catalog, Found, Provider, Request};
 use crate::highlight::utf16_ranges;
 use crate::keys::{self, Command, Held};
 use crate::layout::{self, Rect};
@@ -53,7 +53,7 @@ use crate::{launch, store};
 
 const HOTKEY_TOGGLE: i32 = 1;
 
-/// Posted by the finder's thread each time it hands over a piece.
+/// Posted by the provider's thread each time it hands over a piece.
 const WM_FOUND: u32 = WM_APP + 1;
 
 /// Where the launcher shows: its monitor's work area and DPI.
@@ -77,7 +77,7 @@ pub type Runner = Box<dyn Fn(&Action, bool)>;
 /// stand-ins in tests.
 pub struct Services {
     /// Lists what the launcher searches.
-    pub finder: Finder,
+    pub provider: Provider,
     pub run: Runner,
     /// Where picks are kept between runs; `None` keeps them in memory.
     pub picks: Option<PathBuf>,
@@ -87,7 +87,7 @@ impl Services {
     /// The apps, opened by the shell, picks in `%APPDATA%\hyalo`.
     fn real() -> Self {
         Self {
-            finder: Arc::new(catalog::find_apps),
+            provider: Arc::new(catalog::find_apps),
             run: Box::new(run_in_background),
             picks: store::default_path(),
         }
@@ -114,9 +114,9 @@ struct App {
     results: Results,
     frecency: Frecency,
     services: Services,
-    /// When the finder last started; `None` before it ever did.
+    /// When the provider last started; `None` before it ever did.
     found_at: Option<Instant>,
-    /// The finder's thread sends here and posts WM_FOUND.
+    /// The provider's thread sends here and posts WM_FOUND.
     found: (Sender<Found>, Receiver<Found>),
 }
 
@@ -180,7 +180,7 @@ impl App {
         self.results = Results::search(self.query.text(), items, &self.frecency, now());
     }
 
-    /// Starts the finder on a thread of its own, unless the list it
+    /// Starts the provider on a thread of its own, unless the list it
     /// last found is still fresh.
     fn find_if_stale(&mut self) {
         let now = Instant::now();
@@ -192,12 +192,12 @@ impl App {
             icon_size: layout::icon_pixels(self.placement.dpi),
             known: self.catalog.icons.keys().cloned().collect(),
         };
-        let (finder, sender) = (self.services.finder.clone(), self.found.0.clone());
+        let (provider, sender) = (self.services.provider.clone(), self.found.0.clone());
         let window = self.hwnd.0 as isize;
-        std::thread::spawn(move || finder(&request, &|found| hand_over(&sender, window, found)));
+        std::thread::spawn(move || provider(&request, &|found| hand_over(&sender, window, found)));
     }
 
-    /// Takes in what the finder handed over, searches again if the items
+    /// Takes in what the provider handed over, searches again if the items
     /// changed, and shows the result if the window is up.
     fn take_found(&mut self) -> Result<()> {
         let mut changed = false;
@@ -589,32 +589,32 @@ mod tests {
         }
     }
 
-    /// A finder that lists apps with these titles, each with a red icon,
+    /// A provider that lists apps with these titles, each with a red icon,
     /// and counts how often it runs.
-    fn listing(titles: &[&str]) -> (Finder, Arc<AtomicUsize>) {
+    fn listing(titles: &[&str]) -> (Provider, Arc<AtomicUsize>) {
         let items: Vec<Item> = titles.iter().map(|title| app(title)).collect();
         let runs = Arc::new(AtomicUsize::new(0));
         let counted = runs.clone();
-        let finder: Finder = Arc::new(move |request: &Request, report: &dyn Fn(Found)| {
+        let provider: Provider = Arc::new(move |request: &Request, report: &dyn Fn(Found)| {
             counted.fetch_add(1, Ordering::SeqCst);
             report(Found::Items(items.clone()));
             for item in &items {
                 report(Found::Icon(item.id.clone(), red(request.icon_size)));
             }
         });
-        (finder, runs)
+        (provider, runs)
     }
 
     /// What the launcher was asked to run, and whether as administrator.
     type Ran = Rc<RefCell<Vec<(Action, bool)>>>;
 
-    /// Services for a test: `finder`, a runner that only notes what it is
+    /// Services for a test: `provider`, a runner that only notes what it is
     /// asked to run, and `picks` as the picks file.
-    fn services(finder: Finder, picks: Option<PathBuf>) -> (Services, Ran) {
+    fn services(provider: Provider, picks: Option<PathBuf>) -> (Services, Ran) {
         let ran = Ran::default();
         let noted = ran.clone();
         let services = Services {
-            finder,
+            provider,
             run: Box::new(move |action: &Action, as_admin| {
                 noted.borrow_mut().push((action.clone(), as_admin));
             }),
@@ -654,15 +654,15 @@ mod tests {
         }
     }
 
-    /// A finder that lists Notepad once the test lets it go.
-    fn gated() -> (Finder, Sender<()>) {
+    /// A provider that lists Notepad once the test lets it go.
+    fn gated() -> (Provider, Sender<()>) {
         let (release, gate) = channel::<()>();
         let gate = Mutex::new(gate);
-        let finder: Finder = Arc::new(move |_: &Request, report: &dyn Fn(Found)| {
+        let provider: Provider = Arc::new(move |_: &Request, report: &dyn Fn(Found)| {
             let _ = gate.lock().expect("the gate").recv();
             report(Found::Items(vec![app("Notepad")]));
         });
-        (finder, release)
+        (provider, release)
     }
 
     /// The launcher as a test drives it: through the messages Windows
@@ -675,8 +675,8 @@ mod tests {
             Self::with(listing(&[]).0)
         }
 
-        fn with(finder: Finder) -> Self {
-            Self::serving(services(finder, None).0)
+        fn with(provider: Provider) -> Self {
+            Self::serving(services(provider, None).0)
         }
 
         fn serving(services: Services) -> Self {
@@ -1067,8 +1067,8 @@ mod tests {
     #[test]
     fn showing_again_soon_does_not_list_the_apps_again() {
         on_hidden_desktop(|| {
-            let (finder, runs) = listing(&["Notepad"]);
-            let launcher = Launcher::with(finder);
+            let (provider, runs) = listing(&["Notepad"]);
+            let launcher = Launcher::with(provider);
             launcher.pump_until(|app| !app.catalog.items.is_empty());
             launcher.hotkey();
             launcher.hotkey();
@@ -1079,11 +1079,11 @@ mod tests {
     #[test]
     fn apps_found_while_the_query_is_typed_are_listed_at_once() {
         on_hidden_desktop(|| {
-            let (finder, release) = gated();
-            let launcher = Launcher::with(finder);
+            let (provider, release) = gated();
+            let launcher = Launcher::with(provider);
             launcher.type_text("note");
             assert_eq!(launcher.rect(), launcher.placement().rect(0));
-            release.send(()).expect("release the finder");
+            release.send(()).expect("release the provider");
             launcher.pump_until(|app| !app.catalog.items.is_empty());
             assert_eq!(launcher.rect(), launcher.placement().rect(1));
         });
@@ -1092,10 +1092,10 @@ mod tests {
     #[test]
     fn apps_found_while_hidden_wait_for_the_next_show() {
         on_hidden_desktop(|| {
-            let (finder, release) = gated();
-            let launcher = Launcher::with(finder);
+            let (provider, release) = gated();
+            let launcher = Launcher::with(provider);
             launcher.press(VK_ESCAPE);
-            release.send(()).expect("release the finder");
+            release.send(()).expect("release the provider");
             launcher.pump_until(|app| !app.catalog.items.is_empty());
             assert!(!launcher.visible());
             launcher.hotkey();

@@ -1,5 +1,5 @@
 //! What the launcher can list: items and their icons, found off the UI
-//! thread by a finder and handed over piece by piece.
+//! thread by a provider and handed over piece by piece.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -11,7 +11,7 @@ use windows::core::Result;
 use crate::apps::{self, Icon};
 use crate::com::Com;
 
-/// One piece of what a finder found.
+/// One piece of what a provider found.
 pub enum Found {
     /// Everything there is to list, replacing what was listed before.
     Items(Vec<Item>),
@@ -19,7 +19,7 @@ pub enum Found {
     Icon(ItemId, Icon),
 }
 
-/// What the window asks a finder for.
+/// What the window asks a provider for.
 pub struct Request {
     /// Icon side in pixels.
     pub icon_size: u32,
@@ -27,8 +27,9 @@ pub struct Request {
     pub known: HashSet<ItemId>,
 }
 
-/// Finds items on a thread of its own, reporting each piece as it goes.
-pub type Finder = Arc<dyn Fn(&Request, &dyn Fn(Found)) + Send + Sync>;
+/// A provider: finds items on a thread of its own, reporting each piece
+/// as it goes.
+pub type Provider = Arc<dyn Fn(&Request, &dyn Fn(Found)) + Send + Sync>;
 
 /// The items to search and the icons found for them so far.
 #[derive(Default)]
@@ -55,7 +56,7 @@ impl Catalog {
     }
 }
 
-/// The apps finder: lists the Applications folder, reports the items,
+/// The apps provider: lists the Applications folder, reports the items,
 /// then the icons the window lacks, one at a time, so search works while
 /// icons still come in (listing takes about 0.5 s, icons as long again).
 pub fn find_apps(request: &Request, report: &dyn Fn(Found)) {
@@ -171,7 +172,7 @@ mod tests {
     }
 
     #[test]
-    fn the_apps_finder_reports_the_apps_then_only_the_icons_not_known() {
+    fn the_apps_provider_reports_the_apps_then_only_the_icons_not_known() {
         let mut request = Request {
             icon_size: 32,
             known: HashSet::new(),
