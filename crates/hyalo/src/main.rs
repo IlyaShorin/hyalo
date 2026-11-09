@@ -3,6 +3,16 @@
 
 #[cfg_attr(
     not(test),
+    expect(dead_code, reason = "listed once the window shows results")
+)]
+mod apps;
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "joined once the window lists apps")
+)]
+mod com;
+#[cfg_attr(
+    not(test),
     expect(dead_code, reason = "drawn once the window lists results")
 )]
 mod highlight;
