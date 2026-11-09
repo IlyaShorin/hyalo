@@ -1,17 +1,20 @@
 # Captures the launcher window (plus a margin, to show the shadow and what
 # the glass blurs) into a PNG, for checking the look without a human.
 #
-#   powershell -ExecutionPolicy Bypass -File scripts/snap.ps1 [-Out snap.png] [-Margin 48] [-Toggle] [-Stripes]
+#   powershell -ExecutionPolicy Bypass -File scripts/snap.ps1 [-Out snap.png] [-Margin 48] [-Toggle] [-Stripes] [-Type text]
 #
 # -Toggle presses the hotkey (Alt+Space) twice first, so the window comes
 # back through the real show path and owns the foreground.
 # -Stripes puts bright colour stripes behind the launcher first, so the
 # capture shows whether the glass really blurs what is underneath.
+# -Type types text into the launcher (SendKeys syntax: {DOWN} presses the
+# down arrow) before the capture, which then covers the list too.
 param(
     [string]$Out = "target/snap.png",
     [int]$Margin = 48,
     [switch]$Toggle,
-    [switch]$Stripes
+    [switch]$Stripes,
+    [string]$Type = ""
 )
 $ErrorActionPreference = "Stop"
 
@@ -42,10 +45,18 @@ public static class Snap {
 $hwnd = [Snap]::FindWindow("hyalo.launcher", [NullString]::Value)
 if ($hwnd -eq [IntPtr]::Zero) { throw "hyalo is not running" }
 
-$r = New-Object Snap+RECT
-[Snap]::GetWindowRect($hwnd, [ref]$r) | Out-Null
-$x = $r.Left - $Margin; $y = $r.Top - $Margin
-$w = $r.Right - $r.Left + 2 * $Margin; $h = $r.Bottom - $r.Top + 2 * $Margin
+function Get-Area {
+    $r = New-Object Snap+RECT
+    [Snap]::GetWindowRect($hwnd, [ref]$r) | Out-Null
+    @{ X = $r.Left - $Margin; Y = $r.Top - $Margin
+       W = $r.Right - $r.Left + 2 * $Margin; H = $r.Bottom - $r.Top + 2 * $Margin
+       Bar = $r.Bottom - $r.Top }
+}
+$area = Get-Area
+$x = $area.X; $y = $area.Y; $w = $area.W; $h = $area.H
+# Typing grows the window: stripes cover the tallest list (64 + 16 + 8 * 48
+# DIPs against the bar's 64), assuming the window shows the bar alone now.
+if ($Type) { $h = [int]($area.Bar * 464 / 64) + 2 * $Margin }
 
 $form = $null
 if ($Stripes) {
@@ -71,6 +82,11 @@ if ($Toggle -or $Stripes) {
     Start-Sleep -Milliseconds 500
 }
 if (-not [Snap]::IsWindowVisible($hwnd)) { if ($form) { $form.Close() }; throw "hyalo is hidden" }
+if ($Type) {
+    [System.Windows.Forms.SendKeys]::SendWait($Type); Start-Sleep -Milliseconds 400
+    $area = Get-Area
+    $x = $area.X; $y = $area.Y; $w = $area.W; $h = $area.H
+}
 
 $bitmap = New-Object System.Drawing.Bitmap $w, $h
 $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
