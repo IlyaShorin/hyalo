@@ -29,6 +29,8 @@ mod store;
 mod window;
 
 #[cfg(test)]
+mod reference;
+#[cfg(test)]
 mod test_desktop;
 
 use windows::Win32::UI::HiDpi::{

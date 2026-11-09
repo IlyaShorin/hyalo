@@ -497,3 +497,84 @@ mod readback {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        CreateWindowExW, DestroyWindow, WS_EX_NOREDIRECTIONBITMAP, WS_POPUP,
+    };
+
+    use super::*;
+    use crate::reference::assert_looks_like;
+    use crate::test_desktop::on_hidden_desktop;
+
+    /// A bare window for a renderer to draw into, destroyed after the test.
+    struct Canvas(HWND);
+
+    impl Canvas {
+        fn new() -> Self {
+            let hwnd = unsafe {
+                CreateWindowExW(
+                    WS_EX_NOREDIRECTIONBITMAP,
+                    w!("STATIC"),
+                    None,
+                    WS_POPUP,
+                    0,
+                    0,
+                    1,
+                    1,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+            };
+            Self(hwnd.expect("a window"))
+        }
+    }
+
+    impl Drop for Canvas {
+        fn drop(&mut self) {
+            let _ = unsafe { DestroyWindow(self.0) };
+        }
+    }
+
+    /// `scene` drawn at `width` x `height` pixels and `dpi`.
+    fn drawn(scene: &Scene, (width, height): (u32, u32), dpi: u32) -> Frame {
+        let canvas = Canvas::new();
+        let renderer = Renderer::new(canvas.0, width, height, dpi).expect("a renderer");
+        renderer.draw(scene).expect("draw");
+        renderer.read_frame().expect("read the frame back")
+    }
+
+    #[test]
+    fn the_empty_bar_shows_the_placeholder_and_the_caret() {
+        on_hidden_desktop(|| {
+            let frame = drawn(&Scene { query: "" }, (720, 64), 96);
+            assert_looks_like("bar-empty-100", &frame);
+        });
+    }
+
+    #[test]
+    fn a_typed_query_at_125_percent() {
+        on_hidden_desktop(|| {
+            let frame = drawn(&Scene { query: "notepad" }, (900, 80), 120);
+            assert_looks_like("bar-typed-125", &frame);
+        });
+    }
+
+    #[test]
+    fn a_resized_renderer_draws_at_its_new_size_and_scale() {
+        on_hidden_desktop(|| {
+            let canvas = Canvas::new();
+            let mut renderer = Renderer::new(canvas.0, 720, 64, 96).expect("a renderer");
+            renderer.draw(&Scene { query: "notepad" }).expect("draw");
+            renderer.resize(900, 80, 120).expect("resize");
+            renderer
+                .draw(&Scene { query: "notepad" })
+                .expect("draw again");
+            let frame = renderer.read_frame().expect("read the frame back");
+            assert_looks_like("bar-typed-125", &frame);
+        });
+    }
+}
