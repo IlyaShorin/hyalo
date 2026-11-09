@@ -201,14 +201,16 @@ impl App {
     }
 
     /// Takes in what the provider handed over, searches again if the items
-    /// changed, and shows the result if the window is up.
+    /// changed (keeping the selected item selected), and shows the result
+    /// if the window is up.
     fn take_found(&mut self) -> Result<()> {
         let mut changed = false;
         while let Ok(found) = self.found.1.try_recv() {
             changed |= self.catalog.take(found);
         }
         if changed {
-            self.search();
+            let (query, items) = (self.query.text(), &self.catalog.items);
+            self.results = self.results.refreshed(query, items, &self.frecency, now());
         }
         match unsafe { IsWindowVisible(self.hwnd) }.as_bool() {
             true => self.present(),
@@ -659,13 +661,17 @@ mod tests {
         }
     }
 
-    /// A provider that lists Notepad once the test lets it go.
-    fn gated() -> (Provider, Sender<()>) {
+    /// A provider that lists apps titled `first` at once, then apps
+    /// titled `then` once the test lets it go.
+    fn gated(first: &[&str], then: &[&str]) -> (Provider, Sender<()>) {
+        let apps = |titles: &[&str]| titles.iter().map(|title| app(title)).collect::<Vec<_>>();
+        let (first, then) = (apps(first), apps(then));
         let (release, gate) = channel::<()>();
         let gate = Mutex::new(gate);
         let provider: Provider = Arc::new(move |_: &Request, report: &dyn Fn(Found)| {
+            report(Found::Items(first.clone()));
             let _ = gate.lock().expect("the gate").recv();
-            report(Found::Items(vec![app("Notepad")]));
+            report(Found::Items(then.clone()));
         });
         (provider, release)
     }
@@ -1088,7 +1094,7 @@ mod tests {
     #[test]
     fn apps_found_while_the_query_is_typed_are_listed_at_once() {
         on_hidden_desktop(|| {
-            let (provider, release) = gated();
+            let (provider, release) = gated(&[], &["Notepad"]);
             let launcher = Launcher::with(provider);
             launcher.type_text("note");
             assert_eq!(launcher.rect(), launcher.placement().rect(0));
@@ -1101,7 +1107,7 @@ mod tests {
     #[test]
     fn apps_found_while_hidden_wait_for_the_next_show() {
         on_hidden_desktop(|| {
-            let (provider, release) = gated();
+            let (provider, release) = gated(&[], &["Notepad"]);
             let launcher = Launcher::with(provider);
             launcher.press(VK_ESCAPE);
             release.send(()).expect("release the provider");
@@ -1110,6 +1116,23 @@ mod tests {
             launcher.hotkey();
             launcher.type_text("note");
             assert_eq!(launcher.rect(), launcher.placement().rect(1));
+        });
+    }
+
+    #[test]
+    fn a_refresh_keeps_the_selected_app_selected() {
+        on_hidden_desktop(|| {
+            let (provider, release) = gated(&["Notes", "Notepad"], &["Note", "Notes", "Notepad"]);
+            let (services, ran) = services(provider, None);
+            let launcher = Launcher::serving(services);
+            launcher.pump_until(|app| app.catalog.items.len() == 2);
+            launcher.type_text("note");
+            launcher.press(VK_DOWN);
+            release.send(()).expect("release the provider");
+            launcher.pump_until(|app| app.catalog.items.len() == 3);
+            assert_eq!(launcher.lit_row(3), 2);
+            launcher.press(VK_RETURN);
+            assert_eq!(*ran.borrow(), [opened("Notepad", false)]);
         });
     }
 

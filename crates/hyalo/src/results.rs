@@ -51,6 +51,26 @@ impl Results {
         Self { rows, selected: 0 }
     }
 
+    /// The rows for `query` in items that changed, such as after the
+    /// provider looked again. The item selected before stays selected
+    /// where it moved, so what Enter opens does not change under the
+    /// user's fingers; if it is gone, the first row is.
+    pub fn refreshed<'a>(
+        &self,
+        query: &str,
+        items: impl IntoIterator<Item = &'a Item>,
+        frecency: &Frecency,
+        now: Timestamp,
+    ) -> Self {
+        let mut fresh = Self::search(query, items, frecency, now);
+        let kept = self.picked().and_then(|picked| {
+            let mut rows = fresh.rows.iter();
+            rows.position(|row| row.item.id == picked.item.id)
+        });
+        fresh.selected = kept.unwrap_or(fresh.selected);
+        fresh
+    }
+
     pub fn rows(&self) -> &[Listed] {
         &self.rows
     }
@@ -182,6 +202,33 @@ mod tests {
         assert_eq!(picked(&results), Some("a3"));
         results.up();
         assert_eq!(picked(&results), Some("a2"));
+    }
+
+    fn refreshed(results: &Results, query: &str, items: &[Item]) -> Results {
+        results.refreshed(query, items, &Frecency::default(), NOW)
+    }
+
+    #[test]
+    fn a_refresh_keeps_the_selected_item_selected_where_it_moved() {
+        let mut results = search("note", &apps(&["Notes", "Notepad"]));
+        results.down();
+        let results = refreshed(&results, "note", &apps(&["Note", "Notes", "Notepad"]));
+        assert_eq!(titles(&results), ["Note", "Notes", "Notepad"]);
+        assert_eq!(picked(&results), Some("Notepad"));
+    }
+
+    #[test]
+    fn a_refresh_that_drops_the_selected_item_selects_the_first_row() {
+        let mut results = search("note", &apps(&["Notes", "Notepad"]));
+        results.down();
+        let results = refreshed(&results, "note", &apps(&["Notes", "Note"]));
+        assert_eq!(picked(&results), Some("Note"));
+    }
+
+    #[test]
+    fn a_refresh_lists_what_the_query_finds_in_the_new_items() {
+        let results = refreshed(&Results::default(), "note", &apps(&["Notepad"]));
+        assert_eq!(picked(&results), Some("Notepad"));
     }
 
     #[test]
