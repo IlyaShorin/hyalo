@@ -320,6 +320,7 @@ fn with_app<R>(f: impl FnOnce(&mut App) -> R) -> Option<R> {
 #[cfg(test)]
 mod tests {
     use windows::Win32::Foundation::RECT;
+    use windows::Win32::Graphics::Dwm::DwmGetWindowAttribute;
     use windows::Win32::Graphics::Gdi::MonitorFromWindow;
     use windows::Win32::UI::Input::KeyboardAndMouse::VK_A;
     use windows::Win32::UI::WindowsAndMessaging::{
@@ -390,6 +391,18 @@ mod tests {
         fn caret_x(&self) -> usize {
             caret_x(&self.frame()).expect("a caret on screen")
         }
+
+        /// A window attribute as DWM holds it, read back from DWM.
+        fn dwm(&self, attribute: DWMWINDOWATTRIBUTE) -> i32 {
+            let mut value = 0_i32;
+            let size = size_of::<i32>() as u32;
+            // SAFETY: `value` is a live i32 and `size` is its size.
+            unsafe {
+                DwmGetWindowAttribute(self.0, attribute, (&raw mut value).cast(), size)
+                    .expect("read a DWM attribute");
+            }
+            value
+        }
     }
 
     impl Drop for Launcher {
@@ -437,6 +450,19 @@ mod tests {
             assert_eq!(launcher.client_size(), (rect.width, rect.height));
             let hit = launcher.send(WM_NCHITTEST, 0);
             assert_eq!(hit, LRESULT(HTCLIENT as isize));
+        });
+    }
+
+    #[test]
+    fn dwm_draws_dark_glass_with_round_corners() {
+        on_hidden_desktop(|| {
+            let launcher = Launcher::open();
+            assert_eq!(launcher.dwm(DWMWA_USE_IMMERSIVE_DARK_MODE), 1);
+            assert_eq!(
+                launcher.dwm(DWMWA_SYSTEMBACKDROP_TYPE),
+                DWMSBT_TRANSIENTWINDOW.0
+            );
+            assert_eq!(launcher.dwm(DWMWA_WINDOW_CORNER_PREFERENCE), DWMWCP_ROUND.0);
         });
     }
 
