@@ -50,7 +50,9 @@ $w = $r.Right - $r.Left + 2 * $Margin; $h = $r.Bottom - $r.Top + 2 * $Margin
 $form = $null
 if ($Stripes) {
     $form = New-Object System.Windows.Forms.Form
-    $form.FormBorderStyle = "None"; $form.ShowInTaskbar = $false
+    # TopMost: a background process may not raise its windows above the
+    # active one. The launcher shows after this, so it still ends up on top.
+    $form.FormBorderStyle = "None"; $form.ShowInTaskbar = $false; $form.TopMost = $true
     $form.StartPosition = "Manual"; $form.Bounds = New-Object System.Drawing.Rectangle $x, $y, $w, $h
     $colors = "#FF3B30", "#FF9500", "#FFCC00", "#34C759", "#007AFF", "#AF52DE", "#FFFFFF", "#000000"
     $stripe = [Math]::Ceiling($w / $colors.Count)
