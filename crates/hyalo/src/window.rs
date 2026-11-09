@@ -683,7 +683,11 @@ mod tests {
             Self::serving(services(provider, None).0)
         }
 
+        /// Starts with no key held or toggled: a fresh thread may inherit
+        /// toggle bits from the user's session, and a toggled Ctrl reads
+        /// as a key state that is not 0.
         fn serving(services: Services) -> Self {
+            hold(&[]);
             Self(open(services).expect("open the launcher"))
         }
 
