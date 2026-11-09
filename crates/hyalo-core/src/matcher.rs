@@ -127,7 +127,7 @@ fn acronym(
 
 /// Lowercases one `char` into one `char`, so positions in folded text are
 /// positions in the original.
-fn fold(letter: char) -> char {
+pub(crate) fn fold(letter: char) -> char {
     letter.to_lowercase().next().unwrap_or(letter)
 }
 
