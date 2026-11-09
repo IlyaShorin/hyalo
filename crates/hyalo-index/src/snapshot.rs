@@ -31,44 +31,23 @@ impl Index {
     /// Writes the whole index to `out`. Many small writes: buffer them.
     pub fn save(&self, out: &mut impl Write) -> io::Result<()> {
         let (entries, names, free) = self.parts();
-        out.write_all(MAGIC)?;
-        out.write_all(&VERSION.to_le_bytes())?;
-        for length in [entries.len(), names.len(), free.len()] {
-            out.write_all(&(length as u64).to_le_bytes())?;
-        }
-        for entry in entries {
-            out.write_all(&entry.to_bytes())?;
-        }
+        out.write_all(&header(entries.len(), names.len(), free.len()))?;
+        entries
+            .iter()
+            .try_for_each(|entry| out.write_all(&entry.to_bytes()))?;
         out.write_all(names.as_bytes())?;
-        for at in free {
-            out.write_all(&at.to_le_bytes())?;
-        }
-        Ok(())
+        free.iter()
+            .try_for_each(|at| out.write_all(&at.to_le_bytes()))
     }
 
     /// Reads back what `save` wrote, all of it and nothing after.
     pub fn load(input: &mut impl Read) -> Result<Index, LoadError> {
-        let magic = exactly(input, MAGIC.len()).map_err(|_| LoadError::Foreign)?;
-        let version = exactly(input, 4)?;
-        if magic != MAGIC || version != VERSION.to_le_bytes() {
-            return Err(LoadError::Foreign);
-        }
-        let lengths = exactly(input, 3 * 8)?;
-        // Offsets are u32: no part of a snapshot is longer.
-        let mut lengths = lengths.as_chunks::<8>().0.iter().map(|&length| {
-            let length = u32::try_from(u64::from_le_bytes(length));
-            length.ok().map(|length| length as usize)
-        });
-        let mut next = || lengths.next().flatten().ok_or(LoadError::Damaged);
-        let (entries, names, free) = (next()?, next()?, next()?);
+        ours(input)?;
+        let [entries, names, free] = lengths(input)?;
         let entries = exactly(input, entries * 16)?;
         let names = String::from_utf8(exactly(input, names)?).map_err(|_| LoadError::Damaged)?;
         let free = exactly(input, free * 4)?;
-        // Its first value never matters: a read either fills it or not.
-        let mut probe = [u8::MIN];
-        if input.read(&mut probe).map_err(LoadError::Io)? > 0 {
-            return Err(LoadError::Damaged);
-        }
+        ended(input)?;
         let entries = entries.as_chunks::<16>().0.iter();
         let free = free.as_chunks::<4>().0.iter();
         let parts = Parts {
@@ -77,6 +56,46 @@ impl Index {
             free: free.map(|&bytes| u32::from_le_bytes(bytes)).collect(),
         };
         Index::from_parts(parts).ok_or(LoadError::Damaged)
+    }
+}
+
+/// How a snapshot starts: the magic, the version and the three lengths.
+fn header(entries: usize, names: usize, free: usize) -> Vec<u8> {
+    let lengths = [entries, names, free].map(|length| (length as u64).to_le_bytes());
+    [MAGIC.as_slice(), &VERSION.to_le_bytes(), &lengths.concat()].concat()
+}
+
+/// Reads the magic and the version, and refuses anything but ours.
+fn ours(input: &mut impl Read) -> Result<(), LoadError> {
+    let magic = exactly(input, MAGIC.len()).map_err(|_| LoadError::Foreign)?;
+    let version = exactly(input, 4)?;
+    match magic == MAGIC && version == VERSION.to_le_bytes() {
+        true => Ok(()),
+        false => Err(LoadError::Foreign),
+    }
+}
+
+/// Reads the three lengths. Offsets are u32: no part is longer.
+fn lengths(input: &mut impl Read) -> Result<[usize; 3], LoadError> {
+    let bytes = exactly(input, 3 * 8)?;
+    let length = |&bytes: &[u8; 8]| u32::try_from(u64::from_le_bytes(bytes));
+    let lengths: Result<Vec<usize>, _> = bytes
+        .as_chunks::<8>()
+        .0
+        .iter()
+        .map(|bytes| length(bytes).map(|length| length as usize))
+        .collect();
+    let lengths = lengths.map_err(|_| LoadError::Damaged)?;
+    lengths.try_into().map_err(|_| LoadError::Damaged)
+}
+
+/// Refuses anything after the end.
+fn ended(input: &mut impl Read) -> Result<(), LoadError> {
+    // Its first value never matters: a read either fills it or not.
+    let mut probe = [u8::MIN];
+    match input.read(&mut probe).map_err(LoadError::Io)? {
+        0 => Ok(()),
+        _ => Err(LoadError::Damaged),
     }
 }
 
