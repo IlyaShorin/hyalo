@@ -56,7 +56,8 @@ fn written(value: f64, mark: char) -> String {
 }
 
 /// `written` with its whole part in groups of three digits, apart by a
-/// narrow no-break space: "1 234 500,5".
+/// no-break space as in Windows' Russian number format: "1 234 500,5".
+/// The narrow one (U+202F) is too thin to see at the row's text size.
 fn grouped(written: &str) -> String {
     let (sign, unsigned) = written.split_at(usize::from(written.starts_with('-')));
     let whole = unsigned
@@ -66,7 +67,7 @@ fn grouped(written: &str) -> String {
     let mut shown = sign.to_string();
     for (index, digit) in digits.chars().enumerate() {
         if index > 0 && (digits.len() - index) % 3 == 0 {
-            shown.push('\u{202F}');
+            shown.push('\u{A0}');
         }
         shown.push(digit);
     }
@@ -153,7 +154,7 @@ mod tests {
 
     #[test]
     fn thousands_are_grouped_where_shown_but_not_where_copied() {
-        let space = '\u{202F}';
+        let space = '\u{A0}';
         assert_eq!(
             answered("1000*1234,5"),
             (format!("1{space}234{space}500"), "1234500".to_string())
