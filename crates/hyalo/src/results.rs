@@ -84,6 +84,15 @@ impl Results {
         self.rows.get(self.selected)
     }
 
+    /// Selects row `row`, if there is one; whether the selection moved.
+    pub fn select(&mut self, row: usize) -> bool {
+        let moved = row < self.rows.len() && row != self.selected;
+        if moved {
+            self.selected = row;
+        }
+        moved
+    }
+
     /// One row down; from the last row back to the first. With no rows
     /// there is nowhere to go.
     pub fn down(&mut self) {
@@ -229,6 +238,21 @@ mod tests {
     fn a_refresh_lists_what_the_query_finds_in_the_new_items() {
         let results = refreshed(&Results::default(), "note", &apps(&["Notepad"]));
         assert_eq!(picked(&results), Some("Notepad"));
+    }
+
+    #[test]
+    fn select_moves_the_selection_to_a_row_and_says_so() {
+        let mut results = search("a", &apps(&["a1", "a2", "a3"]));
+        assert!(results.select(2));
+        assert_eq!(picked(&results), Some("a3"));
+        assert!(!results.select(2), "already there");
+    }
+
+    #[test]
+    fn select_past_the_last_row_changes_nothing() {
+        let mut results = search("a", &apps(&["a1", "a2", "a3"]));
+        assert!(!results.select(3));
+        assert_eq!(picked(&results), Some("a1"));
     }
 
     #[test]

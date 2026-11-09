@@ -50,6 +50,17 @@ pub fn row_top(index: usize) -> f32 {
     BAR_HEIGHT + LIST_PADDING + index as f32 * ROW_HEIGHT
 }
 
+/// The row at `y` DIPs from the top of the launcher, when it lists
+/// `rows` rows; `None` over the bar, the padding or past the last row.
+pub fn row_at(y: f32, rows: usize) -> Option<usize> {
+    let below_the_bar = y - row_top(0);
+    if below_the_bar < 0.0 {
+        return None;
+    }
+    let row = (below_the_bar / ROW_HEIGHT) as usize;
+    (row < rows).then_some(row)
+}
+
 /// The side of a row's icon, in DIPs.
 pub const ICON_SIZE: f32 = 32.0;
 
@@ -139,6 +150,22 @@ mod tests {
     fn rows_start_below_the_bar_and_its_padding() {
         assert_eq!(row_top(0), 72.0);
         assert_eq!(row_top(2), 168.0);
+    }
+
+    #[test]
+    fn a_point_on_a_row_is_on_that_row_from_its_top_edge_to_the_next() {
+        assert_eq!(row_at(72.0, 3), Some(0));
+        assert_eq!(row_at(119.9, 3), Some(0));
+        assert_eq!(row_at(120.0, 3), Some(1));
+        assert_eq!(row_at(215.9, 3), Some(2));
+    }
+
+    #[test]
+    fn the_bar_the_padding_and_past_the_last_row_are_on_no_row() {
+        for y in [-1.0, 0.0, 30.0, 71.9, 216.0, 300.0] {
+            assert_eq!(row_at(y, 3), None, "{y}");
+        }
+        assert_eq!(row_at(80.0, 0), None);
     }
 
     #[test]

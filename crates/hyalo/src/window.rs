@@ -24,6 +24,7 @@ use windows::Win32::Graphics::Dwm::{
 };
 use windows::Win32::Graphics::Gdi::{
     GetMonitorInfoW, HMONITOR, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromPoint,
+    ScreenToClient,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
@@ -35,8 +36,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
     HTCLIENT, HWND_TOPMOST, IDC_ARROW, IsWindowVisible, LoadCursorW, MSG, PostMessageW,
     PostQuitMessage, RegisterClassExW, SW_HIDE, SW_SHOW, SWP_NOACTIVATE, SetForegroundWindow,
     SetWindowPos, ShowWindow, TranslateMessage, WA_INACTIVE, WM_ACTIVATE, WM_APP, WM_CHAR,
-    WM_DESTROY, WM_HOTKEY, WM_KEYDOWN, WM_NCCALCSIZE, WM_NCHITTEST, WNDCLASSEXW, WS_CAPTION,
-    WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_THICKFRAME,
+    WM_DESTROY, WM_HOTKEY, WM_KEYDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCCALCSIZE, WM_NCHITTEST,
+    WNDCLASSEXW, WS_CAPTION, WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    WS_THICKFRAME,
 };
 use windows::core::{BOOL, PCWSTR, Result, w};
 
@@ -117,6 +119,9 @@ struct App {
     found_at: Option<Instant>,
     /// The provider's thread sends here and posts WM_FOUND.
     found: (Sender<Found>, Receiver<Found>),
+    /// Where the pointer was last seen, in client pixels; `None` when not
+    /// known.
+    pointer: Option<POINT>,
 }
 
 impl App {
@@ -156,6 +161,35 @@ impl App {
     fn move_selection(&mut self, step: fn(&mut Results)) -> Result<()> {
         step(&mut self.results);
         self.redraw()
+    }
+
+    /// The row under `point`, in client pixels.
+    fn row_under(&self, point: POINT) -> Option<usize> {
+        let y = point.y as f32 / layout::scale(self.placement.dpi);
+        layout::row_at(y, self.results.rows().len())
+    }
+
+    /// Selects the row the pointer moved onto. A move to where the
+    /// pointer already was is not the user's: Windows sends one when the
+    /// window changes under a still pointer, as when the list grows while
+    /// typing, and that must not take the selection from the keyboard.
+    fn hover(&mut self, point: POINT) -> Result<()> {
+        let moved = self.pointer.replace(point) != Some(point);
+        let row = self.row_under(point).filter(|_| moved);
+        match row.is_some_and(|row| self.results.select(row)) {
+            true => self.redraw(),
+            false => Ok(()),
+        }
+    }
+
+    /// Opens the row under `point`, as Enter would; whether there was one.
+    fn click(&mut self, point: POINT) -> bool {
+        let Some(row) = self.row_under(point) else {
+            return false;
+        };
+        self.results.select(row);
+        self.open_picked(false);
+        true
     }
 
     /// Carries out the selected row's action and notes the pick, on disk
@@ -286,6 +320,7 @@ fn open(services: Services) -> Result<HWND> {
             services,
             found_at: None,
             found: channel(),
+            pointer: None,
         })
     });
     style_window(hwnd)?;
@@ -390,7 +425,7 @@ extern "system" fn wndproc(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPA
             unsafe { PostQuitMessage(0) };
             handled(Ok(()))
         }
-        _ => match on_message(hwnd, message, wparam) {
+        _ => match on_message(hwnd, message, wparam, lparam) {
             Some(result) => handled(result),
             None => unsafe { DefWindowProcW(hwnd, message, wparam, lparam) },
         },
@@ -399,7 +434,7 @@ extern "system" fn wndproc(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPA
 
 /// What the launcher does with a message; `None` for messages it leaves
 /// to Windows.
-fn on_message(hwnd: HWND, message: u32, wparam: WPARAM) -> Option<Result<()>> {
+fn on_message(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> Option<Result<()>> {
     match message {
         WM_HOTKEY => Some(toggle(hwnd)),
         WM_ACTIVATE if (wparam.0 & 0xFFFF) as u32 == WA_INACTIVE => {
@@ -409,8 +444,28 @@ fn on_message(hwnd: HWND, message: u32, wparam: WPARAM) -> Option<Result<()>> {
         WM_KEYDOWN => Some(on_key(hwnd, VIRTUAL_KEY(wparam.0 as u16))),
         WM_CHAR => Some(on_char(wparam.0 as u16)),
         WM_FOUND => Some(with_app(App::take_found).unwrap_or(Ok(()))),
+        WM_MOUSEMOVE => Some(with_app(|app| app.hover(client_point(lparam))).unwrap_or(Ok(()))),
+        WM_LBUTTONUP => Some(on_click(hwnd, client_point(lparam))),
         _ => None,
     }
+}
+
+/// The point a mouse message carries: x in the low word of `lparam`, y in
+/// the high one, each signed, in client pixels.
+fn client_point(lparam: LPARAM) -> POINT {
+    let word = |shift: u32| i32::from((lparam.0 >> shift) as u16 as i16);
+    POINT {
+        x: word(0),
+        y: word(16),
+    }
+}
+
+/// A click opens the row under it and hides the launcher.
+fn on_click(hwnd: HWND, point: POINT) -> Result<()> {
+    if with_app(|app| app.click(point)) == Some(true) {
+        hide(hwnd);
+    }
+    Ok(())
 }
 
 /// The message was handled: answer 0, as Windows expects, and log a
@@ -432,10 +487,12 @@ fn toggle(hwnd: HWND) -> Result<()> {
 
 fn show(hwnd: HWND) -> Result<()> {
     let placement = placement_under_cursor()?;
-    with_app(|app| {
+    with_app(|app| -> Result<()> {
         app.placement = placement;
         app.find_if_stale();
-        app.present()
+        app.present()?;
+        app.pointer = pointer_over(hwnd);
+        Ok(())
     })
     .unwrap_or(Ok(()))?;
     unsafe {
@@ -503,6 +560,15 @@ fn on_char(unit: u16) -> Result<()> {
 fn placement_under_cursor() -> Result<Placement> {
     let cursor = cursor_position().unwrap_or_default();
     placement_on(unsafe { MonitorFromPoint(cursor, MONITOR_DEFAULTTONEAREST) })
+}
+
+/// Where the mouse pointer is, in `hwnd`'s client pixels; `None` where it
+/// cannot be read (see `placement_under_cursor`).
+fn pointer_over(hwnd: HWND) -> Option<POINT> {
+    let mut point = cursor_position().ok()?;
+    unsafe { ScreenToClient(hwnd, &mut point) }
+        .as_bool()
+        .then_some(point)
 }
 
 fn cursor_position() -> Result<POINT> {
@@ -739,8 +805,7 @@ mod tests {
             let frame = self.frame();
             let scale = layout::scale(self.placement().dpi);
             let x = (9.0 * scale) as usize;
-            let middle = |row| layout::row_top(row) + layout::ROW_HEIGHT / 2.0;
-            let alpha = |row| frame.pixel(x, (middle(row) * scale) as usize)[3];
+            let alpha = |row| frame.pixel(x, (middle_of(row) * scale) as usize)[3];
             (0..rows).max_by_key(|&row| alpha(row)).expect("rows")
         }
 
@@ -753,6 +818,14 @@ mod tests {
 
         fn send(&self, message: u32, wparam: usize) -> LRESULT {
             unsafe { SendMessageW(self.0, message, Some(WPARAM(wparam)), Some(LPARAM(0))) }
+        }
+
+        /// A mouse message for the point (x, y) in DIPs.
+        fn mouse(&self, message: u32, x: f32, y: f32) {
+            let scale = layout::scale(self.placement().dpi);
+            let (x, y) = ((x * scale) as isize, (y * scale) as isize);
+            let point = LPARAM(y << 16 | x);
+            unsafe { SendMessageW(self.0, message, Some(WPARAM(0)), Some(point)) };
         }
 
         fn post(&self, message: u32, wparam: usize) {
@@ -819,6 +892,11 @@ mod tests {
         fn drop(&mut self) {
             let _ = unsafe { DestroyWindow(self.0) };
         }
+    }
+
+    /// The middle of row `row` from the top, in DIPs.
+    fn middle_of(row: usize) -> f32 {
+        layout::row_top(row) + layout::ROW_HEIGHT / 2.0
     }
 
     /// The first column of the blue caret on the middle row.
@@ -1131,6 +1209,72 @@ mod tests {
             assert_eq!(launcher.lit_row(3), 2);
             launcher.press(VK_RETURN);
             assert_eq!(*ran.borrow(), [opened("Notepad", false)]);
+        });
+    }
+
+    #[test]
+    fn hovering_a_row_selects_it() {
+        on_hidden_desktop(|| {
+            let launcher = Launcher::listing(&["a1", "a2", "a3"]);
+            launcher.type_text("a");
+            launcher.mouse(WM_MOUSEMOVE, 200.0, middle_of(2));
+            assert_eq!(launcher.lit_row(3), 2);
+            launcher.mouse(WM_MOUSEMOVE, 200.0, 30.0);
+            assert_eq!(launcher.lit_row(3), 2, "the bar selects nothing");
+        });
+    }
+
+    #[test]
+    fn a_move_to_where_the_pointer_already_was_keeps_the_selection() {
+        on_hidden_desktop(|| {
+            let launcher = Launcher::listing(&["a1", "a2", "a3"]);
+            launcher.type_text("a");
+            launcher.mouse(WM_MOUSEMOVE, 200.0, middle_of(2));
+            launcher.press(VK_UP);
+            launcher.mouse(WM_MOUSEMOVE, 200.0, middle_of(2));
+            assert_eq!(
+                launcher.lit_row(3),
+                1,
+                "the same spot: Windows, not the user"
+            );
+            launcher.mouse(WM_MOUSEMOVE, 201.0, middle_of(2));
+            assert_eq!(launcher.lit_row(3), 2, "a real move");
+        });
+    }
+
+    #[test]
+    fn showing_again_forgets_where_the_pointer_was() {
+        on_hidden_desktop(|| {
+            let launcher = Launcher::listing(&["a1", "a2", "a3"]);
+            launcher.type_text("a");
+            launcher.mouse(WM_MOUSEMOVE, 200.0, middle_of(2));
+            launcher.press(VK_ESCAPE);
+            launcher.hotkey();
+            launcher.type_text("a");
+            launcher.mouse(WM_MOUSEMOVE, 200.0, middle_of(2));
+            assert_eq!(launcher.lit_row(3), 2);
+        });
+    }
+
+    #[test]
+    fn clicking_a_row_opens_it_and_hides() {
+        on_hidden_desktop(|| {
+            let (launcher, ran) = Launcher::listing_with(&["Notes", "Notepad"], None);
+            launcher.type_text("note");
+            launcher.mouse(WM_LBUTTONUP, 200.0, middle_of(1));
+            assert_eq!(*ran.borrow(), [opened("Notepad", false)]);
+            assert!(!launcher.visible());
+        });
+    }
+
+    #[test]
+    fn clicking_the_bar_opens_nothing() {
+        on_hidden_desktop(|| {
+            let (launcher, ran) = Launcher::listing_with(&["Notepad"], None);
+            launcher.type_text("note");
+            launcher.mouse(WM_LBUTTONUP, 200.0, 30.0);
+            assert!(ran.borrow().is_empty());
+            assert!(launcher.visible());
         });
     }
 
