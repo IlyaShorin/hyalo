@@ -7,14 +7,27 @@
 use std::collections::HashSet;
 use std::ops::Range;
 
-/// How a query matched a name, weakest first.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+/// How a query matched a name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Strength {
-    Substring,
-    Acronym,
-    WordStart,
-    Prefix,
     Exact,
+    Prefix,
+    WordStart,
+    Acronym,
+    Substring,
+}
+
+impl Strength {
+    /// One tier per kind, 20 points apart.
+    fn points(self) -> f64 {
+        match self {
+            Strength::Exact => 100.0,
+            Strength::Prefix => 80.0,
+            Strength::WordStart => 60.0,
+            Strength::Acronym => 40.0,
+            Strength::Substring => 20.0,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -23,6 +36,13 @@ pub struct Match {
     /// Indices of the matched characters (`char`s, not bytes) in the name,
     /// ascending, for highlighting.
     pub positions: Vec<usize>,
+}
+
+impl Match {
+    /// How good the match is; more is better.
+    pub fn points(&self) -> f64 {
+        self.strength.points()
+    }
 }
 
 /// Matches `query` against `name`; `None` when it does not match at all.
@@ -158,11 +178,6 @@ mod tests {
     }
 
     #[test]
-    fn exact_is_stronger_than_prefix() {
-        assert!(Strength::Exact > Strength::Prefix);
-    }
-
-    #[test]
     fn a_later_word_can_start_the_match() {
         assert_eq!(
             strength("studio", "Visual Studio Code"),
@@ -216,11 +231,6 @@ mod tests {
     }
 
     #[test]
-    fn prefix_is_stronger_than_a_word_start() {
-        assert!(Strength::Prefix > Strength::WordStart);
-    }
-
-    #[test]
     fn first_letters_of_words_are_an_acronym() {
         assert_eq!(
             strength("vsc", "Visual Studio Code"),
@@ -270,11 +280,6 @@ mod tests {
     }
 
     #[test]
-    fn word_start_is_stronger_than_an_acronym() {
-        assert!(Strength::WordStart > Strength::Acronym);
-    }
-
-    #[test]
     fn letters_inside_a_word_are_a_substring() {
         assert_eq!(
             strength("ode", "Visual Studio Code"),
@@ -294,13 +299,24 @@ mod tests {
     }
 
     #[test]
-    fn an_acronym_is_stronger_than_a_substring() {
-        assert!(Strength::Acronym > Strength::Substring);
-    }
-
-    #[test]
     fn letters_that_are_not_in_the_name_do_not_match() {
         assert_eq!(find("xyz", "Code"), None);
         assert_eq!(find("codes", "Code"), None);
+    }
+
+    #[test]
+    fn stronger_kinds_of_match_score_more_points() {
+        let points = |query, name| find(query, name).map(|found| found.points());
+        let ladder = [
+            points("code", "Code"),
+            points("co", "Code"),
+            points("code", "Visual Studio Code"),
+            points("vsc", "Visual Studio Code"),
+            points("ode", "Code"),
+        ];
+        assert!(
+            ladder.is_sorted_by(|stronger, weaker| stronger > weaker),
+            "{ladder:?}"
+        );
     }
 }
