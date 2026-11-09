@@ -52,12 +52,14 @@ impl App {
         self.redraw()
     }
 
-    fn redraw(&self) -> Result<()> {
+    fn redraw(&mut self) -> Result<()> {
         let scene = Scene {
             query: self.query.text(),
+            rows: Vec::new(),
+            selected: 0,
         };
         self.renderer
-            .as_ref()
+            .as_mut()
             .map_or(Ok(()), |renderer| renderer.draw(&scene))
     }
 }
