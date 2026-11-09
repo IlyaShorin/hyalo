@@ -39,18 +39,12 @@ pub struct Catalog {
 }
 
 impl Catalog {
-    /// Takes in one piece. Returns whether the items changed, the only
-    /// change that calls for searching again.
-    pub fn take(&mut self, found: Found) -> bool {
+    /// Takes in one piece.
+    pub fn take(&mut self, found: Found) {
         match found {
-            Found::Items(items) => {
-                let changed = items != self.items;
-                self.items = items;
-                changed
-            }
+            Found::Items(items) => self.items = items,
             Found::Icon(id, icon) => {
                 self.icons.insert(id, icon);
-                false
             }
         }
     }
@@ -119,25 +113,18 @@ mod tests {
     }
 
     #[test]
-    fn new_items_replace_the_old_and_call_for_a_search() {
+    fn new_items_replace_the_old() {
         let mut catalog = Catalog::default();
-        assert!(catalog.take(Found::Items(vec![app("Paint")])));
-        assert!(catalog.take(Found::Items(vec![app("Notepad")])));
+        catalog.take(Found::Items(vec![app("Paint")]));
+        catalog.take(Found::Items(vec![app("Notepad")]));
         assert_eq!(catalog.items, [app("Notepad")]);
     }
 
     #[test]
-    fn the_same_items_again_change_nothing() {
-        let mut catalog = Catalog::default();
-        catalog.take(Found::Items(vec![app("Paint")]));
-        assert!(!catalog.take(Found::Items(vec![app("Paint")])));
-    }
-
-    #[test]
-    fn an_icon_is_kept_for_its_item_without_a_search() {
+    fn an_icon_is_kept_for_its_item() {
         let mut catalog = Catalog::default();
         let paint = ItemId("Paint".to_string());
-        assert!(!catalog.take(Found::Icon(paint.clone(), dot())));
+        catalog.take(Found::Icon(paint.clone(), dot()));
         assert_eq!(catalog.icons.get(&paint), Some(&dot()));
     }
 

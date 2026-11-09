@@ -200,18 +200,16 @@ impl App {
         std::thread::spawn(move || provider(&request, &|found| hand_over(&sender, window, found)));
     }
 
-    /// Takes in what the provider handed over, searches again if the items
-    /// changed (keeping the selected item selected), and shows the result
-    /// if the window is up.
+    /// Takes in what the provider handed over, searches again (keeping
+    /// the selected item selected), and shows the result if the window is
+    /// up. After an icon the search finds the same rows; it costs less
+    /// than the redraw that follows.
     fn take_found(&mut self) -> Result<()> {
-        let mut changed = false;
-        while let Ok(found) = self.found.1.try_recv() {
-            changed |= self.catalog.take(found);
+        for found in self.found.1.try_iter() {
+            self.catalog.take(found);
         }
-        if changed {
-            let (query, items) = (self.query.text(), &self.catalog.items);
-            self.results = self.results.refreshed(query, items, &self.frecency, now());
-        }
+        let (query, items) = (self.query.text(), &self.catalog.items);
+        self.results = self.results.refreshed(query, items, &self.frecency, now());
         match unsafe { IsWindowVisible(self.hwnd) }.as_bool() {
             true => self.present(),
             false => Ok(()),
