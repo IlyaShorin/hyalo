@@ -56,6 +56,9 @@ const WORDS: [&str; 48] = [
     "счёт",
 ];
 
+/// 2026-11-10, 14:30 in Moscow, in seconds since 1970.
+pub const NOW: i64 = 1_794_310_200;
+
 const EXTENSIONS: [&str; 18] = [
     "txt", "md", "rs", "js", "ts", "json", "png", "jpg", "pdf", "docx", "xlsx", "exe", "dll",
     "log", "html", "css", "py", "zip",
@@ -67,11 +70,15 @@ const FOLDERS: [&str; 5] = ["Desktop", "node_modules", ".git", "AppData", "Docum
 /// The same drive for the same `seed`: a root `C:` and `count` files and
 /// folders under it, about one in eight a folder. As a walk does, it adds
 /// a folder's entries one after another, a run of up to 16 at a time.
+/// Each file holds up to about 16 MB, most far less, and was written in
+/// the two years before 2026-11-10.
 pub fn drive(count: usize, seed: u64) -> Index {
     let mut index = Index::default();
     let root = index.add_root("C:").expect("a root name");
     let mut folders: Vec<EntryId> = vec![root];
     let mut random = Random(seed | 1);
+    // Its own stream, so the names stay what they were.
+    let mut stats = Random(seed.rotate_left(17) | 1);
     let mut left = count;
     while left > 0 {
         let parent = folders[random.below(folders.len())];
@@ -82,6 +89,10 @@ pub fn drive(count: usize, seed: u64) -> Index {
             let id = index.add(parent, &name, folder).expect("a made-up name");
             if folder {
                 folders.push(id);
+            } else {
+                let size = 1_u64 << stats.below(25) | stats.below(1024) as u64;
+                let written = NOW - stats.below(2 * 365 * 24 * 60 * 60) as i64;
+                index.set_stat(id, size, written).expect("just added");
             }
         }
         left -= run;

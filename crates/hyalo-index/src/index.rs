@@ -657,13 +657,13 @@ impl Fold {
 
 /// A position or count as the u32 entries keep. The index holds far fewer
 /// than four billion entries and bytes of names.
-fn offset(at: usize) -> u32 {
+pub(crate) fn offset(at: usize) -> u32 {
     u32::try_from(at).expect("the index stays under 4 GB of names and 4 billion entries")
 }
 
 /// Whether two names are the same to Windows, which compares them letter
 /// by letter in any case: `Ё` as `ё`, never as `е`.
-fn same(one: &str, other: &str) -> bool {
+pub(crate) fn same(one: &str, other: &str) -> bool {
     let lower = |name: &str| {
         name.chars()
             .flat_map(char::to_lowercase)

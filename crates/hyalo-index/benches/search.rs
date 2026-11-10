@@ -3,12 +3,13 @@
 
 use std::time::{Duration, Instant};
 
+use hyalo_core::filter::{Clock, Query};
 use hyalo_core::places::Places;
 use hyalo_index::{Index, synthetic};
 
 /// Single letters, words, an acronym, the wrong layout, ё typed as е, a
-/// full name, and letters no name has.
-const QUERIES: [&str; 12] = [
+/// full name, letters no name has, then filters, alone and with words.
+const QUERIES: [&str; 22] = [
     "a",
     "e",
     "no",
@@ -21,6 +22,16 @@ const QUERIES: [&str; 12] = [
     "отчет",
     "readme",
     "zqxj",
+    "ext:pdf",
+    "ext:pdf,docx report",
+    "in:Documents",
+    "notes in:Desktop",
+    "size:>10mb",
+    "size:<1kb e",
+    "mod:7d",
+    "mod:2026-11 rep",
+    "mod:>2026-01-01 ext:txt in:node_modules",
+    "e ext:rs size:1kb..1mb mod:30d",
 ];
 
 /// Runs of each query; the median and the worst are reported.
@@ -65,10 +76,16 @@ fn reloaded(index: &Index) -> Index {
     back
 }
 
-fn report(index: &Index, places: &Places, query: &str) {
-    let mut times: Vec<Duration> = (0..RUNS).map(|_| timed(index, places, query)).collect();
+fn report(index: &Index, places: &Places, text: &str) {
+    let clock = Clock {
+        now: synthetic::NOW,
+        offset: 3 * 60 * 60,
+    };
+    let query = Query::parse(text, clock);
+    let mut times: Vec<Duration> = (0..RUNS).map(|_| timed(index, places, &query)).collect();
     times.sort();
-    let found = index.search(query, places, LIMIT);
+    let found = index.search_with(&query.words, &query.filters, places, LIMIT);
+    let query = text;
     let best = found.rows.first().map_or("", |row| row.item.title.as_str());
     println!(
         "{query:>10}: median {:6.2?}, worst {:6.2?}, {} scored, best row {best:?}",
@@ -78,8 +95,9 @@ fn report(index: &Index, places: &Places, query: &str) {
     );
 }
 
-fn timed(index: &Index, places: &Places, query: &str) -> Duration {
+fn timed(index: &Index, places: &Places, query: &Query) -> Duration {
     let started = Instant::now();
-    std::hint::black_box(index.search(query, places, LIMIT));
+    let found = index.search_with(&query.words, &query.filters, places, LIMIT);
+    std::hint::black_box(found);
     started.elapsed()
 }

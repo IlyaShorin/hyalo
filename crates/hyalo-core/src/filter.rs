@@ -5,6 +5,8 @@
 
 use std::ops::RangeInclusive;
 
+use crate::matcher;
+
 /// A query taken apart: the words that match names, and the filters.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Query {
@@ -17,7 +19,8 @@ pub struct Query {
 /// twice narrows further, but extensions and folders, which add choices.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Filters {
-    /// Extensions, lowercased, without their dot: a file with one of them.
+    /// Extensions, folded as names are (`matcher::folded`), without their
+    /// dot: a file with one of them.
     pub extensions: Vec<String>,
     /// Folders, lowercased: by name, anywhere, or by full path. What is
     /// listed is somewhere under one of them.
@@ -43,7 +46,7 @@ impl Filters {
     pub fn extension_of(&self, name: &str) -> bool {
         let extension = name
             .rsplit_once('.')
-            .map(|(_, extension)| extension.to_lowercase());
+            .map(|(_, extension)| matcher::folded(extension));
         let same = |wanted: &String| extension.as_ref() == Some(wanted);
         self.extensions.is_empty() || self.extensions.iter().any(same)
     }
@@ -158,7 +161,7 @@ fn extensions(value: &str) -> Option<Vec<String>> {
     wanted.iter().all(good).then(|| {
         wanted
             .iter()
-            .map(|extension| extension.to_lowercase())
+            .map(|extension| matcher::folded(extension))
             .collect()
     })
 }

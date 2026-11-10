@@ -5,16 +5,18 @@
 //! possible score cannot beat what the thread already holds. Only the
 //! rest are matched and scored by hyalo-core, as every item is.
 
+use std::collections::HashSet;
 use std::num::NonZero;
 use std::ops::Range;
 use std::thread;
 
+use hyalo_core::filter::Filters;
 use hyalo_core::item::Kind;
-use hyalo_core::matcher::{Ceiling, Match, Pattern};
+use hyalo_core::matcher::{self, Ceiling, Layout, Match, Pattern, Strength};
 use hyalo_core::places::{self, Places};
 use hyalo_core::rank::{self, Ranked};
 
-use crate::index::Entry;
+use crate::index::{Entry, offset, same};
 use crate::{EntryId, Index};
 
 /// The fewest entries worth a thread of their own.
@@ -33,11 +35,37 @@ impl Index {
     /// as `hyalo_core::rank` scores items (no picks: the caller ranks
     /// picked files itself). Equal scores keep the order of the index.
     pub fn search(&self, query: &str, places: &Places, limit: usize) -> Searched {
+        self.search_with(query, &Filters::default(), places, limit)
+    }
+
+    /// The same, for the files and folders `filters` lets through. With no
+    /// words what it lets through is ranked by its place alone, the newest
+    /// first among equals; neither words nor filters list nothing.
+    pub fn search_with(
+        &self,
+        query: &str,
+        filters: &Filters,
+        places: &Places,
+        limit: usize,
+    ) -> Searched {
+        if query.is_empty() && filters.is_empty() {
+            return Searched {
+                rows: Vec::new(),
+                scored: 0,
+            };
+        }
         let pattern = &Pattern::new(query);
+        let narrowing = &Narrowing {
+            filters,
+            unmatched: query.is_empty(),
+            within: (!filters.folders.is_empty()).then(|| self.folders_named(&filters.folders)),
+        };
         let (mut hits, scored) = thread::scope(|scope| {
             let threads: Vec<_> = self
                 .slices()
-                .map(|slice| scope.spawn(move || self.best_in(slice, pattern, places, limit)))
+                .map(|slice| {
+                    scope.spawn(move || self.best_in(slice, pattern, narrowing, places, limit))
+                })
                 .collect();
             let found = threads.into_iter().map(|thread| thread.join());
             let found = found.map(|scan| scan.expect("a search thread"));
@@ -47,7 +75,10 @@ impl Index {
             })
         });
         // Stable: equal scores stay in the order of the slices.
-        hits.sort_by(|one, other| other.score.total_cmp(&one.score));
+        hits.sort_by(|one, other| {
+            let newer = other.newer.cmp(&one.newer);
+            other.score.total_cmp(&one.score).then(newer)
+        });
         hits.truncate(limit);
         let rows = hits.into_iter().map(|hit| self.ranked(hit, pattern));
         Searched {
@@ -73,24 +104,55 @@ impl Index {
         &self,
         slice: Range<usize>,
         pattern: &Pattern,
+        narrowing: &Narrowing,
         places: &Places,
         limit: usize,
     ) -> (Vec<Hit>, usize) {
         let mut scan = Scan {
             index: self,
             pattern,
+            narrowing,
             places,
             best: Best {
                 limit,
                 hits: Vec::new(),
             },
             seen: vec![(u32::MAX, 0.0); SEEN],
+            under: vec![(u32::MAX, false); SEEN],
             scored: 0,
         };
         for at in slice {
             scan.consider(at as u32);
         }
         (scan.best.hits, scan.scored)
+    }
+
+    /// The folders `folders` names: by a full path, the one there; by a
+    /// name, every folder so named.
+    fn folders_named(&self, folders: &[String]) -> HashSet<u32> {
+        let mut found = HashSet::new();
+        for folder in folders {
+            if folder.contains(['\\', ':']) {
+                let there = self
+                    .find(folder)
+                    .filter(|&id| self.is_folder(id) == Some(true));
+                found.extend(there.map(|id| id.0));
+                continue;
+            }
+            let folded = matcher::folded(folder);
+            let named = |entry: &Entry| {
+                let folder_named = entry.is_live() && entry.is_folder();
+                folder_named
+                    && self.folded_of(*entry) == folded
+                    && same(self.name_of(*entry), folder)
+            };
+            let all = self.entries.iter().enumerate();
+            found.extend(
+                all.filter(|(_, entry)| named(entry))
+                    .map(|(at, _)| offset(at)),
+            );
+        }
+        found
     }
 
     /// The folded names of the folders from a root down to `folder`.
@@ -119,14 +181,46 @@ impl Index {
 /// after another, so most entries find their folder here.
 const SEEN: usize = 256;
 
+/// Filters made ready for one search.
+struct Narrowing<'a> {
+    filters: &'a Filters,
+    /// No words: what the filters let through is listed unmatched.
+    unmatched: bool,
+    /// The folders `in:` names, when it names any: what is listed is
+    /// under one of them.
+    within: Option<HashSet<u32>>,
+}
+
+impl Narrowing<'_> {
+    /// Whether the entry at `at` is of a kind, extension, size and time
+    /// the filters let through.
+    fn admits(&self, index: &Index, at: u32, entry: Entry) -> bool {
+        let filters = self.filters;
+        if entry.is_folder() && !filters.take_folders() {
+            return false;
+        }
+        let extension = index
+            .folded_of(entry)
+            .rsplit_once('.')
+            .map(|(_, extension)| extension);
+        let wanted = |wanted: &String| Some(wanted.as_str()) == extension;
+        let typed = filters.extensions.is_empty() || filters.extensions.iter().any(wanted);
+        let at = at as usize;
+        typed && filters.sized_and_dated(index.sizes[at], i64::from(index.times[at]))
+    }
+}
+
 /// One thread's look through its slice.
 struct Scan<'a> {
     index: &'a Index,
     pattern: &'a Pattern,
+    narrowing: &'a Narrowing<'a>,
     places: &'a Places,
     best: Best,
     /// `(folder, points of its place)`, each folder in slot `folder % SEEN`.
     seen: Vec<(u32, f64)>,
+    /// `(folder, whether it is under a folder `in:` names)`, the same way.
+    under: Vec<(u32, bool)>,
     /// Names that got past their ceilings.
     scored: usize,
 }
@@ -136,11 +230,38 @@ impl Scan<'_> {
     /// there: judged roughly from the folded name, then from the name's
     /// words; only a possible acronym needs `find` to know its points.
     fn consider(&mut self, at: u32) {
-        let index = self.index;
-        let entry = index.entries[at as usize];
-        if !entry.is_live() || entry.is_root() {
+        let entry = self.index.entries[at as usize];
+        let listed = entry.is_live() && !entry.is_root();
+        if !listed || !self.narrowing.admits(self.index, at, entry) || !self.inside(entry.parent) {
             return;
         }
+        match self.narrowing.unmatched {
+            true => self.list(at, entry),
+            false => self.match_name(at, entry),
+        }
+    }
+
+    /// Offers the entry at `at` by its place alone, the newer first.
+    fn list(&mut self, at: u32, entry: Entry) {
+        let score = rank::score(0.0, kind_of(entry), self.place(entry.parent), 0.0);
+        let none = Match {
+            strength: Strength::Substring,
+            layout: Layout::AsTyped,
+            positions: Vec::new(),
+        };
+        let newer = self.index.times[at as usize];
+        self.best.offer(Hit {
+            at,
+            score,
+            found: Some(none),
+            newer,
+        });
+    }
+
+    /// Offers the entry at `at` by how its name matches, unless that cannot
+    /// beat what is kept.
+    fn match_name(&mut self, at: u32, entry: Entry) {
+        let index = self.index;
         let (folded, name, kind) = (index.folded_of(entry), index.name_of(entry), kind_of(entry));
         let floor = self.best.floor();
         let beats = |points: f64| rank::score(points, kind, places::BOOST, 0.0) > floor;
@@ -157,7 +278,26 @@ impl Scan<'_> {
             return;
         };
         let score = rank::score(points, kind, self.place(entry.parent), 0.0);
-        self.best.offer(Hit { at, score, found });
+        self.best.offer(Hit {
+            at,
+            score,
+            found,
+            newer: 0,
+        });
+    }
+
+    /// Whether what is in `folder` is under a folder `in:` names, if it
+    /// names any.
+    fn inside(&mut self, folder: u32) -> bool {
+        let Some(within) = &self.narrowing.within else {
+            return true;
+        };
+        let slot = folder as usize % SEEN;
+        if self.under[slot].0 != folder {
+            let under = self.index.ancestry(folder).any(|at| within.contains(&at));
+            self.under[slot] = (folder, under);
+        }
+        self.under[slot].1
     }
 
     /// The points of the place of what is in `folder`.
@@ -196,6 +336,9 @@ struct Hit {
     score: f64,
     /// Found while searching only when needed; the rows shown find it.
     found: Option<Match>,
+    /// When it was written, for ties among rows listed unmatched; none
+    /// for a match, whose ties keep the order of the index.
+    newer: u32,
 }
 
 /// The best hits so far, best first, at most `limit`.
@@ -216,7 +359,8 @@ impl Best {
     /// Keeps `hit` if it is among the best; after any equal ones, which
     /// came first.
     fn offer(&mut self, hit: Hit) {
-        let place = self.hits.partition_point(|kept| kept.score >= hit.score);
+        let ahead = |kept: &Hit| (kept.score, kept.newer) >= (hit.score, hit.newer);
+        let place = self.hits.partition_point(ahead);
         self.hits.insert(place, hit);
         self.hits.truncate(self.limit);
     }
@@ -226,6 +370,7 @@ impl Best {
 mod tests {
     use super::*;
     use crate::{EntryId, synthetic};
+    use hyalo_core::filter::{Clock, Query};
     use hyalo_core::frecency::{Frecency, Timestamp};
     use hyalo_core::item::{Item, Kind};
     use hyalo_core::rank::rank;
@@ -368,6 +513,152 @@ mod tests {
             .filter(|&id| index.path(id).is_some_and(|path| path.contains('\\')))
             .filter_map(|id| index.item(id))
             .collect()
+    }
+
+    /// 2026-11-10 14:30 in Moscow.
+    const CLOCK: Clock = Clock {
+        now: 1_794_310_200,
+        offset: 3 * 60 * 60,
+    };
+    const DAY: i64 = 24 * 60 * 60;
+
+    /// C: with Desktop, Downloads\old and Work\deep, files in each: a
+    /// name, its folder, its size and how many days ago it was written;
+    /// a name ending in a backslash is a folder.
+    fn drive() -> Index {
+        let mut index = Index::default();
+        let c = index.add_root("C:").unwrap();
+        let desktop = index.add(c, "Desktop", true).unwrap();
+        let downloads = index.add(c, "Downloads", true).unwrap();
+        let old = index.add(downloads, "old", true).unwrap();
+        let work = index.add(c, "Work", true).unwrap();
+        let deep = index.add(work, "deep", true).unwrap();
+        let files = [
+            (desktop, "report.pdf", 2_000_000, 0),
+            (desktop, "report.docx", 30_000, 1),
+            (downloads, "manual.PDF", 500, 3),
+            (old, "scan.pdf", 9_000_000, 400),
+            (work, "notes.txt", 100, 2),
+            (deep, "report.pdf", 1_000, 10),
+            (deep, "pdf\\", 0, 5),
+        ];
+        for (folder, name, size, days) in files {
+            let bare = name.trim_end_matches('\\');
+            let entry = index.add(folder, bare, bare != name).unwrap();
+            index.set_stat(entry, size, CLOCK.now - days * DAY).unwrap();
+        }
+        index
+    }
+
+    fn found(index: &Index, query: &str) -> Vec<String> {
+        let query = Query::parse(query, CLOCK);
+        let places = Places::new(&[r"C:\Desktop"]);
+        let rows = index
+            .search_with(&query.words, &query.filters, &places, 10)
+            .rows;
+        rows.into_iter().map(|row| row.item.id.0).collect()
+    }
+
+    #[test]
+    fn filters_alone_list_what_they_let_through_best_place_first_then_newest() {
+        let index = drive();
+        assert_eq!(
+            found(&index, "ext:pdf"),
+            [
+                r"C:\Desktop\report.pdf",
+                r"C:\Downloads\manual.PDF",
+                r"C:\Work\deep\report.pdf",
+                r"C:\Downloads\old\scan.pdf",
+            ]
+        );
+    }
+
+    #[test]
+    fn words_and_filters_go_together() {
+        let index = drive();
+        assert_eq!(
+            found(&index, "report ext:pdf"),
+            [r"C:\Desktop\report.pdf", r"C:\Work\deep\report.pdf"]
+        );
+        assert_eq!(
+            found(&index, "ext:docx,txt rep"),
+            [r"C:\Desktop\report.docx"]
+        );
+    }
+
+    #[test]
+    fn a_folder_is_named_or_given_by_its_path_and_holds_what_is_under_it_at_any_depth() {
+        let index = drive();
+        // Folders first, then the newest: deep was never given a time.
+        assert_eq!(
+            found(&index, "in:work"),
+            [
+                r"C:\Work\deep\pdf",
+                r"C:\Work\deep",
+                r"C:\Work\notes.txt",
+                r"C:\Work\deep\report.pdf"
+            ]
+        );
+        assert_eq!(
+            found(&index, r"report in:c:\WORK\"),
+            [r"C:\Work\deep\report.pdf"]
+        );
+        assert_eq!(
+            found(&index, "ext:pdf in:Downloads"),
+            [r"C:\Downloads\manual.PDF", r"C:\Downloads\old\scan.pdf"]
+        );
+        assert_eq!(
+            found(&index, "in:old in:deep ext:pdf"),
+            [r"C:\Work\deep\report.pdf", r"C:\Downloads\old\scan.pdf"]
+        );
+        assert!(found(&index, "in:nowhere").is_empty());
+        assert!(found(&index, r"in:C:\Nowhere").is_empty());
+        assert!(
+            found(&index, r"in:C:\Work\notes.txt").is_empty(),
+            "a file holds nothing"
+        );
+    }
+
+    #[test]
+    fn sizes_and_times_narrow_files_and_folders_have_no_size() {
+        let index = drive();
+        assert_eq!(
+            found(&index, "size:>1mb"),
+            [r"C:\Desktop\report.pdf", r"C:\Downloads\old\scan.pdf"]
+        );
+        assert_eq!(
+            found(&index, "size:<=1000 ext:pdf"),
+            [r"C:\Downloads\manual.PDF", r"C:\Work\deep\report.pdf"]
+        );
+        assert_eq!(found(&index, "mod:today"), [r"C:\Desktop\report.pdf"]);
+        assert_eq!(
+            found(&index, "in:deep mod:7d"),
+            [r"C:\Work\deep\pdf"],
+            "a folder has a time"
+        );
+        assert_eq!(
+            found(&index, "pdf mod:<2026-01-01"),
+            [r"C:\Downloads\old\scan.pdf"]
+        );
+    }
+
+    #[test]
+    fn neither_words_nor_filters_list_nothing() {
+        let index = drive();
+        assert!(found(&index, "").is_empty());
+        let rows = index.search("", &Places::default(), 10).rows;
+        assert!(rows.is_empty());
+    }
+
+    #[test]
+    fn a_row_listed_by_filters_alone_matched_no_letters() {
+        let index = drive();
+        let query = Query::parse("ext:docx", CLOCK);
+        let rows = index
+            .search_with(&query.words, &query.filters, &Places::default(), 10)
+            .rows;
+        assert_eq!(rows[0].item.title, "report.docx");
+        assert!(rows[0].found.positions.is_empty());
     }
 
     #[test]
