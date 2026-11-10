@@ -72,22 +72,28 @@ pub struct Watch {
 
 impl Watch {
     /// Watches `root`, telling `tell` what it sees; back once the watch
-    /// is set, so whatever changes after is told of.
-    pub fn start(root: &Path, tell: Tell) -> Watch {
+    /// is set, so whatever changes after is told of. `None` if Windows
+    /// will not watch it at all; a root not there yet is watched once it
+    /// is.
+    pub fn start(root: &Path, tell: Tell) -> Option<Watch> {
         Watch::with_room(root, tell, BUFFER)
     }
 
-    fn with_room(root: &Path, tell: Tell, room: usize) -> Watch {
+    fn with_room(root: &Path, tell: Tell, room: usize) -> Option<Watch> {
         let stop = Arc::new(AtomicBool::new(false));
         let (root, halt) = (root.to_path_buf(), Arc::clone(&stop));
-        let (set, ready) = mpsc::channel::<()>();
+        let (set, ready) = mpsc::channel::<bool>();
         let thread = thread::spawn(move || watch(&root, &*tell, &halt, room, set));
-        // The watch drops its end once it is set, or could not be.
-        let _ = ready.recv();
-        Watch {
+        // The watch says false if refused; else it drops its end once it
+        // is set, or could not open the root.
+        if ready.recv() == Ok(false) {
+            let _ = thread.join();
+            return None;
+        }
+        Some(Watch {
             stop,
             thread: Some(thread),
-        }
+        })
     }
 }
 
@@ -110,7 +116,7 @@ fn watch(
     tell: &dyn Fn(Event) -> bool,
     stop: &AtomicBool,
     room: usize,
-    set: Sender<()>,
+    set: Sender<bool>,
 ) {
     let top = root_name(root);
     let mut buffer = vec![0_u64; room.div_ceil(8)];
@@ -128,6 +134,7 @@ fn watch(
             continue;
         };
         let ended = directory.follow(&top, &mut buffer, tell, stop, &mut owed);
+        let unset = owed.set.take();
         // Whatever opens it again has lost track of what changed between.
         owed = Owed {
             set: None,
@@ -141,6 +148,9 @@ fn watch(
                     "hyalo: cannot watch {}: walked at start alone",
                     root.display()
                 );
+                if let Some(set) = unset {
+                    let _ = set.send(false);
+                }
                 return;
             }
         }
@@ -150,7 +160,7 @@ fn watch(
 /// What a watch owes once a read waits for changes: telling `start` it
 /// is set, and telling the provider it lost track.
 struct Owed {
-    set: Option<Sender<()>>,
+    set: Option<Sender<bool>>,
     lost: bool,
 }
 
@@ -451,7 +461,7 @@ mod tests {
     fn watching(root: &Path) -> (Watch, Receiver<Event>) {
         let (sender, events) = mpsc::channel();
         let watch = Watch::start(root, Box::new(move |event| sender.send(event).is_ok()));
-        (watch, events)
+        (watch.expect("a folder is watched"), events)
     }
     use std::time::Instant;
 
@@ -702,6 +712,37 @@ mod tests {
     }
 
     #[test]
+    fn what_windows_will_not_watch_is_no_watch() {
+        let folder = Scratch::new("watch-file").with(&["a file.txt"]);
+        let watch = Watch::start(&folder.0.join("a file.txt"), Box::new(|_| true));
+        assert!(watch.is_none());
+    }
+
+    #[test]
+    fn a_root_made_again_at_once_is_lost_track_of() {
+        let folder = Scratch::new("watch-again-at-once");
+        let (watch, events) = watching(&folder.0);
+        fs::remove_dir(&folder.0).expect("remove the root");
+        fs::create_dir(&folder.0).expect("make it again");
+        let seen = gathered(&events, |seen| seen.contains(&Event::Lost));
+        drop(watch);
+        assert!(seen.contains(&Event::Lost), "{seen:?}");
+    }
+
+    #[test]
+    fn a_size_below_nothing_reads_as_nothing() {
+        let sized = |size: i64| {
+            let mut bytes = written(FILE_ACTION_ADDED, 0, 0, &utf16("a"), true);
+            let at = offset_of!(FILE_NOTIFY_EXTENDED_INFORMATION, FileSize);
+            bytes[at..at + 8].copy_from_slice(&size.to_ne_bytes());
+            records(&bytes, "C:")[0].stat.size
+        };
+        assert_eq!(sized(-1), 0);
+        assert_eq!(sized(0), 0);
+        assert_eq!(sized(7), 7);
+    }
+
+    #[test]
     fn a_watch_that_falls_behind_says_it_lost_track() {
         let folder = Scratch::new("watch-overflow");
         let (sender, events) = mpsc::channel();
@@ -716,7 +757,7 @@ mod tests {
                 .recv_timeout(Duration::from_secs(10));
             sender.send(event).is_ok()
         };
-        let watch = Watch::with_room(&folder.0, Box::new(tell), 4096);
+        let watch = Watch::with_room(&folder.0, Box::new(tell), 4096).expect("watched");
         for n in 0..200 {
             let name = format!("a file with a name long enough to fill the room {n:03}.txt");
             fs::write(folder.0.join(name), b"x").expect("write");

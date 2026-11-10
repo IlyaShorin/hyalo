@@ -214,10 +214,11 @@ impl Walk<'_> {
         let tell = |sender: mpsc::Sender<(usize, Event)>, root: usize| {
             Box::new(move |event| sender.send((root, event)).is_ok())
         };
+        // A root Windows will not watch is walked at start alone.
         let watches: Vec<Watch> = roots
             .iter()
             .enumerate()
-            .map(|(at, root)| Watch::start(root, tell(sender.clone(), at)))
+            .filter_map(|(at, root)| Watch::start(root, tell(sender.clone(), at)))
             .collect();
         self.walk(shared, &roots, report);
         self.follow(shared, &roots, &events, report);
@@ -1076,10 +1077,13 @@ mod tests {
     #[test]
     fn a_folder_moved_in_whole_is_walked_and_one_renamed_keeps_its_files() {
         let folder = Scratch::new("live-folder").with(&["watched\\"]);
+        // A `$` name is left out only at a root: these stay.
         let outside = Scratch::new("live-outside").with(&[
             "brought\\",
+            r"brought\$top.txt",
             r"brought\deep\",
             r"brought\deep\inside.txt",
+            r"brought\deep\$deep.txt",
         ]);
         let root = folder.0.join("watched");
         let (files, writer) = Files::new();
@@ -1088,6 +1092,8 @@ mod tests {
         serving.until(|serving| serving.reports() >= 1);
         fs::rename(outside.0.join("brought"), folder.0.join(r"watched\brought")).expect("move in");
         serving.finds("inside", &[folder.path(r"watched\brought\deep\inside.txt")]);
+        serving.finds("top", &[folder.path(r"watched\brought\$top.txt")]);
+        serving.finds("$deep", &[folder.path(r"watched\brought\deep\$deep.txt")]);
         let renamed = folder.0.join(r"watched\taken");
         fs::rename(folder.0.join(r"watched\brought"), &renamed).expect("rename");
         serving.finds("inside", &[folder.path(r"watched\taken\deep\inside.txt")]);

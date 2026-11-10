@@ -4041,6 +4041,24 @@ mod tests {
     }
 
     #[test]
+    fn the_clock_is_now_and_as_far_ahead_of_utc_as_windows_local_time_is() {
+        use windows::Win32::Foundation::FILETIME;
+        use windows::Win32::Storage::FileSystem::FileTimeToLocalFileTime;
+        let clock = clock();
+        let utc = (clock.now + 11_644_473_600) * 10_000_000;
+        let as_filetime = |time: i64| FILETIME {
+            dwLowDateTime: time as u32,
+            dwHighDateTime: (time >> 32) as u32,
+        };
+        let mut local = FILETIME::default();
+        // SAFETY: both structs are ours.
+        unsafe { FileTimeToLocalFileTime(&as_filetime(utc), &mut local) }.expect("local time");
+        let local = i64::from(local.dwHighDateTime) << 32 | i64::from(local.dwLowDateTime);
+        assert_eq!(clock.offset, (local - utc) / 10_000_000);
+        assert!((clock.now - now().0 as i64).abs() <= 1);
+    }
+
+    #[test]
     fn a_picked_file_the_filters_leave_out_is_not_listed() {
         let picks = PicksFile::new("filtered");
         let path = picks.0.clone();
@@ -4052,6 +4070,11 @@ mod tests {
             drop(first);
             let (second, _) = Launcher::finding(&tree.0, Some(path));
             second.pump_until(|app| !app.catalog.picked.is_empty());
+            assert_eq!(
+                listed(),
+                Vec::<String>::new(),
+                "nothing typed, nothing listed"
+            );
             second.search_for("notes", 2);
             second.type_text(" ext:md");
             second.pump_until(|app| titles(app) == ["notes.md"]);
