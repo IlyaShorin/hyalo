@@ -154,6 +154,7 @@ mod tests {
             id: ItemId(title.to_string()),
             title: title.to_string(),
             subtitle: String::new(),
+            keywords: Vec::new(),
             kind: Kind::App,
             action: Action::Open(title.to_string()),
         }

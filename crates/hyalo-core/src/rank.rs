@@ -30,11 +30,11 @@ pub fn rank<'a>(
     let mut ranked: Vec<Ranked> = items
         .into_iter()
         .filter_map(|item| {
-            let found = pattern.find(&item.title)?;
+            let (found, points) = find(&pattern, item)?;
             let picks = frecency.score(&item.id, query, now);
             let place = item.path().map_or(0.0, |path| places.of_path(path));
             Some(Ranked {
-                score: score(found.points(), item.kind, place, picks),
+                score: score(points, item.kind, place, picks),
                 item: item.clone(),
                 found,
             })
@@ -42,6 +42,28 @@ pub fn rank<'a>(
         .collect();
     ranked.sort_by(|one, other| other.score.total_cmp(&one.score));
     ranked
+}
+
+/// Points a match on one of an item's other names loses: a tenth of a
+/// kind of match, so its title wins when both match as well.
+const OTHER_NAME: f64 = 2.0;
+
+/// How the query best matches `item`, by its title or one of its other
+/// names, and the points that is worth. A match on another name
+/// highlights nothing: the title is what is shown.
+fn find(pattern: &matcher::Pattern, item: &Item) -> Option<(Match, f64)> {
+    let title = pattern.find(&item.title).map(|found| {
+        let points = found.points();
+        (found, points)
+    });
+    let others = item.keywords.iter().filter_map(|keyword| {
+        let found = pattern.find(keyword)?;
+        let points = found.points() - OTHER_NAME;
+        let positions = Vec::new();
+        Some((Match { positions, ..found }, points))
+    });
+    let best = |one: &(Match, f64), other: &(Match, f64)| one.1.total_cmp(&other.1);
+    title.into_iter().chain(others).max_by(best)
 }
 
 /// Points per step up the kind ladder (file, folder, app, calculator): a
@@ -92,9 +114,68 @@ mod tests {
             id: ItemId(id.to_string()),
             title: title.to_string(),
             subtitle: String::new(),
+            keywords: Vec::new(),
             kind,
             action: Action::Open(id.to_string()),
         }
+    }
+
+    fn known_as(title: &str, keywords: &[&str]) -> Item {
+        Item {
+            keywords: keywords.iter().map(|keyword| keyword.to_string()).collect(),
+            ..item(title, title, Kind::App)
+        }
+    }
+
+    #[test]
+    fn an_item_is_found_by_its_other_names_with_nothing_to_highlight() {
+        let items = [
+            known_as("Дисплей", &["Display", "brightness"]),
+            file("Notes"),
+        ];
+        let ranked = rank(
+            "bright",
+            &items,
+            &Frecency::default(),
+            &Places::default(),
+            NOW,
+        );
+        assert_eq!(ranked.len(), 1);
+        assert_eq!(ranked[0].item.title, "Дисплей");
+        assert_eq!(ranked[0].found.strength, matcher::Strength::Prefix);
+        assert_eq!(ranked[0].found.positions, Vec::<usize>::new());
+    }
+
+    #[test]
+    fn the_best_of_its_names_counts_and_the_title_wins_a_tie() {
+        let items = [known_as("Sound", &["volume", "sounds"])];
+        let ranked = rank(
+            "sound",
+            &items,
+            &Frecency::default(),
+            &Places::default(),
+            NOW,
+        );
+        assert_eq!(ranked[0].found.strength, matcher::Strength::Exact);
+        assert_eq!(ranked[0].found.positions, [0, 1, 2, 3, 4], "the title's");
+        let items = [known_as("Volume mixer", &["volume"])];
+        let ranked = rank(
+            "volume",
+            &items,
+            &Frecency::default(),
+            &Places::default(),
+            NOW,
+        );
+        assert_eq!(ranked[0].found.strength, matcher::Strength::Exact);
+    }
+
+    #[test]
+    fn a_title_outranks_the_same_match_on_another_name() {
+        let items = [known_as("Mixer", &["sound"]), known_as("Sound", &[])];
+        assert_eq!(
+            order("sound", &items, &Frecency::default()),
+            ["Sound", "Mixer"]
+        );
     }
 
     fn file(title: &str) -> Item {

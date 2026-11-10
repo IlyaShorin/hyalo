@@ -1668,6 +1668,7 @@ mod tests {
             id: ItemId(title.to_string()),
             title: title.to_string(),
             subtitle: "App".to_string(),
+            keywords: Vec::new(),
             kind: Kind::App,
             action: Action::Open(format!("shell:AppsFolder\\{title}")),
         }

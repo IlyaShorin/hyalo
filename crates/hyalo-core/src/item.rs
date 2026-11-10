@@ -14,6 +14,10 @@ pub struct Item {
     pub title: String,
     /// The second line, such as a path. Empty when there is none.
     pub subtitle: String,
+    /// Other names the query finds the item by, never shown: a Windows
+    /// setting's name in the other language and words people search it
+    /// by.
+    pub keywords: Vec<String>,
     pub kind: Kind,
     /// What Enter does.
     pub action: Action,
@@ -66,6 +70,7 @@ impl Item {
             id: ItemId(path.clone()),
             title: name.to_string(),
             subtitle,
+            keywords: Vec::new(),
             kind: match folder {
                 true => Kind::Folder,
                 false => Kind::File,
