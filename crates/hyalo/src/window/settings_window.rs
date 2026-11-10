@@ -72,7 +72,10 @@ pub(super) fn open_settings() -> Result<()> {
         return Ok(());
     };
     let hwnd = create(placement_under_cursor()?)?;
-    let window = SettingsWindow::new(hwnd, panel)?;
+    // A window that cannot be drawn is not left behind, hidden.
+    // SAFETY: the window was made above, on this thread.
+    let window = SettingsWindow::new(hwnd, panel)
+        .inspect_err(|_| unsafe { DestroyWindow(hwnd) }.unwrap_or_default())?;
     with_app(|app| app.settings = Some(window));
     bring_forward(hwnd);
     Ok(())
@@ -918,6 +921,23 @@ mod tests {
                 LRESULT(0)
             );
             assert_eq!(setup.keyboard.held(), ["Alt+K"]);
+        });
+    }
+
+    #[test]
+    fn alt_f4_while_recording_closes_the_window_and_takes_no_hotkey() {
+        on_hidden_desktop(|| {
+            let setup = set_up("settings-window-alt-f4", DEFAULT, None);
+            let settings = setup.settings();
+            settings.click(Target::Hotkey);
+            let menu = windows::Win32::UI::Input::KeyboardAndMouse::VK_MENU;
+            hold(&[menu]);
+            let f4 = windows::Win32::UI::Input::KeyboardAndMouse::VK_F4;
+            settings.send(WM_SYSKEYDOWN, usize::from(f4.0), 0);
+            hold(&[]);
+            assert!(!settings.open());
+            assert_eq!(setup.keyboard.held(), ["Alt+Space"]);
+            assert_eq!(setup.file(), DEFAULT);
         });
     }
 

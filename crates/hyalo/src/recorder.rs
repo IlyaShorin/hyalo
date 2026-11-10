@@ -4,7 +4,7 @@
 
 use hyalo_core::hotkey::Hotkey;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    VK_CONTROL, VK_ESCAPE, VK_LCONTROL, VK_LMENU, VK_LSHIFT, VK_LWIN, VK_MENU, VK_RCONTROL,
+    VK_CONTROL, VK_ESCAPE, VK_F4, VK_LCONTROL, VK_LMENU, VK_LSHIFT, VK_LWIN, VK_MENU, VK_RCONTROL,
     VK_RMENU, VK_RSHIFT, VK_RWIN, VK_SHIFT,
 };
 
@@ -52,6 +52,9 @@ pub enum Heard {
     Nothing,
     /// Esc alone: the hotkey stays as it is.
     Cancelled,
+    /// Alt+F4 alone: the window closes, as Alt+F4 closes windows, rather
+    /// than Alt+F4 being taken from every window.
+    Close,
     /// A combination that may be a hotkey; the recorder stops.
     Hotkey(Hotkey),
     /// A combination that may not be one, and why; it listens on.
@@ -80,9 +83,9 @@ impl Recorder {
             *self = Recorder::Listening(mods);
             return Heard::Nothing;
         }
-        if key == VK_ESCAPE.0 && mods == Mods::default() {
+        if let Some(heard) = alone(key, mods) {
             self.stop();
-            return Heard::Cancelled;
+            return heard;
         }
         match Hotkey::from_keys(mods.bits(), key) {
             Ok(hotkey) => {
@@ -116,6 +119,20 @@ pub fn caps(hotkey: Hotkey) -> Vec<String> {
     hotkey.to_string().split('+').map(String::from).collect()
 }
 
+/// What the keys that keep their meaning while recording mean: Esc alone
+/// cancels, Alt+F4 alone closes.
+fn alone(key: u16, mods: Mods) -> Option<Heard> {
+    let alt = Mods {
+        alt: true,
+        ..Mods::default()
+    };
+    match (key, mods) {
+        (key, mods) if key == VK_ESCAPE.0 && mods == Mods::default() => Some(Heard::Cancelled),
+        (key, mods) if key == VK_F4.0 && mods == alt => Some(Heard::Close),
+        _ => None,
+    }
+}
+
 /// Whether `key` is a modifier: alone, it makes no hotkey.
 fn modifier(key: u16) -> bool {
     let modifiers = [
@@ -137,7 +154,7 @@ fn modifier(key: u16) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use windows::Win32::UI::Input::KeyboardAndMouse::{VK_F4, VK_K, VK_NUMPAD0, VK_SPACE};
+    use windows::Win32::UI::Input::KeyboardAndMouse::{VK_K, VK_NUMPAD0, VK_SPACE};
 
     const CTRL_SHIFT: Mods = Mods {
         ctrl: true,
@@ -231,6 +248,28 @@ mod tests {
         assert_eq!(
             recorder.key(VK_ESCAPE.0, ctrl),
             Heard::Hotkey(hotkey("Ctrl+Esc"))
+        );
+    }
+
+    #[test]
+    fn alt_f4_alone_closes_and_with_more_held_is_a_combination() {
+        let alt = Mods {
+            alt: true,
+            ..Mods::default()
+        };
+        let mut recorder = listening();
+        assert_eq!(recorder.key(VK_F4.0, alt), Heard::Close);
+        assert!(!recorder.listening());
+        let mut recorder = listening();
+        let shift_alt = Mods { shift: true, ..alt };
+        assert_eq!(
+            recorder.key(VK_F4.0, shift_alt),
+            Heard::Hotkey(hotkey("Alt+Shift+F4"))
+        );
+        let mut recorder = listening();
+        assert_eq!(
+            recorder.key(VK_F4.0, Mods::default()),
+            Heard::Hotkey(hotkey("F4"))
         );
     }
 

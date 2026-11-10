@@ -258,6 +258,7 @@ impl Panel {
         self.note = None;
         match heard {
             Heard::Nothing | Heard::Cancelled => None,
+            Heard::Close => Some(Effect::Close),
             Heard::Wrong(why) => {
                 self.note = Some((Spot::Hotkey, why));
                 None
@@ -816,6 +817,27 @@ mod tests {
         assert!(!panel.listening());
         assert_eq!(keys(&panel), (caps("Alt+Space"), false));
         assert_eq!(plain(&mut panel, VK_ESCAPE.0), Some(Effect::Close));
+    }
+
+    #[test]
+    fn alt_f4_while_listening_closes_the_window_rather_than_taking_alt_f4_everywhere() {
+        let mut panel = panel();
+        click(&mut panel, Target::Hotkey);
+        let alt = Mods {
+            alt: true,
+            ..Mods::default()
+        };
+        assert_eq!(press(&mut panel, VK_F4.0, alt), Some(Effect::Close));
+        assert!(!panel.listening());
+        click(&mut panel, Target::Hotkey);
+        let ctrl_alt = Mods { ctrl: true, ..alt };
+        let hotkey = Hotkey::parse("Ctrl+Alt+F4").expect("a hotkey");
+        let heard = press(&mut panel, VK_F4.0, ctrl_alt);
+        assert_eq!(
+            heard,
+            Some(Effect::Change(Change::Hotkey(hotkey))),
+            "with more held, a combination"
+        );
     }
 
     #[test]
