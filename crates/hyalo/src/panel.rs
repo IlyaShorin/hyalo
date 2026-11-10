@@ -10,9 +10,12 @@
 use std::collections::HashMap;
 
 use hyalo_core::config::{Change, List, Problem, Written};
-use windows::Win32::UI::Input::KeyboardAndMouse::{VK_ESCAPE, VK_RETURN, VK_SPACE, VK_TAB};
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    VIRTUAL_KEY, VK_ESCAPE, VK_RETURN, VK_SPACE, VK_TAB,
+};
 
-use crate::field::Field;
+use crate::field::{self, Edit, Edited, Field, Key};
+use crate::keys::Held;
 use crate::page::{self, Button, Card, Control, Laid, Page, Section, Strip, Target};
 use crate::recorder::{Heard, Mods, Recorder};
 
@@ -27,6 +30,11 @@ pub enum Effect {
     StartWithWindows(bool),
     /// Open config.toml in an editor.
     OpenConfig,
+    /// Put this text on the clipboard: what was copied or cut from a
+    /// field.
+    Copy(String),
+    /// Paste the clipboard's text into the field with the focus.
+    Paste,
     Close,
 }
 
@@ -206,7 +214,7 @@ impl Panel {
             }
             _ if key == VK_ESCAPE.0 => Some(Effect::Close),
             Some(Target::Name(list)) if key == VK_RETURN.0 => self.activate(Target::AddName(list)),
-            Some(Target::Name(_)) => None,
+            Some(Target::Name(_)) => self.edit(key, mods),
             Some(target) if key == VK_RETURN.0 || key == VK_SPACE.0 => self.activate(target),
             _ => None,
         }
@@ -220,11 +228,74 @@ impl Panel {
     /// Types one UTF-16 unit into the field with the focus; whether it
     /// changed what the field holds.
     pub fn char(&mut self, unit: u16) -> bool {
-        match self.focus {
-            Some(Target::Name(list)) if self.enabled(Target::Name(list)) => {
-                self.names.entry(list).or_default().type_unit(unit)
+        self.typing().is_some_and(|name| name.type_unit(unit))
+    }
+
+    /// Pastes `text` into the field with the focus; whether it changed
+    /// what the field holds.
+    pub fn paste(&mut self, text: &str) -> bool {
+        self.typing().is_some_and(|name| name.paste(text))
+    }
+
+    /// Puts the caret of the field with the focus before the character
+    /// `at`, or with `extend` selects up to there: a click or a drag in
+    /// it. Whether that changed it.
+    pub fn place(&mut self, at: usize, extend: bool) -> bool {
+        self.typing()
+            .is_some_and(|name| name.place(at, extend) != Edited::Nothing)
+    }
+
+    /// Selects the word at `at` in the field with the focus: a
+    /// double-click. Whether that changed it.
+    pub fn select_word(&mut self, at: usize) -> bool {
+        self.typing()
+            .is_some_and(|name| name.select_word(at) != Edited::Nothing)
+    }
+
+    /// Selects all of the field with the focus: a triple-click. Whether
+    /// that changed it.
+    pub fn select_all(&mut self) -> bool {
+        self.typing()
+            .is_some_and(|name| name.apply(Edit::SelectAll) != Edited::Nothing)
+    }
+
+    /// The list whose name field the button went down in, while it is
+    /// down: moving the pointer selects in it.
+    pub fn dragging(&self) -> Option<List> {
+        match self.pressed {
+            Some(Target::Name(list)) => Some(list),
+            _ => None,
+        }
+    }
+
+    /// The name field with the focus, when it may be typed in.
+    fn typing(&mut self) -> Option<&mut Field> {
+        let Some(Target::Name(list)) = self.focus else {
+            return None;
+        };
+        self.enabled(Target::Name(list))
+            .then(|| self.names.entry(list).or_default())
+    }
+
+    /// A key in the name field with the focus: it edits the field, or
+    /// copies or cuts from it, or pastes into it.
+    fn edit(&mut self, key: u16, mods: Mods) -> Option<Effect> {
+        let held = Held {
+            ctrl: mods.ctrl,
+            shift: mods.shift,
+        };
+        let pressed = field::key(VIRTUAL_KEY(key), held)?;
+        let name = self.typing()?;
+        match pressed {
+            Key::Edit(edit) => {
+                name.apply(edit);
+                None
             }
-            _ => false,
+            Key::Copy => Some(name.selected().to_string())
+                .filter(|selected| !selected.is_empty())
+                .map(Effect::Copy),
+            Key::Cut => name.cut().map(Effect::Copy),
+            Key::Paste => Some(Effect::Paste),
         }
     }
 
@@ -485,13 +556,13 @@ impl Panel {
             remove: Target::Remove(list, at),
         }));
         if list != List::Exclude {
+            let empty = Field::default();
+            let name = self.names.get(&list).unwrap_or(&empty);
             strips.push(Strip::Field {
                 target: Target::Name(list),
-                text: self
-                    .names
-                    .get(&list)
-                    .map(|name| name.text().to_string())
-                    .unwrap_or_default(),
+                text: name.text().to_string(),
+                caret: name.caret_utf16(),
+                selection: name.selection_utf16(),
                 placeholder: format!("A folder name, such as {example}"),
                 add: button("Add", Target::AddName(list)),
             });
@@ -550,7 +621,10 @@ mod tests {
     use super::*;
     use hyalo_core::config::{self, DEFAULT};
     use hyalo_core::hotkey::Hotkey;
-    use windows::Win32::UI::Input::KeyboardAndMouse::{VK_A, VK_F4, VK_K, VK_SPACE};
+    use std::ops::Range;
+    use windows::Win32::UI::Input::KeyboardAndMouse::{
+        VK_A, VK_C, VK_DELETE, VK_END, VK_F4, VK_HOME, VK_K, VK_LEFT, VK_SPACE, VK_V, VK_X,
+    };
 
     use crate::page::{Area, What, lay_out};
 
@@ -1197,5 +1271,123 @@ mod tests {
         assert_eq!(panel.scroll(), area.bottom() + 12.0 - 300.0);
         panel.key(VK_TAB.0, Mods::default(), &laid, 300.0);
         assert_eq!(panel.scroll(), 0.0, "round to the first");
+    }
+
+    const CTRL: Mods = Mods {
+        ctrl: true,
+        alt: false,
+        shift: false,
+        win: false,
+    };
+
+    /// The name field of `list` as the page shows it: its text, the caret
+    /// and the selection in UTF-16 units.
+    fn field(panel: &Panel, list: List) -> (String, u32, Range<u32>) {
+        let marks = laid(panel).marks.into_iter();
+        let mut fields = marks.filter_map(|mark| match mark.what {
+            What::Field {
+                text,
+                target,
+                caret,
+                selection,
+                ..
+            } if target == Target::Name(list) => Some((text, caret, selection)),
+            _ => None,
+        });
+        fields.next().expect("the field")
+    }
+
+    #[test]
+    fn the_keys_edit_the_field_with_the_focus_as_they_do_the_search_bar() {
+        let mut panel = panel();
+        let lower = List::RankLower;
+        click(&mut panel, Target::Name(lower));
+        type_text(&mut panel, "vendor");
+        assert_eq!(field(&panel, lower), ("vendor".to_string(), 6, 6..6));
+        plain(&mut panel, VK_LEFT.0);
+        plain(&mut panel, VK_LEFT.0);
+        type_text(&mut panel, "X");
+        assert_eq!(field(&panel, lower), ("vendXor".to_string(), 5, 5..5));
+        plain(&mut panel, VK_HOME.0);
+        press(&mut panel, VK_END.0, SHIFT);
+        assert_eq!(field(&panel, lower), ("vendXor".to_string(), 7, 0..7));
+        type_text(&mut panel, "lib");
+        plain(&mut panel, VK_HOME.0);
+        plain(&mut panel, VK_DELETE.0);
+        assert_eq!(field(&panel, lower), ("ib".to_string(), 0, 0..0));
+        assert_eq!(field(&panel, List::RankHigher).0, "", "the other field");
+    }
+
+    #[test]
+    fn editing_keys_do_nothing_without_a_field_to_edit() {
+        let mut panel = panel();
+        click(&mut panel, Target::Name(List::RankLower));
+        type_text(&mut panel, "vendor");
+        click(&mut panel, Target::Pick(List::RankLower));
+        for key in [VK_LEFT, VK_HOME, VK_DELETE] {
+            assert_eq!(plain(&mut panel, key.0), None);
+        }
+        assert_eq!(press(&mut panel, VK_A.0, CTRL), None);
+        assert_eq!(
+            field(&panel, List::RankLower),
+            ("vendor".to_string(), 6, 6..6)
+        );
+    }
+
+    #[test]
+    fn copy_and_cut_hand_the_selection_over_and_paste_asks_for_the_clipboard() {
+        let mut panel = panel();
+        let higher = List::RankHigher;
+        click(&mut panel, Target::Name(higher));
+        type_text(&mut panel, "notes");
+        assert_eq!(press(&mut panel, VK_C.0, CTRL), None, "nothing selected");
+        assert_eq!(press(&mut panel, VK_X.0, CTRL), None, "nothing selected");
+        press(&mut panel, VK_LEFT.0, CTRL_SHIFT);
+        let copied = Some(Effect::Copy("notes".to_string()));
+        assert_eq!(press(&mut panel, VK_C.0, CTRL), copied);
+        assert_eq!(field(&panel, higher).0, "notes");
+        assert_eq!(press(&mut panel, VK_X.0, CTRL), copied);
+        assert_eq!(field(&panel, higher).0, "");
+        assert_eq!(press(&mut panel, VK_V.0, CTRL), Some(Effect::Paste));
+        assert!(panel.paste(
+            "my
+notes
+"
+        ));
+        assert_eq!(field(&panel, higher), ("my notes".to_string(), 8, 8..8));
+        click(&mut panel, Target::Pick(higher));
+        assert!(!panel.paste("more"), "no field has the focus");
+    }
+
+    #[test]
+    fn the_mouse_places_the_caret_selects_a_word_or_everything() {
+        let mut panel = panel();
+        let lower = List::RankLower;
+        assert!(!panel.place(1, false), "no field has the focus");
+        click(&mut panel, Target::Name(lower));
+        type_text(&mut panel, "my vendor");
+        assert!(panel.place(1, false));
+        assert_eq!(field(&panel, lower).2, 1..1);
+        assert!(panel.place(5, true));
+        assert_eq!(field(&panel, lower).2, 1..5);
+        assert!(!panel.place(5, true), "already there");
+        assert!(panel.select_word(4));
+        assert_eq!(field(&panel, lower).2, 3..9);
+        assert!(panel.select_all());
+        assert_eq!(field(&panel, lower).2, 0..9);
+        assert_eq!(panel.dragging(), None, "the button came up");
+        panel.press(Some(Target::Name(lower)));
+        assert_eq!(panel.dragging(), Some(lower));
+        panel.release(Some(Target::Name(lower)));
+        assert_eq!(panel.dragging(), None);
+    }
+
+    #[test]
+    fn the_field_shows_its_text_only_from_the_name_typed() {
+        let mut panel = panel();
+        click(&mut panel, Target::Name(List::RankLower));
+        assert_eq!(field(&panel, List::RankLower), (String::new(), 0, 0..0));
+        type_text(&mut panel, "a🔍");
+        assert_eq!(field(&panel, List::RankLower), ("a🔍".to_string(), 3, 3..3));
     }
 }

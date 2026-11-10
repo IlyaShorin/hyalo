@@ -8,24 +8,47 @@
 //! them rely on: each interface is a live COM object owned by `Painter`,
 //! used only from the UI thread that created it.
 
+use std::ops::Range;
+
 use windows::Win32::Foundation::HWND;
 use windows::Win32::Graphics::Direct2D::Common::{D2D_RECT_F, D2D1_COLOR_F};
-use windows::Win32::Graphics::Direct2D::{D2D1_ELLIPSE, D2D1_ROUNDED_RECT};
+use windows::Win32::Graphics::Direct2D::{
+    D2D1_ANTIALIAS_MODE_ALIASED, D2D1_ELLIPSE, D2D1_ROUNDED_RECT,
+};
 use windows::Win32::Graphics::DirectWrite::{
     DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_TEXT_ALIGNMENT_CENTER,
-    DWRITE_TEXT_METRICS, IDWriteFactory, IDWriteTextFormat,
+    DWRITE_TEXT_METRICS, IDWriteFactory, IDWriteTextFormat, IDWriteTextLayout,
 };
 use windows::core::Result;
 use windows_numerics::{Matrix3x2, Vector2};
 
-use crate::page::{Area, CAP_GAP, CAP_PAD, KEYS_PAD, Laid, Mark, TITLE_SIZE, Target, What};
+use crate::field;
+use crate::page::{
+    Area, CAP_GAP, CAP_PAD, FIELD_INSET, KEYS_PAD, Laid, Mark, TITLE_SIZE, Target, What,
+    field_inside,
+};
 use crate::panel::Look;
-use crate::surface::{DISPLAY_FONT, Surface, TEXT_FONT, rgba, text_format, trimmed};
+use crate::surface::{
+    DISPLAY_FONT, SELECTED_TEXT, Surface, TEXT_FONT, caret_x, hit, line_width, rgba, text_format,
+    trimmed,
+};
 
 const TEXT: D2D1_COLOR_F = rgba(1.0, 1.0, 1.0, 0.92);
 const DIM: D2D1_COLOR_F = rgba(1.0, 1.0, 1.0, 0.6);
 const FAINT: D2D1_COLOR_F = rgba(1.0, 1.0, 1.0, 0.36);
 const WARNING: D2D1_COLOR_F = rgba(1.0, 0.64, 0.58, 1.0);
+/// How far the one-line `layout` is scrolled left in `inside` so the
+/// caret before the UTF-16 unit `caret` shows: no further than that.
+fn scrolled(layout: &IDWriteTextLayout, caret: u32, inside: Area) -> Result<f32> {
+    let x = caret_x(layout, caret)?;
+    Ok(field::scrolled(
+        0.0,
+        x,
+        line_width(layout)?,
+        inside.width - 2.0,
+    ))
+}
+
 /// The launcher's blue: its caret and matched letters.
 const ACCENT: D2D1_COLOR_F = rgba(0.45, 0.68, 1.0, 1.0);
 const ACCENT_HOVER: D2D1_COLOR_F = rgba(0.55, 0.76, 1.0, 1.0);
@@ -54,8 +77,6 @@ const HELP_SIZE: f32 = 12.0;
 const LABEL_SIZE: f32 = 14.0;
 /// A key cap's height in the recorder.
 const CAP_HEIGHT: f32 = 22.0;
-/// Where a field's text starts, from its left edge.
-const FIELD_INSET: f32 = 10.0;
 /// What the recorder shows while it listens and nothing is held yet.
 const LISTENING: &str = "Press keys";
 
@@ -72,6 +93,9 @@ struct Fonts {
     help: IDWriteTextFormat,
     /// Entries and what is typed: one line, cut short with an ellipsis.
     plain: IDWriteTextFormat,
+    /// What is typed in the field with the focus: one line, whole, for
+    /// the caret to move through.
+    typed: IDWriteTextFormat,
     /// Labels on buttons and key caps, centred.
     label: IDWriteTextFormat,
 }
@@ -82,17 +106,23 @@ impl Fonts {
         let cut = |size: f32| -> Result<IDWriteTextFormat> {
             trimmed(dwrite, text_format(dwrite, TEXT_FONT, size, normal)?)
         };
-        let label = text_format(dwrite, TEXT_FONT, LABEL_SIZE, normal)?;
-        unsafe { label.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER)? };
         Ok(Self {
             title: text_format(dwrite, DISPLAY_FONT, TITLE_SIZE, semi_bold)?,
             header: text_format(dwrite, TEXT_FONT, HEADER_SIZE, semi_bold)?,
             name: cut(NAME_SIZE)?,
             help: cut(HELP_SIZE)?,
             plain: cut(LABEL_SIZE)?,
-            label,
+            typed: text_format(dwrite, TEXT_FONT, LABEL_SIZE, normal)?,
+            label: centred(dwrite)?,
         })
     }
+}
+
+/// Labels on buttons and key caps: centred on them.
+fn centred(dwrite: &IDWriteFactory) -> Result<IDWriteTextFormat> {
+    let label = text_format(dwrite, TEXT_FONT, LABEL_SIZE, DWRITE_FONT_WEIGHT_NORMAL)?;
+    unsafe { label.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER)? };
+    Ok(label)
 }
 
 impl Painter {
@@ -200,8 +230,12 @@ impl Painter {
             } => self.draw_keys(caps, *listening, at, look),
             What::Remove(_) => self.draw_remove(at, look),
             What::Field {
-                text, placeholder, ..
-            } => self.draw_field(text, placeholder, at, look),
+                text,
+                caret,
+                selection,
+                placeholder,
+                ..
+            } => self.draw_field(text, placeholder, (*caret, selection), at, look),
             _ => Ok(()),
         }
     }
@@ -363,8 +397,16 @@ impl Painter {
     }
 
     /// A text field: what is typed, or the placeholder; with the focus,
-    /// a blue line under it and the caret after the text.
-    fn draw_field(&self, typed: &str, placeholder: &str, at: Area, look: Look) -> Result<()> {
+    /// a blue line under it, what is selected and the caret, the text
+    /// scrolled so the caret shows.
+    fn draw_field(
+        &self,
+        typed: &str,
+        placeholder: &str,
+        (caret, selection): (u32, &Range<u32>),
+        at: Area,
+        look: Look,
+    ) -> Result<()> {
         let typing = look.focused;
         self.round(
             at,
@@ -373,20 +415,80 @@ impl Painter {
             Some(CONTROL_EDGE),
         )?;
         self.draw_underline(at, typing)?;
-        let inside = Area {
-            x: at.x + FIELD_INSET,
-            width: (at.width - 2.0 * FIELD_INSET).max(0.0),
-            ..at
-        };
+        let inside = field_inside(at);
+        match typing && !typed.is_empty() {
+            true => self.draw_typing(typed, (caret, selection), inside)?,
+            false => self.draw_words(typed, placeholder, inside, typing)?,
+        }
+        self.ring(at, CONTROL_RADIUS, look)
+    }
+
+    /// What a field holds, cut short, or its placeholder; with the focus
+    /// (the field is empty then), the caret at its start.
+    fn draw_words(&self, typed: &str, placeholder: &str, inside: Area, typing: bool) -> Result<()> {
         let (words, color) = match typed.is_empty() {
             true => (placeholder, DIM),
             false => (typed, TEXT),
         };
         self.write(words, &self.fonts.plain, inside, color)?;
-        if typing {
-            self.draw_caret(typed, inside)?;
+        match typing {
+            true => self.draw_caret(inside.x + 1.0, inside),
+            false => Ok(()),
         }
-        self.ring(at, CONTROL_RADIUS, look)
+    }
+
+    /// What is typed in the field with the focus, inside `inside`: the
+    /// selection behind it and the caret, scrolled so the caret shows.
+    fn draw_typing(
+        &self,
+        typed: &str,
+        (caret, selection): (u32, &Range<u32>),
+        inside: Area,
+    ) -> Result<()> {
+        let layout = self.typed(typed, inside)?;
+        let left = inside.x - scrolled(&layout, caret, inside)?;
+        let dc = &self.surface.dc;
+        unsafe { dc.PushAxisAlignedClip(&rect(inside), D2D1_ANTIALIAS_MODE_ALIASED) };
+        let drawn = self
+            .draw_selection(&layout, selection, left, inside)
+            .and_then(|()| self.surface.draw_text(&layout, left, inside.y, TEXT))
+            .and_then(|()| self.draw_caret(left + caret_x(&layout, caret)? + 1.0, inside));
+        unsafe { dc.PopAxisAlignedClip() };
+        drawn
+    }
+
+    /// The band behind the letters selected, `left` the line's start.
+    fn draw_selection(
+        &self,
+        layout: &IDWriteTextLayout,
+        selection: &Range<u32>,
+        left: f32,
+        inside: Area,
+    ) -> Result<()> {
+        let start = left + caret_x(layout, selection.start)?;
+        let band = Area {
+            x: start,
+            y: inside.y + 6.0,
+            width: left + caret_x(layout, selection.end)? - start,
+            height: (inside.height - 12.0).max(0.0),
+        };
+        self.fill(band, SELECTED_TEXT)
+    }
+
+    /// Where a click `x` DIPs from the page's left, in the field at `at`
+    /// that holds `typed` with the caret at `caret`, puts the caret: a
+    /// UTF-16 position, as the field is drawn scrolled.
+    pub fn field_hit(&self, typed: &str, caret: u32, at: Area, x: f32) -> Result<u32> {
+        let inside = field_inside(at);
+        let layout = self.typed(typed, inside)?;
+        let scroll = scrolled(&layout, caret, inside)?;
+        hit(&layout, x - inside.x + scroll, inside.height / 2.0)
+    }
+
+    /// `typed` laid out whole on one line as high as `inside`.
+    fn typed(&self, typed: &str, inside: Area) -> Result<IDWriteTextLayout> {
+        self.surface
+            .layout(typed, &self.fonts.typed, 0.0, inside.height)
     }
 
     /// The line under a field: blue and thicker while it takes keys.
@@ -404,9 +506,8 @@ impl Painter {
         self.fill(under, line)
     }
 
-    /// The caret after `typed`, in the field's inside `inside`.
-    fn draw_caret(&self, typed: &str, inside: Area) -> Result<()> {
-        let x = (inside.x + self.measure(typed) + 1.0).min(inside.x + inside.width);
+    /// The caret at `x`, in the field's inside `inside`.
+    fn draw_caret(&self, x: f32, inside: Area) -> Result<()> {
         let caret = Area {
             x,
             y: inside.y + 8.0,
@@ -645,6 +746,32 @@ mod tests {
             panel.wheel(-1200, 2000.0, 400.0);
             let frame = painted(&mut panel, (800, 500), 120);
             assert_looks_like("settings-typing-125", &frame);
+        });
+    }
+
+    #[test]
+    fn a_selection_in_a_field_and_a_long_name_scrolled_to_its_caret() {
+        on_hidden_desktop(|| {
+            let mut panel = Panel::new(Ok(written(DEFAULT)), None);
+            panel.press(Some(Target::Name(List::RankLower)));
+            panel.release(Some(Target::Name(List::RankLower)));
+            let long = r"D:\Projects\a folder whose name is far too long for the field it is typed in, and longer";
+            for unit in long.encode_utf16() {
+                panel.char(unit);
+            }
+            panel.press(Some(Target::Name(List::RankHigher)));
+            panel.release(Some(Target::Name(List::RankHigher)));
+            for unit in "my notes here".encode_utf16() {
+                panel.char(unit);
+            }
+            panel.select_word(5);
+            panel.wheel(-1200, 2000.0, 400.0);
+            let frame = painted(&mut panel, (640, 400), 96);
+            assert_looks_like("settings-field-selected-100", &frame);
+            panel.press(Some(Target::Name(List::RankLower)));
+            panel.release(Some(Target::Name(List::RankLower)));
+            let frame = painted(&mut panel, (640, 400), 96);
+            assert_looks_like("settings-field-scrolled-100", &frame);
         });
     }
 

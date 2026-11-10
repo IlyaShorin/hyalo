@@ -4,6 +4,8 @@
 //! piece in DIPs, and from that the window draws them, finds what is under
 //! the pointer and moves the focus.
 
+use std::ops::Range;
+
 use hyalo_core::config::List;
 
 /// What a control does when used.
@@ -64,10 +66,13 @@ pub enum Strip {
     },
     /// An entry of a list, with a × that removes it.
     Entry { text: String, remove: Target },
-    /// A field to type in, and a button that adds what it holds.
+    /// A field to type in, with its caret and selection in UTF-16 units,
+    /// and a button that adds what it holds.
     Field {
         target: Target,
         text: String,
+        caret: u32,
+        selection: Range<u32>,
         placeholder: String,
         add: Button,
     },
@@ -162,6 +167,8 @@ pub enum What {
     Remove(Target),
     Field {
         text: String,
+        caret: u32,
+        selection: Range<u32>,
         placeholder: String,
         target: Target,
     },
@@ -212,6 +219,18 @@ impl Laid {
             .iter()
             .find(|mark| mark.what.target() == Some(target));
         mark.map(|mark| mark.at)
+    }
+}
+
+/// Where a field's text starts, from its left edge.
+pub const FIELD_INSET: f32 = 10.0;
+
+/// The inside of a field at `at`: where its text goes.
+pub fn field_inside(at: Area) -> Area {
+    Area {
+        x: at.x + FIELD_INSET,
+        width: (at.width - 2.0 * FIELD_INSET).max(0.0),
+        ..at
     }
 }
 
@@ -355,9 +374,20 @@ impl Out<'_> {
             Strip::Field {
                 target,
                 text,
+                caret,
+                selection,
                 placeholder,
                 add,
-            } => self.field(*target, text, placeholder, add),
+            } => {
+                let field = What::Field {
+                    text: text.clone(),
+                    caret: *caret,
+                    selection: selection.clone(),
+                    placeholder: placeholder.clone(),
+                    target: *target,
+                };
+                self.field(field, add)
+            }
             Strip::Text { text } => self.text(text),
         }
     }
@@ -415,25 +445,18 @@ impl Out<'_> {
         self.y += ENTRY;
     }
 
-    fn field(&mut self, target: Target, text: &str, placeholder: &str, add: &Button) {
+    fn field(&mut self, field: What, add: &Button) {
         let right = self.left + self.width - PAD;
         let width = self.button_width(&add.label);
         let button = self.at(right - width, FIELD, width, CONTROL_HEIGHT);
         let left = self.left + PAD;
-        let field = self.at(
+        let at = self.at(
             left,
             FIELD,
             (button.x - 8.0 - left).max(0.0),
             CONTROL_HEIGHT,
         );
-        self.mark(
-            field,
-            What::Field {
-                text: text.to_string(),
-                placeholder: placeholder.to_string(),
-                target,
-            },
-        );
+        self.mark(at, field);
         self.mark(button, button_mark(add));
         self.y += FIELD;
     }
@@ -580,6 +603,8 @@ mod tests {
         let field = Strip::Field {
             target: Target::Name(List::RankLower),
             text: String::new(),
+            caret: 0,
+            selection: 0..0,
             placeholder: "Folder name".to_string(),
             add: button("Add", Target::AddName(List::RankLower)),
         };

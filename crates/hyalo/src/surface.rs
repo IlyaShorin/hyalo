@@ -32,9 +32,10 @@ use windows::Win32::Graphics::DirectComposition::{
 };
 use windows::Win32::Graphics::DirectWrite::{
     DWRITE_FACTORY_TYPE_SHARED, DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL,
-    DWRITE_FONT_WEIGHT, DWRITE_PARAGRAPH_ALIGNMENT_CENTER, DWRITE_TRIMMING,
-    DWRITE_TRIMMING_GRANULARITY_CHARACTER, DWRITE_WORD_WRAPPING_NO_WRAP, DWriteCreateFactory,
-    IDWriteFactory, IDWriteTextFormat, IDWriteTextLayout,
+    DWRITE_FONT_WEIGHT, DWRITE_HIT_TEST_METRICS, DWRITE_PARAGRAPH_ALIGNMENT_CENTER,
+    DWRITE_TEXT_METRICS, DWRITE_TRIMMING, DWRITE_TRIMMING_GRANULARITY_CHARACTER,
+    DWRITE_WORD_WRAPPING_NO_WRAP, DWriteCreateFactory, IDWriteFactory, IDWriteTextFormat,
+    IDWriteTextLayout,
 };
 use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_ALPHA_MODE_PREMULTIPLIED, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_UNKNOWN,
@@ -45,7 +46,7 @@ use windows::Win32::Graphics::Dxgi::{
     DXGI_SWAP_CHAIN_DESC1, DXGI_SWAP_CHAIN_FLAG, DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL,
     DXGI_USAGE_RENDER_TARGET_OUTPUT, IDXGIDevice, IDXGIFactory2, IDXGISurface, IDXGISwapChain1,
 };
-use windows::core::{Interface, PCWSTR, Result, w};
+use windows::core::{BOOL, Interface, PCWSTR, Result, w};
 use windows_numerics::Vector2;
 
 use crate::layout::scale;
@@ -245,6 +246,39 @@ impl Surface {
                 .cast()
         }
     }
+}
+
+/// Behind the letters selected in a field: the launcher's blue,
+/// see-through.
+pub const SELECTED_TEXT: D2D1_COLOR_F = rgba(0.30, 0.52, 1.0, 0.45);
+
+/// How far from the start of the one-line `layout` the caret before the
+/// UTF-16 unit `at` goes, in DIPs.
+pub fn caret_x(layout: &IDWriteTextLayout, at: u32) -> Result<f32> {
+    let (mut x, mut y) = (0.0, 0.0);
+    let mut metrics = DWRITE_HIT_TEST_METRICS::default();
+    unsafe { layout.HitTestTextPosition(at, false, &mut x, &mut y, &mut metrics)? };
+    Ok(x)
+}
+
+/// How wide the one-line `layout` is, spaces at its end included.
+pub fn line_width(layout: &IDWriteTextLayout) -> Result<f32> {
+    let mut metrics = DWRITE_TEXT_METRICS::default();
+    unsafe { layout.GetMetrics(&mut metrics)? };
+    Ok(metrics.widthIncludingTrailingWhitespace)
+}
+
+/// Where a click (x, y) DIPs from the start of `layout` puts the caret: a
+/// UTF-16 position. Past the middle of a letter is after it.
+pub fn hit(layout: &IDWriteTextLayout, x: f32, y: f32) -> Result<u32> {
+    let (mut trailing, mut inside) = (BOOL::default(), BOOL::default());
+    let mut hit = DWRITE_HIT_TEST_METRICS::default();
+    unsafe { layout.HitTestPoint(x, y, &mut trailing, &mut inside, &mut hit)? };
+    let after = match trailing.as_bool() {
+        true => hit.length,
+        false => 0,
+    };
+    Ok(hit.textPosition + after)
 }
 
 /// One line of text in `family` at `size` and `weight`, centred in the

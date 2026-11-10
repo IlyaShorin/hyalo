@@ -12,8 +12,10 @@
 
 use std::path::Path;
 use std::rc::Rc;
+use std::time::Instant;
 
 use hyalo_core::config::{self, Change, List, Problem, Refusal};
+use hyalo_core::item::Action;
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Dwm::{
     DWMSBT_MAINWINDOW, DWMWA_SYSTEMBACKDROP_TYPE, DWMWA_USE_IMMERSIVE_DARK_MODE,
@@ -27,22 +29,27 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     VK_MENU, VK_RWIN, VK_SHIFT,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, GetClientRect, IDC_ARROW, IsIconic,
+    CS_DBLCLKS, CreateWindowExW, DefWindowProcW, DestroyWindow, GetClientRect, IDC_ARROW, IsIconic,
     LoadCursorW, MINMAXINFO, RegisterClassExW, SM_CXICON, SM_CXSMICON, SW_RESTORE, SW_SHOW,
     SWP_NOACTIVATE, SWP_NOZORDER, SetForegroundWindow, SetWindowPos, ShowWindow, WA_INACTIVE,
     WM_ACTIVATE, WM_CHAR, WM_DESTROY, WM_DPICHANGED, WM_GETMINMAXINFO, WM_KEYDOWN, WM_KEYUP,
-    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_SIZE, WM_SYSCHAR, WM_SYSKEYDOWN,
-    WM_SYSKEYUP, WNDCLASSEXW, WS_EX_NOREDIRECTIONBITMAP, WS_OVERLAPPEDWINDOW,
+    WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_SIZE,
+    WM_SYSCHAR, WM_SYSKEYDOWN, WM_SYSKEYUP, WNDCLASSEXW, WS_EX_NOREDIRECTIONBITMAP,
+    WS_OVERLAPPEDWINDOW,
 };
 use windows::core::{BOOL, PCWSTR, Result, w};
 
-use super::{App, Placement, client_point, down, placement_under_cursor, set_attribute, with_app};
+use super::{
+    App, MOUSE_SHIFT, Placement, client_point, double_click_room, double_click_time, down,
+    placement_under_cursor, set_attribute, with_app,
+};
+use crate::field;
 use crate::layout;
-use crate::page::{self, Laid};
+use crate::page::{self, Laid, Target, What};
 use crate::paint::Painter;
 use crate::panel::{Effect, Panel};
 use crate::recorder::Mods;
-use crate::{settings, tray};
+use crate::{clipboard, settings, tray};
 
 const CLASS: PCWSTR = w!("hyalo.settings");
 
@@ -60,6 +67,9 @@ pub(super) struct SettingsWindow {
     /// Whether the recorder took the last key pressed with Alt: the
     /// character it makes is the recorder's too.
     recorded: bool,
+    /// When and where the last double-click in a field was, until a
+    /// third click uses it.
+    double: Option<(Instant, (i32, i32))>,
 }
 
 /// Opens the settings window, or brings the one open forward. Called
@@ -109,6 +119,8 @@ fn register_class(instance: HINSTANCE) -> Result<()> {
         let small = tray::icon(GetSystemMetricsForDpi(SM_CXSMICON, dpi)).unwrap_or_default();
         let class = WNDCLASSEXW {
             cbSize: size_of::<WNDCLASSEXW>() as u32,
+            // Double-clicks select words in the name fields.
+            style: CS_DBLCLKS,
             lpfnWndProc: Some(wndproc),
             hInstance: instance,
             hIcon: big,
@@ -145,7 +157,11 @@ fn create(placement: Placement) -> Result<HWND> {
             None,
         )?
     };
-    style(hwnd)?;
+    // Where DWM refuses the backdrop (a window station of its own), the
+    // window still opens, on a plain background.
+    if let Err(error) = style(hwnd) {
+        eprintln!("hyalo: the settings window goes without its backdrop: {error}");
+    }
     Ok(hwnd)
 }
 
@@ -197,6 +213,7 @@ impl SettingsWindow {
             laid: Laid::default(),
             tracking: false,
             recorded: false,
+            double: None,
         };
         window.redraw()?;
         Ok(window)
@@ -231,11 +248,79 @@ impl SettingsWindow {
     }
 
     /// The control under the point a mouse message carries.
-    fn hit(&self, lparam: LPARAM) -> Option<page::Target> {
+    fn hit(&self, lparam: LPARAM) -> Option<Target> {
+        let (x, y) = self.on_page(lparam);
+        self.laid.hit(x, y)
+    }
+
+    /// The point a mouse message carries, in DIPs from the page's top.
+    fn on_page(&self, lparam: LPARAM) -> (f32, f32) {
         let point = client_point(lparam);
         let scale = layout::scale(self.dpi);
         let (x, y) = (point.x as f32 / scale, point.y as f32 / scale);
-        self.laid.hit(x, y + self.panel.scroll())
+        (x, y + self.panel.scroll())
+    }
+
+    /// The button went down at `lparam`, with Shift held when `shift`: the
+    /// control there takes the focus; in a name field the caret goes
+    /// where it was clicked, or Shift selects up to there, or a click
+    /// after a double-click selects everything.
+    fn press(&mut self, lparam: LPARAM, shift: bool) {
+        let target = self.hit(lparam);
+        self.panel.press(target);
+        let Some(Target::Name(list)) = target else {
+            return;
+        };
+        let point = client_point(lparam);
+        let double = self.double.take();
+        let (soon, room) = (double_click_time(), double_click_room());
+        if field::third_click(double, Instant::now(), (point.x, point.y), soon, room) {
+            self.panel.select_all();
+        } else if let Some(at) = self.char_at(list, lparam) {
+            self.panel.place(at, shift);
+        }
+    }
+
+    /// A double-click at `lparam`: in a name field it selects the word
+    /// there; elsewhere it is a press like any other.
+    fn double_click(&mut self, lparam: LPARAM, shift: bool) {
+        let target = self.hit(lparam);
+        let Some(Target::Name(list)) = target else {
+            return self.press(lparam, shift);
+        };
+        self.panel.press(target);
+        let point = client_point(lparam);
+        self.double = Some((Instant::now(), (point.x, point.y)));
+        if let Some(at) = self.char_at(list, lparam) {
+            self.panel.select_word(at);
+        }
+    }
+
+    /// With the button down in a name field, the selection follows the
+    /// pointer to `lparam`; whether it moved.
+    fn drag(&mut self, lparam: LPARAM) -> bool {
+        let Some(list) = self.panel.dragging() else {
+            return false;
+        };
+        let at = self.char_at(list, lparam);
+        at.is_some_and(|at| self.panel.place(at, true))
+    }
+
+    /// The character a click at `lparam` puts the caret before in the
+    /// name field of `list`, as it was last drawn.
+    fn char_at(&self, list: List, lparam: LPARAM) -> Option<usize> {
+        let target = Some(Target::Name(list));
+        let mark = self
+            .laid
+            .marks
+            .iter()
+            .find(|mark| mark.what.target() == target)?;
+        let What::Field { text, caret, .. } = &mark.what else {
+            return None;
+        };
+        let (x, _) = self.on_page(lparam);
+        let unit = self.painter.field_hit(text, *caret, mark.at, x).ok()?;
+        Some(field::char_index(text, unit))
     }
 
     /// Asks Windows to say when the pointer leaves, once per visit.
@@ -290,16 +375,21 @@ impl SettingsWindow {
             WM_MOUSEMOVE => {
                 self.track();
                 let target = self.hit(lparam);
-                changed(self.panel.hover(target))
+                let hovered = self.panel.hover(target);
+                changed(self.drag(lparam) | hovered)
             }
             WM_MOUSELEAVE => {
                 self.tracking = false;
                 changed(self.panel.hover(None))
             }
-            WM_LBUTTONDOWN => {
+            WM_LBUTTONDOWN | WM_LBUTTONDBLCLK => {
                 // SAFETY: a plain call on a window of this thread.
                 unsafe { SetCapture(self.hwnd) };
-                self.panel.press(self.hit(lparam));
+                let shift = wparam.0 & MOUSE_SHIFT != 0;
+                match message {
+                    WM_LBUTTONDOWN => self.press(lparam, shift),
+                    _ => self.double_click(lparam, shift),
+                }
                 Outcome::Changed(None)
             }
             WM_LBUTTONUP => {
@@ -507,14 +597,7 @@ fn carry_out(hwnd: HWND, effect: Effect) {
             let _ = unsafe { DestroyWindow(hwnd) };
             return;
         }
-        Effect::Pick(list) => {
-            let Some(picker) = with_app(|app| Rc::clone(&app.services.picker)) else {
-                return;
-            };
-            if let Some(path) = picker.pick(hwnd, picking(list)) {
-                with_app(|app| app.change(Change::Add(list, path)));
-            }
-        }
+        Effect::Pick(list) => pick(hwnd, list),
         Effect::Change(change) => {
             with_app(|app| app.change(change));
         }
@@ -524,12 +607,31 @@ fn carry_out(hwnd: HWND, effect: Effect) {
         Effect::OpenConfig => {
             with_app(App::open_config);
         }
+        Effect::Copy(text) => {
+            with_app(|app| (app.services.run)(&Action::CopyText(text), false));
+        }
+        Effect::Paste => {
+            let text = clipboard::text().unwrap_or_default();
+            ours(hwnd, |window| window.panel.paste(&text));
+        }
     }
     with_app(|app| {
         if let Some(window) = &mut app.settings {
             window.redraw_or_say();
         }
     });
+}
+
+/// Opens the folder picker for `list`, and adds what is picked to it.
+/// Called with no app state borrowed: the picker runs a message loop of
+/// its own.
+fn pick(hwnd: HWND, list: List) {
+    let Some(picker) = with_app(|app| Rc::clone(&app.services.picker)) else {
+        return;
+    };
+    if let Some(path) = picker.pick(hwnd, picking(list)) {
+        with_app(|app| app.change(Change::Add(list, path)));
+    }
 }
 
 /// Runs `f` on the window's state, when `hwnd` is the settings window
@@ -636,7 +738,8 @@ mod tests {
     use hyalo_core::item::Action;
     use windows::Win32::Graphics::Dwm::DwmGetWindowAttribute;
     use windows::Win32::UI::Input::KeyboardAndMouse::{
-        VIRTUAL_KEY, VK_CONTROL, VK_ESCAPE, VK_K, VK_RETURN, VK_SHIFT, VK_SPACE, VK_TAB,
+        VIRTUAL_KEY, VK_A, VK_C, VK_CONTROL, VK_ESCAPE, VK_HOME, VK_K, VK_RETURN, VK_SHIFT,
+        VK_SPACE, VK_TAB, VK_V, VK_X,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
         GWL_EXSTYLE, GWL_STYLE, GetWindowLongPtrW, IsWindow, IsWindowVisible, SendMessageW,
@@ -646,13 +749,12 @@ mod tests {
     use super::super::tests::{
         Chooser, Keyboard, Launcher, Ran, Taskbar, config_file, hold, listing, services,
     };
-    use super::super::{HOTKEY_TOGGLE, tray};
+    use super::super::{HOTKEY_TOGGLE, MOUSE_SHIFT, tray};
     use super::*;
     use crate::autostart::{self, Autostart};
-    use crate::page::{Target, What};
     use crate::scratch::Scratch;
     use crate::surface::Frame;
-    use crate::test_desktop::on_hidden_desktop;
+    use crate::test_desktop::{in_own_window_station, on_hidden_desktop};
 
     /// A launcher on a config of its own, with the stand-ins a test looks
     /// at. The launcher goes first, then its folder.
@@ -744,6 +846,32 @@ mod tests {
             let at = self.point(target);
             self.send(WM_LBUTTONDOWN, 0, at);
             self.send(WM_LBUTTONUP, 0, at);
+        }
+
+        /// The point `x` DIPs right of where the text of the field
+        /// `target` starts, in its middle, in client pixels.
+        fn point_in(&self, target: Target, x: f32) -> isize {
+            let (area, scroll, dpi) = self.state(|window| {
+                let area = window.laid.area(target).expect("on the page");
+                (area, window.panel.scroll(), window.dpi)
+            });
+            let scale = layout::scale(dpi);
+            let x = page::field_inside(area).x + x;
+            let y = area.middle().1 - scroll;
+            let (x, y) = ((x * scale) as isize, (y * scale) as isize);
+            (y & 0xFFFF) << 16 | (x & 0xFFFF)
+        }
+
+        /// The selection in the name field of `list`, in UTF-16 units.
+        fn selection(&self, list: List) -> std::ops::Range<u32> {
+            let marks = self.state(|window| window.laid.marks.clone());
+            let mut fields = marks.into_iter().filter_map(|mark| match mark.what {
+                What::Field {
+                    target, selection, ..
+                } if target == Target::Name(list) => Some(selection),
+                _ => None,
+            });
+            fields.next().expect("the field")
         }
 
         fn press(&self, key: VIRTUAL_KEY) {
@@ -1103,6 +1231,99 @@ mod tests {
             );
             assert!(settings.shows("vendor"));
             assert!(!settings.shows("[vendor]"));
+        });
+    }
+
+    #[test]
+    fn a_click_in_a_name_field_places_the_caret_and_dragging_selects() {
+        on_hidden_desktop(|| {
+            let setup = set_up("settings-window-field-mouse", DEFAULT, None);
+            let settings = setup.settings();
+            let name = Target::Name(List::RankLower);
+            settings.click(name);
+            settings.type_text("vendor");
+            let start = settings.point_in(name, 0.0);
+            settings.send(WM_LBUTTONDOWN, 0, start);
+            settings.send(WM_LBUTTONUP, 0, start);
+            settings.type_text("X");
+            assert!(settings.shows("[Xvendor]"));
+            let past = settings.point_in(name, 300.0);
+            settings.send(WM_LBUTTONDOWN, 0, start);
+            settings.send(WM_MOUSEMOVE, 0, past);
+            settings.send(WM_LBUTTONUP, 0, past);
+            assert_eq!(settings.selection(List::RankLower), 0..7);
+            settings.send(WM_MOUSEMOVE, 0, start);
+            assert_eq!(
+                settings.selection(List::RankLower),
+                0..7,
+                "the button is up"
+            );
+            settings.type_text("y");
+            assert!(settings.shows("[y]"));
+        });
+    }
+
+    #[test]
+    fn shift_double_and_triple_clicks_select_in_a_name_field() {
+        on_hidden_desktop(|| {
+            let setup = set_up("settings-window-field-clicks", DEFAULT, None);
+            let settings = setup.settings();
+            let name = Target::Name(List::RankHigher);
+            settings.click(name);
+            settings.type_text("my vendor");
+            settings.press(VK_HOME);
+            let past = settings.point_in(name, 300.0);
+            settings.send(WM_LBUTTONDOWN, MOUSE_SHIFT, past);
+            settings.send(WM_LBUTTONUP, MOUSE_SHIFT, past);
+            assert_eq!(settings.selection(List::RankHigher), 0..9);
+            let on_vendor = settings.state(|window| window.painter.measure("my ven"));
+            let on_vendor = settings.point_in(name, on_vendor);
+            settings.send(WM_LBUTTONDOWN, 0, on_vendor);
+            settings.send(WM_LBUTTONUP, 0, on_vendor);
+            settings.send(WM_LBUTTONDBLCLK, 0, on_vendor);
+            settings.send(WM_LBUTTONUP, 0, on_vendor);
+            assert_eq!(settings.selection(List::RankHigher), 3..9);
+            settings.send(WM_LBUTTONDOWN, 0, on_vendor);
+            settings.send(WM_LBUTTONUP, 0, on_vendor);
+            assert_eq!(settings.selection(List::RankHigher), 0..9);
+        });
+    }
+
+    #[test]
+    fn a_double_click_elsewhere_is_a_click() {
+        on_hidden_desktop(|| {
+            let setup = set_up("settings-window-double-switch", DEFAULT, None);
+            let settings = setup.settings();
+            let pick = settings.point(Target::Pick(List::Exclude));
+            settings.send(WM_LBUTTONDOWN, 0, pick);
+            settings.send(WM_LBUTTONUP, 0, pick);
+            settings.send(WM_LBUTTONDBLCLK, 0, pick);
+            settings.send(WM_LBUTTONUP, 0, pick);
+            let asked = setup.chooser.asked.borrow().len();
+            assert_eq!(asked, 2, "two clicks, two pickers");
+        });
+    }
+
+    #[test]
+    fn ctrl_v_pastes_into_a_name_field_and_ctrl_c_copies_from_it() {
+        let name = "window::settings_window::tests::ctrl_v_pastes_into_a_name_field_and_ctrl_c_copies_from_it";
+        in_own_window_station(name, || {
+            on_hidden_desktop(|| {
+                clipboard::copy("vendor\r\n").expect("copy");
+                let setup = set_up("settings-window-paste", DEFAULT, None);
+                let settings = setup.settings();
+                settings.click(Target::Name(List::RankLower));
+                hold(&[VK_CONTROL]);
+                settings.press(VK_V);
+                assert!(settings.shows("[vendor]"));
+                settings.press(VK_A);
+                settings.press(VK_C);
+                let copied = (Action::CopyText("vendor".to_string()), false);
+                assert_eq!(setup.ran.borrow().last(), Some(&copied));
+                settings.press(VK_X);
+                assert!(!settings.shows("[vendor]"));
+                assert_eq!(setup.ran.borrow().len(), 2);
+            });
         });
     }
 

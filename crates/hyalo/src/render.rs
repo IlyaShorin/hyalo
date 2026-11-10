@@ -24,17 +24,18 @@ use windows::Win32::Graphics::Direct2D::{
     D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC, D2D1_ROUNDED_RECT, ID2D1Bitmap1,
 };
 use windows::Win32::Graphics::DirectWrite::{
-    DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_HIT_TEST_METRICS,
-    DWRITE_TEXT_METRICS, DWRITE_TEXT_RANGE, IDWriteFactory, IDWriteTextFormat, IDWriteTextLayout,
+    DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_TEXT_RANGE, IDWriteFactory,
+    IDWriteTextFormat, IDWriteTextLayout,
 };
-use windows::core::{BOOL, Result};
+use windows::core::Result;
 use windows_numerics::Vector2;
 
 use crate::apps::Icon;
 use crate::field;
 use crate::layout::{BAR_HEIGHT, ICON_SIZE, ROW_HEIGHT, TEXT_LEFT, TEXT_RIGHT_PAD, row_top};
 use crate::surface::{
-    DISPLAY_FONT, PREMULTIPLIED_BGRA, Surface, TEXT_FONT, rgba, text_format, trimmed,
+    DISPLAY_FONT, PREMULTIPLIED_BGRA, SELECTED_TEXT, Surface, TEXT_FONT, caret_x, hit, line_width,
+    rgba, text_format, trimmed,
 };
 
 /// What to draw.
@@ -85,8 +86,6 @@ const TEXT: D2D1_COLOR_F = rgba(1.0, 1.0, 1.0, 0.95);
 const PLACEHOLDER_TEXT: D2D1_COLOR_F = rgba(1.0, 1.0, 1.0, 0.42);
 const ICON: D2D1_COLOR_F = rgba(1.0, 1.0, 1.0, 0.6);
 const CARET: D2D1_COLOR_F = rgba(0.45, 0.68, 1.0, 1.0);
-/// Behind the letters selected in the query: the caret's blue, see-through.
-const SELECTED: D2D1_COLOR_F = rgba(0.30, 0.52, 1.0, 0.45);
 const SEPARATOR: D2D1_COLOR_F = rgba(1.0, 1.0, 1.0, 0.10);
 const SELECTION: D2D1_COLOR_F = rgba(1.0, 1.0, 1.0, 0.12);
 const TITLE_TEXT: D2D1_COLOR_F = rgba(1.0, 1.0, 1.0, 0.92);
@@ -219,16 +218,7 @@ impl Renderer {
         let layout = self
             .surface
             .layout(text, &self.fonts.query, 0.0, BAR_HEIGHT)?;
-        let (mut trailing, mut inside) = (BOOL::default(), BOOL::default());
-        let mut hit = DWRITE_HIT_TEST_METRICS::default();
-        let x = x - TEXT_LEFT + self.scroll;
-        unsafe { layout.HitTestPoint(x, BAR_HEIGHT / 2.0, &mut trailing, &mut inside, &mut hit)? };
-        // Past the middle of a letter is after it.
-        let after = match trailing.as_bool() {
-            true => hit.length,
-            false => 0,
-        };
-        Ok(hit.textPosition + after)
+        hit(&layout, x - TEXT_LEFT + self.scroll, BAR_HEIGHT / 2.0)
     }
 
     /// The query or the placeholder, what is selected in the query, and
@@ -239,9 +229,9 @@ impl Renderer {
         let typed = self
             .surface
             .layout(scene.query, &self.fonts.query, 0.0, BAR_HEIGHT)?;
-        let caret = x_at(&typed, scene.caret)?;
+        let caret = caret_x(&typed, scene.caret)?;
         let room = w - TEXT_LEFT - TEXT_RIGHT_PAD;
-        self.scroll = field::scrolled(self.scroll, caret, width(&typed)?, room);
+        self.scroll = field::scrolled(self.scroll, caret, line_width(&typed)?, room);
         let left = TEXT_LEFT - self.scroll;
         let room = D2D_RECT_F {
             left: TEXT_LEFT - QUERY_SLACK,
@@ -284,12 +274,12 @@ impl Renderer {
         }
         let half = QUERY_SIZE * 0.55;
         let band = D2D_RECT_F {
-            left: left + x_at(typed, selection.start)?,
+            left: left + caret_x(typed, selection.start)?,
             top: BAR_HEIGHT / 2.0 - half,
-            right: left + x_at(typed, selection.end)?,
+            right: left + caret_x(typed, selection.end)?,
             bottom: BAR_HEIGHT / 2.0 + half,
         };
-        let brush = self.surface.solid(SELECTED)?;
+        let brush = self.surface.solid(SELECTED_TEXT)?;
         unsafe { self.surface.dc.FillRectangle(&band, &brush) };
         Ok(())
     }
@@ -428,22 +418,6 @@ impl Renderer {
         }
         Ok(())
     }
-}
-
-/// How far from the start of the one-line `layout` the caret before the
-/// UTF-16 unit `at` goes, in DIPs.
-fn x_at(layout: &IDWriteTextLayout, at: u32) -> Result<f32> {
-    let (mut x, mut y) = (0.0, 0.0);
-    let mut metrics = DWRITE_HIT_TEST_METRICS::default();
-    unsafe { layout.HitTestTextPosition(at, false, &mut x, &mut y, &mut metrics)? };
-    Ok(x)
-}
-
-/// How wide the one-line `layout` is, spaces at its end included.
-fn width(layout: &IDWriteTextLayout) -> Result<f32> {
-    let mut metrics = DWRITE_TEXT_METRICS::default();
-    unsafe { layout.GetMetrics(&mut metrics)? };
-    Ok(metrics.widthIncludingTrailingWhitespace)
 }
 
 impl Fonts {
