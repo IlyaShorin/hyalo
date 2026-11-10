@@ -236,14 +236,25 @@ impl Narrowing<'_> {
         if entry.is_folder() && !filters.take_folders() {
             return false;
         }
+        let at = at as usize;
+        let sized = filters.sized_and_dated(index.sizes[at], i64::from(index.times[at]));
+        sized && self.typed(index, entry)
+    }
+
+    /// Whether the entry's extension is one asked for, if any are: its
+    /// name is looked at only then, which a search without one spares.
+    fn typed(&self, index: &Index, entry: Entry) -> bool {
+        let wanted = &self.filters.extensions;
+        if wanted.is_empty() {
+            return true;
+        }
         let extension = index
             .folded_of(entry)
             .rsplit_once('.')
             .map(|(_, extension)| extension);
-        let wanted = |wanted: &String| Some(wanted.as_str()) == extension;
-        let typed = filters.extensions.is_empty() || filters.extensions.iter().any(wanted);
-        let at = at as usize;
-        typed && filters.sized_and_dated(index.sizes[at], i64::from(index.times[at]))
+        wanted
+            .iter()
+            .any(|wanted| Some(wanted.as_str()) == extension)
     }
 }
 
