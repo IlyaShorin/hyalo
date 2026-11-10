@@ -6,9 +6,9 @@
 # each with its own .venv. Their bundled launchers assume a Unix venv layout
 # (.venv/bin), so this script calls each venv's python directly.
 #
-#   scripts/gates.sh                 crap + dry (exit 2 when either fails)
-#   scripts/gates.sh crap [args]     crapper only
-#   scripts/gates.sh dry [args]      dryer only
+#   scripts/gates.sh                 crap + dry over crates/ (exit 2 when either fails)
+#   scripts/gates.sh crap [args]     crapper only (given no args, over crates/)
+#   scripts/gates.sh dry [args]      dryer only (given no args, over crates/)
 #   scripts/gates.sh mutate [args]   mutator (slow; try --changed)
 set -eu
 
@@ -37,14 +37,22 @@ run() {
   "$py" -m "$tool" --root "$ROOT" "$@"
 }
 
+# What the gates look at when given no paths: the workspace's crates.
+# Sessions that work beside this one keep git worktrees of the whole
+# repository under .claude/, and the tools would take every function
+# there for a copy of its own (and build and test each worktree again).
+SOURCES=crates
+
 # ub-mode wants every function under CRAP 10; crapper fails only when the
 # worst score is above its threshold, so the threshold sits just below 10.
 crap() {
+  [ $# -gt 0 ] || set -- "$SOURCES"
   run crapper --threshold 9.999 "$@"
 }
 
 # dryer reports and exits 0 either way; the gate fails on any candidate.
 dry() {
+  [ $# -gt 0 ] || set -- "$SOURCES"
   report=$(run dryer --threshold 0.8 "$@")
   printf '%s\n' "$report"
   case "$report" in
