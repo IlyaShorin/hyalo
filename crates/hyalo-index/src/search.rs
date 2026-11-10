@@ -55,11 +55,7 @@ impl Index {
             };
         }
         let pattern = &Pattern::new(query);
-        let narrowing = &Narrowing {
-            filters,
-            unmatched: query.is_empty(),
-            within: (!filters.folders.is_empty()).then(|| self.folders_named(&filters.folders)),
-        };
+        let narrowing = &self.narrowing(filters, query.is_empty());
         let (mut hits, scored) = thread::scope(|scope| {
             let threads: Vec<_> = self
                 .slices()
@@ -155,6 +151,25 @@ impl Index {
         found
     }
 
+    /// What `filters` lets through, made ready to ask of one path after
+    /// another.
+    pub fn sieve<'a>(&'a self, filters: &'a Filters) -> Sieve<'a> {
+        Sieve {
+            index: self,
+            narrowing: self.narrowing(filters, false),
+        }
+    }
+
+    /// `filters` made ready: the folders `in:` names found.
+    fn narrowing<'a>(&self, filters: &'a Filters, unmatched: bool) -> Narrowing<'a> {
+        let named = !filters.folders.is_empty();
+        Narrowing {
+            filters,
+            unmatched,
+            within: named.then(|| self.folders_named(&filters.folders)),
+        }
+    }
+
     /// The folded names of the folders from a root down to `folder`.
     fn folders(&self, folder: u32) -> Vec<&str> {
         let above = self.ancestry(folder);
@@ -180,6 +195,28 @@ impl Index {
 /// Folders whose place points one thread remembers: siblings come one
 /// after another, so most entries find their folder here.
 const SEEN: usize = 256;
+
+/// Filters made ready to ask whether this file or that passes them.
+pub struct Sieve<'a> {
+    index: &'a Index,
+    narrowing: Narrowing<'a>,
+}
+
+impl Sieve<'_> {
+    /// Whether the file or folder at the full path `path` is in the index
+    /// and passes the filters.
+    pub fn lets_through(&self, path: &str) -> bool {
+        let index = self.index;
+        let Some(id) = index.find(path) else {
+            return false;
+        };
+        let entry = index.entries[id.0 as usize];
+        let under =
+            |within: &HashSet<u32>| index.ancestry(entry.parent).any(|at| within.contains(&at));
+        let within = self.narrowing.within.as_ref();
+        !entry.is_root() && self.narrowing.admits(index, id.0, entry) && within.is_none_or(under)
+    }
+}
 
 /// Filters made ready for one search.
 struct Narrowing<'a> {
@@ -659,6 +696,30 @@ mod tests {
             .rows;
         assert_eq!(rows[0].item.title, "report.docx");
         assert!(rows[0].found.positions.is_empty());
+    }
+
+    #[test]
+    fn a_sieve_lets_through_the_paths_the_filters_do() {
+        let index = drive();
+        let sieve = |text: &str| -> Vec<bool> {
+            let query = Query::parse(text, CLOCK);
+            let sieve = index.sieve(&query.filters);
+            let paths = [
+                r"C:\Desktop\report.pdf",
+                r"c:\work\DEEP\report.pdf",
+                r"C:\Work\deep\pdf",
+                r"C:\Nowhere\report.pdf",
+                "C:",
+            ];
+            paths.iter().map(|path| sieve.lets_through(path)).collect()
+        };
+        assert_eq!(sieve("ext:pdf"), [true, true, false, false, false]);
+        assert_eq!(sieve("in:work"), [false, true, true, false, false]);
+        assert_eq!(sieve("mod:today"), [true, false, false, false, false]);
+        assert_eq!(
+            sieve(r"in:c:\desktop size:>1mb"),
+            [true, false, false, false, false]
+        );
     }
 
     #[test]

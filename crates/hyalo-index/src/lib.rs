@@ -16,4 +16,5 @@ mod snapshot;
 pub mod synthetic;
 
 pub use index::{EntryId, Error, Index, MAX_NAME};
+pub use search::{Searched, Sieve};
 pub use snapshot::LoadError;
