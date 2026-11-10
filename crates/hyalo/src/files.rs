@@ -1342,16 +1342,20 @@ mod tests {
         let folder = Scratch::new("shrink").with(&names);
         let snapshot = Scratch::new("shrink-snapshot");
         let path = snapshot.0.join("files.idx");
+        // The walk tells the window as it goes, before it is done: wait
+        // for all of it, then for no room kept, which never comes when
+        // the room is kept.
+        let exact = |serving: &Serving| {
+            let (walked, exact) = memory(serving.files());
+            read(&serving.files().0).len() == 301 && walked == exact
+        };
         let first = Serving::new_walking(&folder, Some(path.clone()));
-        first.until(|serving| serving.reports() >= 1 && read(&serving.files().0).len() == 301);
-        let (walked, exact) = memory(first.files());
-        assert_eq!(walked, exact, "the first walk");
+        assert!(first.until(exact), "the first walk");
         first.stop();
         // From the snapshot, then a walk into a fresh index.
         let again = Serving::new_walking(&folder, Some(path));
         again.until(|serving| serving.reports() >= 2);
-        let (walked, exact) = memory(again.files());
-        assert_eq!(walked, exact, "a walk into a fresh index");
+        assert!(again.until(exact), "a walk into a fresh index");
     }
 
     #[test]
