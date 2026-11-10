@@ -14,10 +14,10 @@
 # -Stripes puts bright colour stripes behind the launcher first, so the
 # capture shows whether the glass really blurs what is underneath.
 # -Type types into the launcher before the capture, which then covers the
-# list too: {DOWN}, {UP}, {ENTER} and {ESC} press those keys, the rest is
-# typed. Keys go to the window with SendMessageW, so they reach it
-# whatever has the focus, and a slow debug search finishes before the
-# capture.
+# list too: {DOWN}, {UP}, {ENTER}, {ESC}, {LEFT}, {RIGHT}, {HOME}, {END}
+# and {DEL} press those keys, the rest is typed. Keys go to the window
+# with SendMessageW, so they reach it whatever has the focus, and a slow
+# debug search finishes before the capture.
 param(
     [string]$Out = "target/snap.png",
     [int]$Margin = 48,
@@ -145,7 +145,7 @@ if ($Settings) {
 Start-Sleep -Milliseconds 500
 
 if ($Type) {
-    $keys = @{ "DOWN" = 0x28; "UP" = 0x26; "ENTER" = 0x0D; "ESC" = 0x1B }
+    $keys = @{ "DOWN" = 0x28; "UP" = 0x26; "ENTER" = 0x0D; "ESC" = 0x1B; "LEFT" = 0x25; "RIGHT" = 0x27; "HOME" = 0x24; "END" = 0x23; "DEL" = 0x2E }
     foreach ($part in [regex]::Split($Type, "(\{[A-Z]+\})")) {
         if ($part -match "^\{([A-Z]+)\}$") {
             [Snap]::SendMessageW($hwnd, 0x0100, [IntPtr]$keys[$Matches[1]], [IntPtr]::Zero) | Out-Null
