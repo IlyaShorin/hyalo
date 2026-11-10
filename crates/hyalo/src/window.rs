@@ -35,13 +35,13 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetKeyState, MOD_ALT, MOD_NOREPEAT, RegisterHotKey, VIRTUAL_KEY, VK_CONTROL, VK_SHIFT, VK_SPACE,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CW_USEDEFAULT, CreateWindowExW, DefWindowProcW, DispatchMessageW, GetCursorPos, GetMessageW,
-    HTCLIENT, HWND_TOPMOST, IDC_ARROW, IsWindowVisible, LoadCursorW, MSG, PostMessageW,
-    PostQuitMessage, RegisterClassExW, SW_HIDE, SW_SHOW, SWP_NOACTIVATE, SetForegroundWindow,
-    SetWindowPos, ShowWindow, TranslateMessage, WA_INACTIVE, WM_ACTIVATE, WM_APP, WM_CHAR,
-    WM_DESTROY, WM_HOTKEY, WM_KEYDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCCALCSIZE, WM_NCHITTEST,
-    WNDCLASSEXW, WS_CAPTION, WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
-    WS_THICKFRAME,
+    AllowSetForegroundWindow, CW_USEDEFAULT, CreateWindowExW, DefWindowProcW, DispatchMessageW,
+    FindWindowW, GetCursorPos, GetMessageW, GetWindowThreadProcessId, HTCLIENT, HWND_TOPMOST,
+    IDC_ARROW, IsWindowVisible, LoadCursorW, MSG, PostMessageW, PostQuitMessage, RegisterClassExW,
+    SW_HIDE, SW_SHOW, SWP_NOACTIVATE, SetForegroundWindow, SetWindowPos, ShowWindow,
+    TranslateMessage, WA_INACTIVE, WM_ACTIVATE, WM_APP, WM_CHAR, WM_DESTROY, WM_HOTKEY, WM_KEYDOWN,
+    WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCCALCSIZE, WM_NCHITTEST, WNDCLASSEXW, WS_CAPTION,
+    WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_THICKFRAME,
 };
 use windows::core::{BOOL, PCWSTR, Result, w};
 
@@ -60,6 +60,9 @@ const HOTKEY_TOGGLE: i32 = 1;
 
 /// Posted by the provider's thread each time it hands over a piece.
 const WM_FOUND: u32 = WM_APP + 1;
+
+/// Posted by a second start of hyalo: show the launcher.
+const WM_SHOW: u32 = WM_APP + 2;
 
 /// Where the launcher shows: its monitor's work area and DPI.
 #[derive(Debug, Clone, Copy)]
@@ -558,10 +561,36 @@ fn on_message(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> Optio
         }
         WM_KEYDOWN => Some(on_key(hwnd, VIRTUAL_KEY(wparam.0 as u16))),
         WM_CHAR => Some(on_char(wparam.0 as u16)),
-        WM_FOUND => Some(with_app(App::take_found).unwrap_or(Ok(()))),
         WM_MOUSEMOVE => Some(with_app(|app| app.hover(client_point(lparam))).unwrap_or(Ok(()))),
         WM_LBUTTONUP => Some(on_click(hwnd, client_point(lparam))),
+        _ => on_app_message(hwnd, message),
+    }
+}
+
+/// What the launcher does with the messages its own threads and
+/// processes send it; `None` for the rest.
+fn on_app_message(hwnd: HWND, message: u32) -> Option<Result<()>> {
+    match message {
+        WM_FOUND => Some(with_app(App::take_found).unwrap_or(Ok(()))),
+        WM_SHOW => Some(show(hwnd)),
         _ => None,
+    }
+}
+
+/// From a second start: shows the launcher that runs already. The second
+/// start was the user's, so it may hand the foreground on; the launcher,
+/// in the background, could not take it on its own.
+pub fn show_running() {
+    // SAFETY: plain calls; the window may be gone by the time a call
+    // reaches it, and then the call fails and nothing waits.
+    unsafe {
+        let Ok(hwnd) = FindWindowW(WINDOW_CLASS, PCWSTR::null()) else {
+            return;
+        };
+        let mut process = 0;
+        GetWindowThreadProcessId(hwnd, Some(&mut process));
+        let _ = AllowSetForegroundWindow(process);
+        let _ = PostMessageW(Some(hwnd), WM_SHOW, WPARAM::default(), LPARAM::default());
     }
 }
 
@@ -1140,6 +1169,18 @@ mod tests {
     }
 
     #[test]
+    fn a_second_start_shows_it_and_keeps_it_shown() {
+        on_hidden_desktop(|| {
+            let launcher = Launcher::open();
+            launcher.press(VK_ESCAPE);
+            launcher.send(WM_SHOW, 0);
+            assert!(launcher.visible());
+            launcher.send(WM_SHOW, 0);
+            assert!(launcher.visible(), "shown, not toggled");
+        });
+    }
+
+    #[test]
     fn escape_enter_and_losing_focus_each_hide_it() {
         let hiders = [
             (WM_KEYDOWN, usize::from(VK_ESCAPE.0)),
@@ -1238,6 +1279,7 @@ mod tests {
             (WM_ACTIVATE, WA_INACTIVE as usize),
             (WM_HOTKEY, HOTKEY_TOGGLE as usize),
             (WM_FOUND, 0),
+            (WM_SHOW, 0),
         ];
         on_hidden_desktop(move || {
             let launcher = Launcher::open();

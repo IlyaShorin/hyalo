@@ -7,6 +7,7 @@ mod com;
 mod files;
 mod highlight;
 mod http;
+mod instance;
 mod keys;
 mod launch;
 mod layout;
@@ -24,11 +25,22 @@ mod scratch;
 #[cfg(test)]
 mod test_desktop;
 
+use instance::Claim;
 use windows::Win32::UI::HiDpi::{
     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext,
 };
 
 fn main() -> windows::core::Result<()> {
+    // One launcher per session: a second start shows the first and goes.
+    let _launcher = match instance::claim(instance::NAME)? {
+        Claim::Ours(launcher) => launcher,
+        Claim::Taken(running) => {
+            // A build replacing the running one would wait on it here.
+            drop(running);
+            window::show_running();
+            return Ok(());
+        }
+    };
     // DPI awareness is per process and must be set before the first window.
     unsafe { SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2)? };
     window::run()
