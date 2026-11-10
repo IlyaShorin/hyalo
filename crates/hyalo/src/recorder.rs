@@ -2,7 +2,7 @@
 //! combination pressed as the new hotkey. Pure: the window hands it each
 //! key and the modifiers held, and it says what it heard.
 
-use hyalo_core::hotkey::Hotkey;
+use hyalo_core::hotkey::{Hotkey, Wrong};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     VK_CONTROL, VK_ESCAPE, VK_F4, VK_LCONTROL, VK_LMENU, VK_LSHIFT, VK_LWIN, VK_MENU, VK_RCONTROL,
     VK_RMENU, VK_RSHIFT, VK_RWIN, VK_SHIFT,
@@ -58,7 +58,7 @@ pub enum Heard {
     /// A combination that may be a hotkey; the recorder stops.
     Hotkey(Hotkey),
     /// A combination that may not be one, and why; it listens on.
-    Wrong(String),
+    Wrong(Wrong),
 }
 
 impl Recorder {
@@ -279,7 +279,7 @@ mod tests {
         let Heard::Wrong(why) = recorder.key(VK_SPACE.0, Mods::default()) else {
             panic!("refused");
         };
-        assert!(why.contains("needs Ctrl, Alt or Win"), "{why}");
+        assert!(why.to_string().contains("needs Ctrl, Alt or Win"), "{why}");
         assert!(recorder.listening());
         let ctrl = Mods {
             ctrl: true,

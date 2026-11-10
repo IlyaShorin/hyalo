@@ -8,7 +8,7 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 use std::{fs, io};
 
-use hyalo_core::config::{self, Change, Config, Problem, Refusal, Written};
+use hyalo_core::config::{self, Change, Config, Problem, Refusal, Why, Written};
 use windows::Win32::Foundation::{HANDLE, WAIT_TIMEOUT};
 use windows::Win32::Storage::FileSystem::{
     FILE_NOTIFY_CHANGE_FILE_NAME, FILE_NOTIFY_CHANGE_LAST_WRITE, FindCloseChangeNotification,
@@ -63,7 +63,7 @@ fn text(bytes: Vec<u8>) -> Result<String, Problem> {
         let valid = &error.as_bytes()[..error.utf8_error().valid_up_to()];
         Problem {
             line: valid.iter().filter(|&&byte| byte == b'\n').count() + 1,
-            message: "this is not UTF-8 text: save the file as UTF-8".to_string(),
+            why: Why::NotUtf8,
         }
     })
 }
@@ -72,7 +72,7 @@ fn text(bytes: Vec<u8>) -> Result<String, Problem> {
 /// there is written with the defaults first), with `change` made in it;
 /// `None` when the change makes no difference. Nothing is written.
 pub fn edited(path: &Path, change: &Change) -> Result<Option<String>, Refusal> {
-    let unreadable = || Refusal::Wrong("cannot read config.toml".to_string());
+    let unreadable = || Refusal::Wrong(Why::Unreadable);
     let text = text(contents(path).ok_or_else(unreadable)?).map_err(Refusal::Broken)?;
     let edited = config::edit(&text, change)?;
     Ok((edited != text).then_some(edited))
@@ -204,7 +204,7 @@ mod tests {
         fs::write(&path, b"hotkey = \"Alt+Space\"\n# \xC0\xEB\xFC\n").expect("write");
         let problem = load(&path).expect("read").expect_err("a problem");
         assert_eq!(problem.line, 2);
-        assert!(problem.message.contains("UTF-8"), "{}", problem.message);
+        assert!(problem.why == Why::NotUtf8, "{}", problem.why);
     }
 
     #[test]
@@ -278,8 +278,7 @@ mod tests {
     fn a_file_that_cannot_be_read_is_not_changed() {
         let scratch = Scratch::new("settings-edit-folder").with(&["hyalo\\config.toml\\"]);
         let refused = edited(&config_in(&scratch), &change(List::RankLower, "x"));
-        let why = "cannot read config.toml".to_string();
-        assert_eq!(refused, Err(Refusal::Wrong(why)));
+        assert_eq!(refused, Err(Refusal::Wrong(Why::Unreadable)));
     }
 
     #[test]

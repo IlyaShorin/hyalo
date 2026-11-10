@@ -52,6 +52,7 @@ impl Notice {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hyalo_core::config::Why;
 
     fn hotkey(text: &str) -> Hotkey {
         Hotkey::parse(text).expect("a hotkey")
@@ -60,7 +61,7 @@ mod tests {
     fn problem() -> Notice {
         Notice::Config(Problem {
             line: 2,
-            message: "unknown field `hotkye`".to_string(),
+            why: Why::Toml("unknown field `hotkye`".to_string()),
         })
     }
 

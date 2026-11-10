@@ -8,8 +8,9 @@ use std::ops::Range;
 use serde::Deserialize;
 use toml::Spanned;
 
-use crate::hotkey::Hotkey;
+use crate::hotkey::{self, Hotkey};
 use crate::places::{self, Place};
+use crate::text::{Language, Text};
 
 mod edit;
 
@@ -133,12 +134,86 @@ pub fn written(text: &str) -> Result<Written, Problem> {
 pub struct Problem {
     /// Counted from 1.
     pub line: usize,
-    pub message: String,
+    pub why: Why,
+}
+
+impl Problem {
+    /// Its line and what is wrong there, in `language`.
+    pub fn said(&self, language: Language) -> String {
+        let line = self.line.to_string();
+        language.fill(Text::ProblemAt, &[&line, &self.why.said(language)])
+    }
 }
 
 impl fmt::Display for Problem {
+    /// Its line and what is wrong there, in English.
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "line {}: {}", self.line, self.message)
+        f.write_str(&self.said(Language::English))
+    }
+}
+
+/// What is wrong with a config, or with a change to it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Why {
+    /// The hotkey's name, or the keys pressed for one.
+    Hotkey(hotkey::Wrong),
+    /// A value that does not read as what was wanted.
+    Value(Wanted, String),
+    /// A backslash in double quotes, as in a Windows path.
+    Escape,
+    /// What TOML's own reader says, in English.
+    Toml(String),
+    /// The file is not UTF-8.
+    NotUtf8,
+    /// The file cannot be read at all.
+    Unreadable,
+    /// Windows refused this hotkey: another app holds it.
+    Taken(Hotkey),
+    /// The file could not be written, for the reason Windows gives.
+    Unsaved(String),
+}
+
+/// What a value of the config should have been.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Wanted {
+    /// A full path below a drive: an excluded folder.
+    FullPath,
+    /// A folder name or a full path: a folder that ranks.
+    Place,
+    Language,
+}
+
+impl Why {
+    /// What is wrong, in `language`; TOML's own words stay English.
+    pub fn said(&self, language: Language) -> String {
+        match self {
+            Why::Hotkey(wrong) => wrong.said(language),
+            Why::Value(wanted, value) => language.fill(wanted.text(), &[value]),
+            Why::Escape => language.say(Text::Escape).to_string(),
+            Why::Toml(message) => message.clone(),
+            Why::NotUtf8 => language.say(Text::NotUtf8).to_string(),
+            Why::Unreadable => language.say(Text::Unreadable).to_string(),
+            Why::Taken(hotkey) => language.fill(Text::Taken, &[&hotkey.to_string()]),
+            Why::Unsaved(error) => language.fill(Text::Unsaved, &[error]),
+        }
+    }
+}
+
+impl fmt::Display for Why {
+    /// What is wrong, in English.
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.write_str(&self.said(Language::English))
+    }
+}
+
+impl Wanted {
+    /// The sentence that says a value is not what was wanted.
+    fn text(self) -> Text {
+        match self {
+            Wanted::FullPath => Text::NotFullPath,
+            Wanted::Place => Text::NotPlace,
+            Wanted::Language => Text::NotLanguage,
+        }
     }
 }
 
@@ -157,7 +232,9 @@ fn read(text: &str) -> Result<(Config, [Vec<String>; 3]), Problem> {
     let defaults = Config::default();
     let at = Lines(text);
     let config = Config {
-        hotkey: at.one(file.hotkey, defaults.hotkey, Hotkey::parse)?,
+        hotkey: at.one(file.hotkey, defaults.hotkey, |text| {
+            Hotkey::parse(text).map_err(Why::Hotkey)
+        })?,
         exclude: at.each(folders.exclude, defaults.exclude, excluded)?,
         rank_lower: at.each(folders.rank_lower, defaults.rank_lower, place)?,
         rank_higher: at.each(folders.rank_higher, defaults.rank_higher, place)?,
@@ -204,10 +281,10 @@ impl Lines<'_> {
         before.iter().filter(|&&byte| byte == b'\n').count() + 1
     }
 
-    fn problem(&self, span: Range<usize>, message: String) -> Problem {
+    fn problem(&self, span: Range<usize>, why: Why) -> Problem {
         Problem {
             line: self.line(span.start),
-            message,
+            why,
         }
     }
 
@@ -215,9 +292,9 @@ impl Lines<'_> {
     fn read<T>(
         &self,
         value: Spanned<String>,
-        read: &impl Fn(&str) -> Result<T, String>,
+        read: &impl Fn(&str) -> Result<T, Why>,
     ) -> Result<T, Problem> {
-        read(value.get_ref()).map_err(|message| self.problem(value.span(), message))
+        read(value.get_ref()).map_err(|why| self.problem(value.span(), why))
     }
 
     /// The setting `value` reads as, or `default` when it was left out.
@@ -225,7 +302,7 @@ impl Lines<'_> {
         &self,
         value: Option<Spanned<String>>,
         default: T,
-        read: impl Fn(&str) -> Result<T, String>,
+        read: impl Fn(&str) -> Result<T, Why>,
     ) -> Result<T, Problem> {
         value.map_or(Ok(default), |value| self.read(value, &read))
     }
@@ -235,7 +312,7 @@ impl Lines<'_> {
         &self,
         values: Option<Vec<Spanned<String>>>,
         default: Vec<T>,
-        read: impl Fn(&str) -> Result<T, String>,
+        read: impl Fn(&str) -> Result<T, Why>,
     ) -> Result<Vec<T>, Problem> {
         let Some(values) = values else {
             return Ok(default);
@@ -252,32 +329,28 @@ impl Lines<'_> {
 /// with Windows paths, so it gets advice instead of TOML's escapes.
 fn unreadable(text: &str, error: &toml::de::Error) -> Problem {
     let message = error.message().lines().next().unwrap_or_default();
-    let message = match message.contains("escape") {
-        true => {
-            "a backslash in double quotes starts an escape: write paths in single quotes, as 'C:\\Windows'"
-        }
-        false => message,
+    let why = match message.contains("escape") {
+        true => Why::Escape,
+        false => Why::Toml(message.to_string()),
     };
     let span = error.span().unwrap_or_default();
-    Lines(text).problem(span, message.to_string())
+    Lines(text).problem(span, why)
 }
 
 /// An excluded path: a full path below a drive, with backslashes and no
 /// backslash at the end. A drive alone, `C:\`, is `C:` once its
 /// backslash is gone, which is no full path.
-fn excluded(text: &str) -> Result<String, String> {
+fn excluded(text: &str) -> Result<String, Why> {
     let path = text.trim().replace('/', "\\");
     let path = path.trim_end_matches('\\');
     match places::full_path(path) {
         true => Ok(path.to_string()),
-        false => Err(format!("`{text}` is not a full path such as `D:\\old`")),
+        false => Err(Why::Value(Wanted::FullPath, text.to_string())),
     }
 }
 
-fn place(text: &str) -> Result<Place, String> {
-    Place::parse(text).ok_or_else(|| {
-        format!("`{text}` is neither a folder name nor a full path such as `D:\\old`")
-    })
+fn place(text: &str) -> Result<Place, Why> {
+    Place::parse(text).ok_or_else(|| Why::Value(Wanted::Place, text.to_string()))
 }
 
 #[cfg(test)]
@@ -346,10 +419,10 @@ rank_higher = ['notes']
     fn an_unknown_setting_is_named_with_its_line() {
         let found = problem("\nhotkye = \"Alt+Space\"\n");
         assert_eq!(found.line, 2);
-        assert!(found.message.contains("`hotkye`"), "{}", found.message);
+        assert!(found.why.to_string().contains("`hotkye`"), "{}", found.why);
         let found = problem("[folders]\nexclude = []\nhide = []\n");
         assert_eq!(found.line, 3);
-        assert!(found.message.contains("`hide`"), "{}", found.message);
+        assert!(found.why.to_string().contains("`hide`"), "{}", found.why);
     }
 
     #[test]
@@ -372,7 +445,7 @@ rank_higher = ['notes']
     fn a_hotkey_it_cannot_read_is_found_on_its_line() {
         let found = problem("# keys\nhotkey = \"Ctrl+Kay\"\n");
         assert_eq!(found.line, 2);
-        assert!(found.message.contains("`Kay`"), "{}", found.message);
+        assert!(found.why.to_string().contains("`Kay`"), "{}", found.why);
     }
 
     #[test]
@@ -381,7 +454,7 @@ rank_higher = ['notes']
             let text = format!("[folders]\nexclude = [\n  'D:\\ok',\n  {path},\n]\n");
             let found = problem(&text);
             assert_eq!(found.line, 4, "{path}");
-            assert!(found.message.contains("full path"), "{}", found.message);
+            assert!(found.why.to_string().contains("full path"), "{}", found.why);
         }
     }
 
@@ -389,7 +462,11 @@ rank_higher = ['notes']
     fn a_place_must_be_a_folder_name_or_a_full_path() {
         let found = problem("[folders]\nrank_lower = ['target', 'old\\stuff']\n");
         assert_eq!(found.line, 2);
-        assert!(found.message.contains(r"`old\stuff`"), "{}", found.message);
+        assert!(
+            found.why.to_string().contains(r"`old\stuff`"),
+            "{}",
+            found.why
+        );
         let found = problem("[folders]\nrank_higher = ['']\n");
         assert_eq!(found.line, 2);
     }
@@ -398,16 +475,24 @@ rank_higher = ['notes']
     fn a_backslash_in_double_quotes_gets_a_hint_about_single_quotes() {
         let found = problem("[folders]\nexclude = [\"C:\\Windows\"]\n");
         assert_eq!(found.line, 2);
-        assert!(found.message.contains("single quotes"), "{}", found.message);
+        assert!(
+            found.why.to_string().contains("single quotes"),
+            "{}",
+            found.why
+        );
     }
 
     #[test]
     fn a_problem_reads_as_its_line_and_what_is_wrong() {
         let found = Problem {
             line: 3,
-            message: "`Kay` is not a key hyalo knows".to_string(),
+            why: Why::Hotkey(hotkey::Wrong::Unknown("Kay".to_string())),
         };
         assert_eq!(found.to_string(), "line 3: `Kay` is not a key hyalo knows");
+        assert_eq!(
+            found.said(Language::Russian),
+            "строка 3: hyalo не знает клавишу `Kay`"
+        );
     }
 
     fn entries(written: &Written, list: List) -> Vec<&str> {
@@ -464,8 +549,49 @@ rank_higher = ['notes']
     }
 
     #[test]
+    fn what_is_wrong_is_said_in_either_language_but_tomls_own_words() {
+        let saids = [
+            (
+                Why::Value(Wanted::FullPath, "C:".into()),
+                "`C:` — не полный путь вроде `D:\\old`",
+            ),
+            (
+                Why::Value(Wanted::Place, "a\\b".into()),
+                "`a\\b` — не имя папки и не полный путь вроде `D:\\old`",
+            ),
+            (
+                Why::Value(Wanted::Language, "de".into()),
+                "hyalo не знает языка `de`: только \"en\" или \"ru\"",
+            ),
+            (Why::Toml("unknown field".into()), "unknown field"),
+            (
+                Why::NotUtf8,
+                "это не текст в UTF-8: сохраните файл в кодировке UTF-8",
+            ),
+            (Why::Unreadable, "не удаётся прочитать config.toml"),
+            (
+                Why::Taken(Hotkey::default()),
+                "Alt+Space уже занято другим приложением",
+            ),
+            (
+                Why::Unsaved("Отказано в доступе.".into()),
+                "не удалось сохранить config.toml: Отказано в доступе.",
+            ),
+        ];
+        for (why, said) in saids {
+            assert_eq!(why.said(Language::Russian), said, "{why:?}");
+        }
+        assert!(
+            Why::Escape
+                .said(Language::Russian)
+                .contains("одинарных кавычках")
+        );
+        assert!(Why::Escape.to_string().contains("single quotes"));
+    }
+
+    #[test]
     fn a_problem_is_one_line() {
         let found = problem("hotkey = \"Alt+Space\n");
-        assert!(!found.message.contains('\n'), "{:?}", found.message);
+        assert!(!found.why.to_string().contains('\n'), "{:?}", found.why);
     }
 }

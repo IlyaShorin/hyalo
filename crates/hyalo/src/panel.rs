@@ -9,7 +9,7 @@
 
 use std::collections::HashMap;
 
-use hyalo_core::config::{Change, List, Problem, Written};
+use hyalo_core::config::{Change, List, Problem, Why, Written};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     VIRTUAL_KEY, VK_ESCAPE, VK_RETURN, VK_SPACE, VK_TAB,
 };
@@ -81,7 +81,7 @@ pub struct Panel {
     /// What is typed in each list's name field.
     names: HashMap<List, Field>,
     /// What went wrong with the last change, and where it shows.
-    note: Option<(Spot, String)>,
+    note: Option<(Spot, Why)>,
     focus: Option<Target>,
     /// Whether the focus is ringed: it came from the keyboard.
     ring: bool,
@@ -168,7 +168,7 @@ impl Panel {
     }
 
     /// `change` was not made, for the reason `why`, told by its setting.
-    pub fn refused(&mut self, change: &Change, why: String) {
+    pub fn refused(&mut self, change: &Change, why: Why) {
         let spot = match change {
             Change::Hotkey(_) => Spot::Hotkey,
             Change::Add(list, _) | Change::Remove(list, _) => Spot::List(*list),
@@ -333,7 +333,7 @@ impl Panel {
             Heard::Nothing | Heard::Cancelled => None,
             Heard::Close => Some(Effect::Close),
             Heard::Wrong(why) => {
-                self.note = Some((Spot::Hotkey, why));
+                self.note = Some((Spot::Hotkey, Why::Hotkey(why)));
                 None
             }
             Heard::Hotkey(hotkey) => {
@@ -462,7 +462,7 @@ impl Panel {
     /// a warning, or `help`.
     fn help(&self, spot: Spot, help: &str) -> (String, bool) {
         match &self.note {
-            Some((noted, why)) if *noted == spot => (why.clone(), true),
+            Some((noted, why)) if *noted == spot => (why.to_string(), true),
             _ => (help.to_string(), false),
         }
     }
@@ -480,7 +480,7 @@ impl Panel {
             (help.to_string(), false),
             Some(fix),
         );
-        let text = format!("Line {}: {}", problem.line, problem.message);
+        let text = format!("Line {}: {}", problem.line, problem.why);
         Some(Section {
             title: None,
             cards: vec![card(true, false, vec![title, Strip::Text { text }])],
@@ -954,7 +954,10 @@ mod tests {
     fn a_hotkey_windows_refused_is_told_by_the_hotkey() {
         let mut panel = panel();
         let change = Change::Hotkey(Hotkey::parse("Ctrl+K").expect("a hotkey"));
-        panel.refused(&change, "Ctrl+K is taken by another app".to_string());
+        panel.refused(
+            &change,
+            Why::Taken(Hotkey::parse("Ctrl+K").expect("a hotkey")),
+        );
         assert!(texts(&panel).contains(&"! Ctrl+K is taken by another app".to_string()));
         assert_eq!(keys(&panel).0, caps("Alt+Space"));
         click(&mut panel, Target::Hotkey);
@@ -980,11 +983,11 @@ mod tests {
     #[test]
     fn what_went_wrong_shows_by_its_own_setting_only() {
         let mut panel = panel();
-        let why = "Ctrl+K is taken by another app".to_string();
+        let why = Why::Taken(Hotkey::parse("Ctrl+K").expect("a hotkey"));
         let change = Change::Hotkey(Hotkey::parse("Ctrl+K").expect("a hotkey"));
         panel.refused(&change, why.clone());
         let warned = What::Help {
-            text: why.clone(),
+            text: "Ctrl+K is taken by another app".to_string(),
             alarm: true,
         };
         assert_eq!(help_of(&panel, "Hotkey"), warned);
@@ -1082,10 +1085,8 @@ mod tests {
         click(&mut panel, Target::Name(List::RankHigher));
         type_text(&mut panel, r"old\stuff");
         let change = Change::Add(List::RankHigher, r"old\stuff".to_string());
-        panel.refused(
-            &change,
-            "`old\\stuff` is neither a folder name nor a full path".to_string(),
-        );
+        let place = hyalo_core::config::Wanted::Place;
+        panel.refused(&change, Why::Value(place, r"old\stuff".to_string()));
         let shown = texts(&panel);
         assert!(shown.contains(&r"[old\stuff]".to_string()), "{shown:?}");
         assert!(shown.iter().any(|text| text.starts_with("! `old")));

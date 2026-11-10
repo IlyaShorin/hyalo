@@ -4,7 +4,7 @@
 
 use toml_edit::{Array, DocumentMut, Item, Table, Value};
 
-use super::{List, Problem, Written, written};
+use super::{List, Problem, Why, Written, written};
 use crate::hotkey::Hotkey;
 
 /// One change to the settings.
@@ -25,7 +25,7 @@ pub enum Refusal {
     /// fixed.
     Broken(Problem),
     /// The change would make the settings wrong, for this reason.
-    Wrong(String),
+    Wrong(Why),
 }
 
 /// `text` with `change` made in it, and only there; `text` as it is
@@ -36,7 +36,7 @@ pub fn edit(text: &str, change: &Change) -> Result<String, Refusal> {
     // well parses here too.
     let mut document: DocumentMut = text
         .parse()
-        .map_err(|error: toml_edit::TomlError| Refusal::Wrong(error.to_string()))?;
+        .map_err(|error: toml_edit::TomlError| Refusal::Wrong(Why::Toml(error.to_string())))?;
     let changed = match change {
         Change::Hotkey(hotkey) => set_hotkey(&mut document, *hotkey, before.hotkey),
         Change::Add(list, entry) => add(&mut document, &before, *list, entry),
@@ -46,7 +46,7 @@ pub fn edit(text: &str, change: &Change) -> Result<String, Refusal> {
         return Ok(text.to_string());
     }
     let after = line_endings(text, document.to_string());
-    written(&after).map_err(|problem| Refusal::Wrong(problem.message))?;
+    written(&after).map_err(|problem| Refusal::Wrong(problem.why))?;
     Ok(after)
 }
 
@@ -397,12 +397,12 @@ mod tests {
         let Err(Refusal::Wrong(why)) = refused else {
             panic!("{refused:?}");
         };
-        assert!(why.contains(r"`old\stuff`"), "{why}");
+        assert!(why.to_string().contains(r"`old\stuff`"), "{why}");
         let refused = edit(DEFAULT, &add(List::Exclude, r"C:\"));
         let Err(Refusal::Wrong(why)) = refused else {
             panic!("{refused:?}");
         };
-        assert!(why.contains("full path"), "{why}");
+        assert!(why.to_string().contains("full path"), "{why}");
         assert!(matches!(
             edit(DEFAULT, &add(List::RankHigher, "")),
             Err(Refusal::Wrong(_))

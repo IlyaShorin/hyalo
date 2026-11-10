@@ -7,6 +7,8 @@
 
 use std::fmt;
 
+use crate::text::{Language, Text};
+
 /// The `MOD_*` bits of `RegisterHotKey`.
 const ALT: u8 = 0x1;
 const CTRL: u8 = 0x2;
@@ -82,12 +84,54 @@ impl Default for Hotkey {
     }
 }
 
+/// What is wrong with a hotkey's name, or with the keys pressed for one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Wrong {
+    /// This modifier is named twice.
+    Twice(String),
+    /// This part names no key hyalo knows.
+    Unknown(String),
+    /// Two keys are named, where a hotkey has one.
+    TwoKeys(String, String),
+    Empty,
+    /// This name has modifiers and no key.
+    NoKey(String),
+    /// This hotkey's key is one the user types, and it has no Ctrl, Alt
+    /// or Win.
+    Bare(String),
+    /// A key was pressed that hyalo has no name for.
+    Unnamed,
+}
+
+impl Wrong {
+    /// What is wrong, in `language`.
+    pub fn said(&self, language: Language) -> String {
+        let (text, words): (Text, &[&str]) = match self {
+            Wrong::Twice(part) => (Text::Twice, &[part]),
+            Wrong::Unknown(part) => (Text::UnknownKey, &[part]),
+            Wrong::TwoKeys(first, second) => (Text::TwoKeys, &[first, second]),
+            Wrong::Empty => (Text::EmptyHotkey, &[]),
+            Wrong::NoKey(name) => (Text::NoKey, &[name]),
+            Wrong::Bare(name) => (Text::Bare, &[name]),
+            Wrong::Unnamed => (Text::Unnamed, &[]),
+        };
+        language.fill(text, words)
+    }
+}
+
+impl fmt::Display for Wrong {
+    /// What is wrong, in English.
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.write_str(&self.said(Language::English))
+    }
+}
+
 impl Hotkey {
     /// Reads a name such as `Ctrl+Shift+K`: modifiers in any order and
     /// any case, then or among them one key. A hotkey needs Ctrl, Alt or
     /// Win, unless its key is F1 to F24: Shift alone, or no modifier,
     /// would take a key the user types.
-    pub fn parse(text: &str) -> Result<Hotkey, String> {
+    pub fn parse(text: &str) -> Result<Hotkey, Wrong> {
         let parts = text
             .split('+')
             .map(str::trim)
@@ -95,7 +139,7 @@ impl Hotkey {
         let (mut modifiers, mut key) = (0, None);
         for part in parts {
             match modifier(part) {
-                Some(bit) if modifiers & bit != 0 => return Err(format!("`{part}` twice")),
+                Some(bit) if modifiers & bit != 0 => return Err(Wrong::Twice(part.to_string())),
                 Some(bit) => modifiers |= bit,
                 None => key = Some(one_key(key, part)?),
             }
@@ -106,9 +150,9 @@ impl Hotkey {
     /// The hotkey made of the keys a user pressed: `modifiers` as
     /// `MOD_*` bits and the virtual-key code `key`, held to the rules a
     /// name is held to. A key with no name here is refused.
-    pub fn from_keys(modifiers: u32, key: u16) -> Result<Hotkey, String> {
+    pub fn from_keys(modifiers: u32, key: u16) -> Result<Hotkey, Wrong> {
         if !known(key) {
-            return Err("hyalo has no name for that key: choose another".to_string());
+            return Err(Wrong::Unnamed);
         }
         let modifiers = (modifiers & u32::from(ALT | CTRL | SHIFT | WIN)) as u8;
         let name = Hotkey { modifiers, key }.to_string();
@@ -149,27 +193,22 @@ fn modifier(part: &str) -> Option<u8> {
 }
 
 /// The key `part` names, when no key came before it.
-fn one_key(before: Option<u16>, part: &str) -> Result<u16, String> {
-    let key = key_code(part).ok_or_else(|| format!("`{part}` is not a key hyalo knows"))?;
+fn one_key(before: Option<u16>, part: &str) -> Result<u16, Wrong> {
+    let key = key_code(part).ok_or_else(|| Wrong::Unknown(part.to_string()))?;
     match before {
-        Some(first) => Err(format!(
-            "two keys, `{}` and `{part}`: a hotkey has one",
-            key_name(first)
-        )),
+        Some(first) => Err(Wrong::TwoKeys(key_name(first), part.to_string())),
         None => Ok(key),
     }
 }
 
 /// The hotkey made of `modifiers` and `key`, if it is one a user can have.
-fn checked(modifiers: u8, key: Option<u16>, text: &str) -> Result<Hotkey, String> {
+fn checked(modifiers: u8, key: Option<u16>, text: &str) -> Result<Hotkey, Wrong> {
     if text.trim().is_empty() {
-        return Err("the hotkey is empty".to_string());
+        return Err(Wrong::Empty);
     }
-    let key = key.ok_or_else(|| format!("no key after the modifiers in `{text}`"))?;
+    let key = key.ok_or_else(|| Wrong::NoKey(text.to_string()))?;
     if modifiers & (CTRL | ALT | WIN) == 0 && function_key(key).is_none() {
-        return Err(format!(
-            "`{text}` needs Ctrl, Alt or Win: only F1 to F24 do without"
-        ));
+        return Err(Wrong::Bare(text.to_string()));
     }
     Ok(Hotkey { modifiers, key })
 }
@@ -227,7 +266,7 @@ mod tests {
     }
 
     fn refused(text: &str) -> String {
-        Hotkey::parse(text).expect_err("not a hotkey")
+        Hotkey::parse(text).expect_err("not a hotkey").to_string()
     }
 
     #[test]
@@ -306,7 +345,10 @@ mod tests {
     }
 
     fn heard(modifiers: u32, key: u16) -> Result<String, String> {
-        Hotkey::from_keys(modifiers, key).map(|hotkey| hotkey.to_string())
+        let heard = Hotkey::from_keys(modifiers, key);
+        heard
+            .map(|hotkey| hotkey.to_string())
+            .map_err(|wrong| wrong.to_string())
     }
 
     #[test]
@@ -344,6 +386,37 @@ mod tests {
                 refused.contains("no name for that key"),
                 "{key:#x}: {refused}"
             );
+        }
+    }
+
+    #[test]
+    fn what_is_wrong_is_said_in_either_language() {
+        let wrong = Hotkey::parse("Shift+K").expect_err("not a hotkey");
+        assert_eq!(wrong, Wrong::Bare("Shift+K".to_string()));
+        assert_eq!(
+            wrong.said(Language::Russian),
+            "к `Shift+K` нужно добавить Ctrl, Alt или Win: без них обходятся только F1–F24"
+        );
+        let two = Hotkey::parse("Ctrl+K+L").expect_err("not a hotkey");
+        assert_eq!(
+            two.said(Language::Russian),
+            "две клавиши, `K` и `L`, а в сочетании нужна одна"
+        );
+        let all = [
+            (Hotkey::parse("Ctrl+Ctrl+K"), "`Ctrl` указано дважды"),
+            (Hotkey::parse("Ctrl+Kay"), "hyalo не знает клавишу `Kay`"),
+            (Hotkey::parse(""), "сочетание клавиш не задано"),
+            (
+                Hotkey::parse("Ctrl+Alt"),
+                "в `Ctrl+Alt` нет клавиши после модификаторов",
+            ),
+            (
+                Hotkey::from_keys(0, 0x60),
+                "у этой клавиши нет имени в hyalo: выберите другую",
+            ),
+        ];
+        for (refused, said) in all {
+            assert_eq!(refused.expect_err("refused").said(Language::Russian), said);
         }
     }
 

@@ -14,7 +14,7 @@ use std::path::Path;
 use std::rc::Rc;
 use std::time::Instant;
 
-use hyalo_core::config::{self, Change, List, Problem, Refusal};
+use hyalo_core::config::{self, Change, List, Problem, Refusal, Why};
 use hyalo_core::item::Action;
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Dwm::{
@@ -479,7 +479,7 @@ impl App {
             || {
                 Err(Problem {
                     line: 1,
-                    message: "config.toml cannot be read".to_string(),
+                    why: Why::Unreadable,
                 })
             },
             settings::written,
@@ -549,14 +549,14 @@ impl App {
         };
         let before = self.hotkey();
         if let Change::Hotkey(hotkey) = change {
-            let taken = |_| Refusal::Wrong(format!("{hotkey} is taken by another app"));
+            let taken = |_| Refusal::Wrong(Why::Taken(*hotkey));
             self.bind(*hotkey).map_err(taken)?;
         }
         if let Err(error) = settings::write(path, &text) {
             if let Some(before) = before {
                 let _ = self.bind(before);
             }
-            return Err(Refusal::Wrong(format!("cannot save config.toml: {error}")));
+            return Err(Refusal::Wrong(Why::Unsaved(error.to_string())));
         }
         Ok(Some(text))
     }
