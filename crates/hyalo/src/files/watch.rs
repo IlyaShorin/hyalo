@@ -53,6 +53,10 @@ const WATCHED: FILE_NOTIFY_CHANGE = FILE_NOTIFY_CHANGE(
         | FILE_NOTIFY_CHANGE_LAST_WRITE.0,
 );
 
+/// How long changes gather between two reads, so a burst of them comes
+/// in one batch: one wakeup for the provider, not one for each name.
+const GATHER: Duration = Duration::from_millis(100);
+
 /// How long a watch waits before it looks whether it is to stop, and
 /// before it tries again to open a root it could not.
 const PATIENCE: Duration = Duration::from_millis(500);
@@ -183,14 +187,19 @@ impl Directory {
         set: &mut Option<Sender<()>>,
     ) -> Ended {
         let mut worked = false;
-        loop {
+        // Before every read: on a busy drive the wait never times out.
+        while !stop.load(Ordering::SeqCst) {
             match self.read(top, buffer, tell, stop, set) {
-                Ok(()) => worked = true,
+                Ok(()) => {
+                    worked = true;
+                    thread::sleep(GATHER);
+                }
                 // Refused after it worked: broken, so tried again.
                 Err(Ended::Refused) if worked => return Ended::Broken,
                 Err(ended) => return ended,
             }
         }
+        Ended::Stopped
     }
 
     /// Reads one batch of changes into `buffer` and tells of it.
@@ -593,6 +602,50 @@ mod tests {
         let seen = gathered(&events, |seen| records_of(seen).len() >= expected.len());
         drop(watch);
         assert_eq!(records_of(&seen), expected);
+    }
+
+    #[test]
+    fn a_burst_of_changes_comes_in_a_few_batches() {
+        let folder = Scratch::new("watch-burst");
+        let (watch, events) = watching(&folder.0);
+        for n in 0..50 {
+            fs::write(folder.0.join(format!("{n}.txt")), b"x").expect("write");
+        }
+        let made = |seen: &[Event]| {
+            let added = records_of(seen)
+                .into_iter()
+                .filter(|record| record.0 == Action::Added);
+            added.count()
+        };
+        let seen = gathered(&events, |seen| made(seen) == 50);
+        drop(watch);
+        assert_eq!(made(&seen), 50);
+        assert!(seen.len() <= 5, "{} batches", seen.len());
+    }
+
+    #[test]
+    fn a_watch_stops_when_dropped_while_changes_keep_coming() {
+        let folder = Scratch::new("watch-busy");
+        let (watch, _events) = watching(&folder.0);
+        let busy = Arc::new(AtomicBool::new(true));
+        let (going, path) = (Arc::clone(&busy), folder.0.join("busy.txt"));
+        let writer = thread::spawn(move || {
+            let mut count = 0_u64;
+            while going.load(Ordering::SeqCst) {
+                let _ = fs::write(&path, count.to_string());
+                count += 1;
+            }
+        });
+        thread::sleep(PATIENCE);
+        let (dropped, done) = mpsc::channel();
+        thread::spawn(move || {
+            drop(watch);
+            let _ = dropped.send(());
+        });
+        let stopped = done.recv_timeout(4 * PATIENCE).is_ok();
+        busy.store(false, Ordering::SeqCst);
+        writer.join().expect("the writer");
+        assert!(stopped, "still watching");
     }
 
     #[test]
