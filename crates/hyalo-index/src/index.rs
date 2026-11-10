@@ -112,6 +112,9 @@ pub(crate) struct Parts {
     pub(crate) entries: Vec<Entry>,
     pub(crate) names: String,
     pub(crate) free: Vec<u32>,
+    /// One for each entry.
+    pub(crate) sizes: Vec<u64>,
+    pub(crate) times: Vec<u32>,
 }
 
 /// The end of a list of entries, or a folder with none.
@@ -141,6 +144,10 @@ pub struct Index {
     pub(crate) entries: Vec<Entry>,
     /// Beside each entry, its place among its folder's entries.
     links: Vec<Links>,
+    /// Beside each entry, the bytes it holds, and when it was last
+    /// written, in seconds since 1970.
+    pub(crate) sizes: Vec<u64>,
+    pub(crate) times: Vec<u32>,
     /// The first root; the roots are listed as a folder's entries are.
     top: u32,
     /// Every name, one after another, as given.
@@ -160,6 +167,8 @@ impl Default for Index {
         Index {
             entries: Vec::new(),
             links: Vec::new(),
+            sizes: Vec::new(),
+            times: Vec::new(),
             top: NONE,
             names: String::new(),
             folded: String::new(),
@@ -253,6 +262,27 @@ impl Index {
 
     pub fn is_folder(&self, id: EntryId) -> Option<bool> {
         Some(self.live(id).ok()?.is_folder())
+    }
+
+    /// Sets how many bytes the entry holds and when it was last written,
+    /// in seconds since 1970.
+    pub fn set_stat(&mut self, id: EntryId, size: u64, written: i64) -> Result<(), Error> {
+        self.live(id)?;
+        let at = id.0 as usize;
+        let written = written.clamp(0, i64::from(u32::MAX)) as u32;
+        if (self.sizes[at], self.times[at]) != (size, written) {
+            (self.sizes[at], self.times[at]) = (size, written);
+            self.version += 1;
+        }
+        Ok(())
+    }
+
+    /// How many bytes the entry holds and when it was last written: none
+    /// and 1970 until told.
+    pub fn stat(&self, id: EntryId) -> Option<(u64, i64)> {
+        self.live(id).ok()?;
+        let at = id.0 as usize;
+        Some((self.sizes[at], i64::from(self.times[at])))
     }
 
     /// The folder the entry is in; none for a root, or an entry removed.
@@ -355,6 +385,8 @@ impl Index {
     pub fn shrink_to_fit(&mut self) {
         self.entries.shrink_to_fit();
         self.links.shrink_to_fit();
+        self.sizes.shrink_to_fit();
+        self.times.shrink_to_fit();
         self.names.shrink_to_fit();
         self.folded.shrink_to_fit();
         self.free.shrink_to_fit();
@@ -364,6 +396,8 @@ impl Index {
     pub fn memory(&self) -> usize {
         self.entries.capacity() * size_of::<Entry>()
             + self.links.capacity() * size_of::<Links>()
+            + self.sizes.capacity() * size_of::<u64>()
+            + self.times.capacity() * size_of::<u32>()
             + self.names.capacity()
             + self.folded.capacity()
             + self.free.capacity() * size_of::<u32>()
@@ -386,8 +420,14 @@ impl Index {
             entries: parts.entries,
             names: parts.names,
             free: parts.free,
+            sizes: parts.sizes,
+            times: parts.times,
             ..Index::default()
         };
+        let beside = |length: usize| length == index.entries.len();
+        if !(beside(index.sizes.len()) && beside(index.times.len())) {
+            return None;
+        }
         let sound = index.entries.iter().all(|&entry| index.sound(entry));
         let whole = sound && index.rooted() && index.free_is_removed();
         if !(whole && index.rebuild(Fold::Again)) {
@@ -546,11 +586,14 @@ impl Index {
             Some(at) => {
                 self.entries[at as usize] = entry;
                 self.links[at as usize] = UNLINKED;
+                (self.sizes[at as usize], self.times[at as usize]) = (0, 0);
                 at
             }
             None => {
                 self.entries.push(entry);
                 self.links.push(UNLINKED);
+                self.sizes.push(0);
+                self.times.push(0);
                 offset(self.entries.len() - 1)
             }
         };
@@ -996,6 +1039,45 @@ mod tests {
     }
 
     #[test]
+    fn an_entry_holds_its_size_and_last_write_and_a_new_one_neither() {
+        let (mut index, [c, _, me, notes, ..]) = drive();
+        assert_eq!(index.stat(notes), Some((0, 0)));
+        assert_eq!(index.set_stat(notes, 5_000_000_000, 1_794_310_200), Ok(()));
+        assert_eq!(index.stat(notes), Some((5_000_000_000, 1_794_310_200)));
+        index.rename(notes, c, "moved.txt").unwrap();
+        assert_eq!(
+            index.stat(notes),
+            Some((5_000_000_000, 1_794_310_200)),
+            "kept on a move"
+        );
+        index.remove(notes).unwrap();
+        assert_eq!(index.stat(notes), None);
+        assert_eq!(index.set_stat(notes, 1, 1), Err(Error::NoSuchEntry));
+        let next = index.add(me, "next.txt", false).unwrap();
+        assert_eq!(next, notes, "the place given again");
+        assert_eq!(index.stat(next), Some((0, 0)), "but not what was in it");
+    }
+
+    #[test]
+    fn a_last_write_is_kept_in_seconds_from_1970_to_2106() {
+        let (mut index, [.., notes, _, _]) = drive();
+        index.set_stat(notes, 1, -5).unwrap();
+        assert_eq!(index.stat(notes), Some((1, 0)));
+        index.set_stat(notes, 1, i64::MAX).unwrap();
+        assert_eq!(index.stat(notes), Some((1, i64::from(u32::MAX))));
+    }
+
+    #[test]
+    fn the_version_moves_when_a_size_or_time_changes() {
+        let (mut index, [.., notes, _, _]) = drive();
+        let before = index.version();
+        index.set_stat(notes, 0, 0).unwrap();
+        assert_eq!(index.version(), before, "the same");
+        index.set_stat(notes, 0, 10).unwrap();
+        assert_ne!(index.version(), before);
+    }
+
+    #[test]
     fn an_entry_is_sixteen_bytes() {
         assert_eq!(size_of::<Entry>(), 16);
     }
@@ -1015,9 +1097,9 @@ mod tests {
         let (mut index, [_, _, _, notes, ..]) = drive();
         index.remove(notes).unwrap();
         index.shrink_to_fit();
-        // Six entries and their links; C:, Users, Me, notes.txt, Windows,
-        // System32 twice; one free place.
-        assert_eq!(index.memory(), 6 * (16 + 12) + 2 * 33 + 4);
+        // Six entries, their links, sizes and times; C:, Users, Me,
+        // notes.txt, Windows, System32 twice; one free place.
+        assert_eq!(index.memory(), 6 * (16 + 12 + 12) + 2 * 33 + 4);
         assert_eq!(
             index.path(EntryId(5)).as_deref(),
             Some(r"C:\Windows\System32")

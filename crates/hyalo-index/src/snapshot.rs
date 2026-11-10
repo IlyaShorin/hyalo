@@ -2,7 +2,8 @@
 //!
 //! Little-endian: the magic `HYALOIDX`, a version, three lengths
 //! (entries, bytes of names, free places), then each part as it lies in
-//! memory. The folded names are not kept: loading folds the names again,
+//! memory: entries, names, free places, then each entry's size (8 bytes)
+//! and last write (4). The folded names are not kept: loading folds the names again,
 //! which also makes sure the copy matches. A snapshot is checked where it
 //! comes in; one that is damaged, cut short or of another version is
 //! refused, never trusted.
@@ -14,8 +15,9 @@ use crate::index::{Entry, Parts};
 
 const MAGIC: &[u8; 8] = b"HYALOIDX";
 
-/// Changes with the format, and with the way names are folded.
-const VERSION: u32 = 1;
+/// Changes with the format, and with the way names are folded. 2: sizes
+/// and times.
+const VERSION: u32 = 2;
 
 /// Why a snapshot was refused.
 #[derive(Debug)]
@@ -37,7 +39,13 @@ impl Index {
             .try_for_each(|entry| out.write_all(&entry.to_bytes()))?;
         out.write_all(names.as_bytes())?;
         free.iter()
-            .try_for_each(|at| out.write_all(&at.to_le_bytes()))
+            .try_for_each(|at| out.write_all(&at.to_le_bytes()))?;
+        let sizes = self.sizes.iter().map(|size| size.to_le_bytes());
+        sizes
+            .into_iter()
+            .try_for_each(|size| out.write_all(&size))?;
+        let times = self.times.iter().map(|time| time.to_le_bytes());
+        times.into_iter().try_for_each(|time| out.write_all(&time))
     }
 
     /// Reads back what `save` wrote, all of it and nothing after.
@@ -47,6 +55,8 @@ impl Index {
         let entries = exactly(input, entries * 16)?;
         let names = String::from_utf8(exactly(input, names)?).map_err(|_| LoadError::Damaged)?;
         let free = exactly(input, free * 4)?;
+        let sizes = exactly(input, entries.len() / 16 * 8)?;
+        let times = exactly(input, entries.len() / 16 * 4)?;
         ended(input)?;
         let entries = entries.as_chunks::<16>().0.iter();
         let free = free.as_chunks::<4>().0.iter();
@@ -54,6 +64,18 @@ impl Index {
             entries: entries.map(|&bytes| Entry::from_bytes(bytes)).collect(),
             names,
             free: free.map(|&bytes| u32::from_le_bytes(bytes)).collect(),
+            sizes: sizes
+                .as_chunks::<8>()
+                .0
+                .iter()
+                .map(|&bytes| u64::from_le_bytes(bytes))
+                .collect(),
+            times: times
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|&bytes| u32::from_le_bytes(bytes))
+                .collect(),
         };
         Index::from_parts(parts).ok_or(LoadError::Damaged)
     }
@@ -183,12 +205,32 @@ mod tests {
     }
 
     #[test]
+    fn sizes_and_times_load_back_the_same() {
+        let mut index = small();
+        let a = index.find(r"C:\a").expect("a");
+        index.set_stat(a, 4096, 1_700_000_000).unwrap();
+        let tree = index.find(r"C:\a\Ёлка.txt").expect("tree");
+        index.set_stat(tree, u64::MAX, 7).unwrap();
+        let back = loaded(&saved(&index)).expect("load");
+        assert_eq!(back.stat(a), Some((4096, 1_700_000_000)));
+        assert_eq!(back.stat(tree), Some((u64::MAX, 7)));
+        assert_eq!(back.stat(EntryId(0)), Some((0, 0)));
+    }
+
+    #[test]
+    fn a_snapshot_of_the_first_version_is_refused_and_walked_again() {
+        let mut bytes = saved(&small());
+        bytes[8..12].copy_from_slice(&1_u32.to_le_bytes());
+        assert!(matches!(loaded(&bytes), Err(LoadError::Foreign)));
+    }
+
+    #[test]
     fn loading_takes_no_more_memory_than_it_needs() {
         let back = loaded(&saved(&small())).expect("load");
-        // Four entries and their links; C:, a and Ёлка.txt as given and
-        // folded (the name of the one removed is not loaded); one free
-        // place.
-        assert_eq!(back.memory(), 4 * (16 + 12) + 15 + 15 + 4);
+        // Four entries, their links, sizes and times; C:, a and Ёлка.txt
+        // as given and folded (the name of the one removed is not
+        // loaded); one free place.
+        assert_eq!(back.memory(), 4 * (16 + 12 + 12) + 15 + 15 + 4);
     }
 
     #[test]
@@ -310,8 +352,10 @@ mod tests {
 
     #[test]
     fn a_free_place_must_be_a_removed_entry_listed_once() {
+        // Each entry's size and time come after the free places.
+        let after = |index: &Index| index.entries.len() * (8 + 4);
         let bytes = saved(&small());
-        let free = bytes.len() - 4;
+        let free = bytes.len() - after(&small()) - 4;
         assert!(damaged(&with(&bytes, free, 1)), "a live entry");
         assert!(damaged(&with(&bytes, free, 9)), "past the end");
         let mut index = small();
@@ -321,9 +365,9 @@ mod tests {
         index.remove(x).unwrap();
         index.remove(y).unwrap();
         let mut index_bytes = saved(&index);
-        let len = index_bytes.len();
+        let len = index_bytes.len() - after(&index);
         let first = index_bytes[len - 8..len - 4].to_vec();
-        index_bytes[len - 4..].copy_from_slice(&first);
+        index_bytes[len - 4..len].copy_from_slice(&first);
         assert!(damaged(&index_bytes), "listed twice");
     }
 
