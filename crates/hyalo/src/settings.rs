@@ -439,7 +439,9 @@ mod tests {
         let (_settings, listening, watcher) = watching(&path);
         let started = Instant::now();
         stop(&listening, watcher);
-        assert!(started.elapsed() < Duration::from_secs(2));
+        // It asks every half second; the room beyond that is for a
+        // machine busy with mutation testing, eight suites at once.
+        assert!(started.elapsed() < Duration::from_secs(5));
     }
 
     #[test]
