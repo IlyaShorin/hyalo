@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 
 use hyalo_core::item::{Item, ItemId};
 use hyalo_core::rates::Rates;
+use hyalo_core::update::{Failure, Release};
 use windows::core::Result;
 
 use crate::apps::{self, Icon};
@@ -28,6 +29,11 @@ pub enum Found {
     /// launcher reads the settings from them, the settings window what
     /// they write.
     Config(Vec<u8>),
+    /// GitHub's answer about the latest release: the release, if it is
+    /// one hyalo can install, or why GitHub could not be asked.
+    Latest(std::result::Result<Option<Release>, String>),
+    /// How installing an update went.
+    Installed(std::result::Result<(), Failure>),
 }
 
 /// What the window asks a provider for.
@@ -70,8 +76,9 @@ impl Catalog {
             Found::Files => {}
             Found::Picked(items) => items.into_iter().for_each(|item| self.pick(item)),
             Found::Rates(rates) => self.rates = Some(rates),
-            // The window puts settings in force; there is nothing to list.
-            Found::Config(_) => {}
+            // The window puts settings in force and updates hyalo; there
+            // is nothing to list.
+            Found::Config(_) | Found::Latest(_) | Found::Installed(_) => {}
         }
     }
 

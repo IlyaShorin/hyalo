@@ -684,11 +684,12 @@ mod tests {
 
     use super::*;
     use crate::page::lay_out;
-    use crate::panel::Panel;
+    use crate::panel::{Panel, Versions};
     use crate::recorder::Mods;
     use crate::reference::assert_looks_like;
     use crate::surface::{Canvas, Frame};
     use crate::test_desktop::on_hidden_desktop;
+    use hyalo_core::update::{Progress, Release, Update, Version};
 
     /// What `panel` looks like `width` by `height` pixels at `dpi`, its
     /// scroll kept within the page, as the window keeps it.
@@ -733,6 +734,49 @@ mod tests {
             panel.hover(Some(Target::Language(Language::English)));
             let frame = painted(&mut panel, (640, 1040), 96);
             assert_looks_like("settings-ru-100", &frame);
+        });
+    }
+
+    /// A panel on the default file, in `language`, telling of hyalo
+    /// 0.0.2 with its notes, while 0.0.1 runs.
+    fn offering(language: Language) -> Panel {
+        let text = config::default_file(language);
+        let mut panel = Panel::new(Ok(written(&text)), Some(true), Language::English);
+        let notes = "## What's new\n\
+                     * hyalo updates itself from GitHub Releases\n\
+                     * The download is checked against its SHA-256 before it is swapped in, \
+                       and the old build comes back if the new one cannot start";
+        let version = |text| Version::parse(text).expect("a version");
+        panel.set_updates(Some(Versions {
+            current: version("0.0.1"),
+            update: Some(Update {
+                release: Release {
+                    version: version("0.0.2"),
+                    notes: notes.to_string(),
+                    exe: String::new(),
+                    sum: String::new(),
+                },
+                progress: Progress::Offered,
+            }),
+        }));
+        panel
+    }
+
+    #[test]
+    fn a_newer_release_at_100_percent() {
+        on_hidden_desktop(|| {
+            let mut panel = offering(Language::English);
+            let frame = painted(&mut panel, (640, 400), 96);
+            assert_looks_like("settings-update-100", &frame);
+        });
+    }
+
+    #[test]
+    fn a_newer_release_in_russian_at_100_percent() {
+        on_hidden_desktop(|| {
+            let mut panel = offering(Language::Russian);
+            let frame = painted(&mut panel, (640, 400), 96);
+            assert_looks_like("settings-update-ru-100", &frame);
         });
     }
 

@@ -7,6 +7,7 @@ use std::sync::OnceLock;
 
 use hyalo_core::hotkey::Hotkey;
 use hyalo_core::text::{Language, Text};
+use hyalo_core::update::{Progress, Update};
 use windows::Win32::Foundation::{HWND, LPARAM, POINT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::{GetDpiForSystem, GetSystemMetricsForDpi};
@@ -29,6 +30,7 @@ pub enum Command {
     Settings = 2,
     StartWithWindows = 3,
     Exit = 4,
+    Install = 5,
 }
 
 impl Command {
@@ -39,6 +41,7 @@ impl Command {
             Command::Settings,
             Command::StartWithWindows,
             Command::Exit,
+            Command::Install,
         ];
         all.into_iter().find(|&command| command as usize == id)
     }
@@ -70,10 +73,16 @@ pub enum Line {
 }
 
 /// The menu: Show (with the hotkey that does it, if one is registered),
-/// Settings, Start with Windows (checked when hyalo starts with Windows;
-/// grayed when `starts` is `None`, as for a build that may not start with
-/// Windows), Exit; in `language`.
-pub fn menu(hotkey: Option<Hotkey>, starts: Option<bool>, language: Language) -> Vec<Line> {
+/// the install of a newer release, if there is one (grayed while it
+/// installs), Settings, Start with Windows (checked when hyalo starts
+/// with Windows; grayed when `starts` is `None`, as for a build that may
+/// not start with Windows), Exit; in `language`.
+pub fn menu(
+    hotkey: Option<Hotkey>,
+    starts: Option<bool>,
+    update: Option<&Update>,
+    language: Language,
+) -> Vec<Line> {
     let show = language.say(Text::Show);
     let show = match hotkey {
         // A tab puts the keys on the right, as menus show shortcuts.
@@ -86,14 +95,34 @@ pub fn menu(hotkey: Option<Hotkey>, starts: Option<bool>, language: Language) ->
         checked: starts == Some(true),
         enabled: starts.is_some(),
     });
-    vec![
-        Command::Show.entry(show),
-        Line::Separator,
-        Command::Settings.entry(language.say(Text::Settings).to_string()),
-        start,
-        Line::Separator,
-        Command::Exit.entry(language.say(Text::Exit).to_string()),
-    ]
+    let install = update.map(|update| install(update, language));
+    let show = Command::Show.entry(show);
+    let lines = [Some(show), install, Some(Line::Separator)]
+        .into_iter()
+        .flatten();
+    lines
+        .chain([
+            Command::Settings.entry(language.say(Text::Settings).to_string()),
+            start,
+            Line::Separator,
+            Command::Exit.entry(language.say(Text::Exit).to_string()),
+        ])
+        .collect()
+}
+
+/// The entry that installs `update`, grayed while it installs.
+fn install(update: &Update, language: Language) -> Line {
+    let installing = update.progress == Progress::Installing;
+    let label = match installing {
+        true => Text::Installing,
+        false => Text::InstallUpdate,
+    };
+    Line::Entry(Entry {
+        command: Command::Install,
+        label: language.fill(label, &[&update.release.version.to_string()]),
+        checked: false,
+        enabled: !installing,
+    })
 }
 
 /// The longest tooltip the notification area shows, in UTF-16 units.
@@ -272,6 +301,45 @@ fn flags(entry: &Entry) -> MENU_ITEM_FLAGS {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hyalo_core::update::{Progress, Release, Update, Version};
+
+    fn update(progress: Progress) -> Update {
+        Update {
+            release: Release {
+                version: Version::parse("0.0.2").expect("a version"),
+                notes: String::new(),
+                exe: String::new(),
+                sum: String::new(),
+            },
+            progress,
+        }
+    }
+
+    #[test]
+    fn a_newer_release_puts_its_install_under_show() {
+        let offered = update(Progress::Offered);
+        let lines = menu(None, None, Some(&offered), Language::English);
+        let install = entry(&lines, Command::Install);
+        assert_eq!(install.label, "Install hyalo 0.0.2");
+        assert!(install.enabled);
+        assert_eq!(lines[1], Line::Entry(install), "right under Show");
+        assert_eq!(lines.len(), 7);
+        let installing = update(Progress::Installing);
+        let lines = menu(None, None, Some(&installing), Language::Russian);
+        let install = entry(&lines, Command::Install);
+        assert_eq!(install.label, "Устанавливается hyalo 0.0.2…");
+        assert!(!install.enabled, "once is enough");
+        let lines = menu(None, None, None, Language::English);
+        let commands = lines.iter().filter_map(|line| match line {
+            Line::Entry(entry) => Some(entry.command),
+            Line::Separator => None,
+        });
+        assert!(!commands.collect::<Vec<_>>().contains(&Command::Install));
+        assert_eq!(
+            Command::from_id(Command::Install as usize),
+            Some(Command::Install)
+        );
+    }
     use crate::test_desktop::on_hidden_desktop;
     use windows::Win32::Graphics::Gdi::{
         BI_RGB, BITMAPINFO, BITMAPINFOHEADER, DIB_RGB_COLORS, DeleteObject, GetDC, GetDIBits,
@@ -297,7 +365,7 @@ mod tests {
 
     #[test]
     fn the_menu_shows_settings_start_with_windows_and_exit() {
-        let lines = menu(alt_space(), Some(false), Language::English);
+        let lines = menu(alt_space(), Some(false), None, Language::English);
         let labels: Vec<Option<&str>> = lines
             .iter()
             .map(|line| match line {
@@ -323,7 +391,7 @@ mod tests {
 
     #[test]
     fn the_menu_speaks_russian_in_russian() {
-        let lines = menu(alt_space(), Some(false), Language::Russian);
+        let lines = menu(alt_space(), Some(false), None, Language::Russian);
         let labels: Vec<&str> = lines
             .iter()
             .filter_map(|line| match line {
@@ -338,41 +406,47 @@ mod tests {
             "Выход",
         ];
         assert_eq!(labels, expected);
-        let show = entry(&menu(None, None, Language::Russian), Command::Show);
+        let show = entry(&menu(None, None, None, Language::Russian), Command::Show);
         assert_eq!(show.label, "Показать hyalo");
     }
 
     #[test]
     fn show_names_no_hotkey_when_none_is_registered() {
         assert_eq!(
-            entry(&menu(None, None, Language::English), Command::Show).label,
+            entry(&menu(None, None, None, Language::English), Command::Show).label,
             "Show hyalo"
         );
         let ctrl_k = Hotkey::parse("Ctrl+K").ok();
-        let show = entry(&menu(ctrl_k, None, Language::English), Command::Show);
+        let show = entry(&menu(ctrl_k, None, None, Language::English), Command::Show);
         assert_eq!(show.label, "Show hyalo\tCtrl+K");
     }
 
     #[test]
     fn start_with_windows_is_checked_when_it_does_and_grayed_when_it_may_not() {
         let on = entry(
-            &menu(alt_space(), Some(true), Language::English),
+            &menu(alt_space(), Some(true), None, Language::English),
             Command::StartWithWindows,
         );
         assert!(on.checked && on.enabled);
         let off = entry(
-            &menu(alt_space(), Some(false), Language::English),
+            &menu(alt_space(), Some(false), None, Language::English),
             Command::StartWithWindows,
         );
         assert!(!off.checked && off.enabled);
         let unavailable = entry(
-            &menu(alt_space(), None, Language::English),
+            &menu(alt_space(), None, None, Language::English),
             Command::StartWithWindows,
         );
         assert!(!unavailable.checked && !unavailable.enabled);
         let others = [Command::Show, Command::Settings, Command::Exit];
         for command in others {
-            assert!(!entry(&menu(alt_space(), Some(true), Language::English), command).checked);
+            assert!(
+                !entry(
+                    &menu(alt_space(), Some(true), None, Language::English),
+                    command
+                )
+                .checked
+            );
         }
     }
 
@@ -383,12 +457,13 @@ mod tests {
             Command::Settings,
             Command::StartWithWindows,
             Command::Exit,
+            Command::Install,
         ];
         for command in all {
             assert_eq!(Command::from_id(command as usize), Some(command));
         }
         assert_eq!(Command::from_id(0), None);
-        assert_eq!(Command::from_id(5), None);
+        assert_eq!(Command::from_id(6), None);
     }
 
     #[test]
@@ -506,7 +581,7 @@ mod tests {
             unsafe { DestroyMenu(built) }.expect("destroy the menu");
             items
         };
-        let items = built(&menu(alt_space(), Some(true), Language::English));
+        let items = built(&menu(alt_space(), Some(true), None, Language::English));
         let show = (Some("Show hyalo	Alt+Space".to_string()), 1, false, false);
         assert_eq!(items[0], show);
         assert_eq!(items[1].0, None, "a separator");
@@ -515,7 +590,7 @@ mod tests {
         assert_eq!(items[3], start);
         assert_eq!(items[5], (Some("Exit".to_string()), 4, false, false));
         assert!(
-            built(&menu(alt_space(), None, Language::English))[3].3,
+            built(&menu(alt_space(), None, None, Language::English))[3].3,
             "grayed"
         );
     }

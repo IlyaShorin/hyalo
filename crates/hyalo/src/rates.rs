@@ -16,12 +16,7 @@ use crate::store;
 
 /// Where the bank publishes the day's rates.
 pub fn bank() -> Address {
-    Address {
-        host: "www.cbr.ru",
-        port: 443,
-        path: "/scripts/XML_daily.asp",
-        secure: true,
-    }
+    Address::https("www.cbr.ru", "/scripts/XML_daily.asp")
 }
 
 /// How long showing the launcher waits before looking at the rates again.
@@ -297,7 +292,12 @@ pub(crate) mod tests {
     #[test]
     fn the_rates_come_from_the_banks_own_site_over_https() {
         let bank = bank();
-        let address = (bank.host, bank.port, bank.path, bank.secure);
+        let address = (
+            bank.host.as_str(),
+            bank.port,
+            bank.path.as_str(),
+            bank.secure,
+        );
         assert_eq!(address, ("www.cbr.ru", 443, "/scripts/XML_daily.asp", true));
     }
 

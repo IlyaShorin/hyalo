@@ -23,6 +23,7 @@ use hyalo_core::item::{Action, Item, ItemId, Kind};
 use hyalo_core::places::Places;
 use hyalo_core::rank::Ranked;
 use hyalo_core::text::{Language, Text};
+use hyalo_core::update::{Checked, Failure, Progress, Release, Update};
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Globalization::GetUserDefaultUILanguage;
 use windows::Win32::Graphics::Dwm::{
@@ -47,7 +48,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     IDC_IBEAM, IsWindow, IsWindowVisible, LoadCursorW, MSG, PostMessageW, PostQuitMessage,
     RegisterClassExW, SM_CXDOUBLECLK, SM_CYDOUBLECLK, SW_HIDE, SW_SHOW, SWP_NOACTIVATE, SetCursor,
     SetForegroundWindow, SetWindowPos, ShowWindow, TranslateMessage, WA_INACTIVE, WM_ACTIVATE,
-    WM_APP, WM_CHAR, WM_CONTEXTMENU, WM_DESTROY, WM_HOTKEY, WM_KEYDOWN, WM_LBUTTONDBLCLK,
+    WM_APP, WM_CHAR, WM_CLOSE, WM_CONTEXTMENU, WM_DESTROY, WM_HOTKEY, WM_KEYDOWN, WM_LBUTTONDBLCLK,
     WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCCALCSIZE, WM_NCHITTEST, WM_SETCURSOR,
     WM_SYSCHAR, WM_SYSKEYDOWN, WM_SYSKEYUP, WNDCLASSEXW, WS_CAPTION, WS_EX_NOREDIRECTIONBITMAP,
     WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_THICKFRAME,
@@ -71,7 +72,8 @@ use crate::render::{Renderer, Row, Scene};
 use crate::results::{self, Listed, MAX_ROWS, Results};
 use crate::settings::{self, Loaded};
 use crate::tray::{self, Tray};
-use crate::{http, launch, rates, store};
+use crate::update::Updates;
+use crate::{http, launch, rates, store, update};
 
 mod settings_window;
 
@@ -148,6 +150,9 @@ pub struct Services {
     /// The language Windows is shown in: hyalo's own, unless the config
     /// names another.
     pub windows_language: Language,
+    /// Where newer releases come from and how one is installed; `None`
+    /// where hyalo does not update itself, as in a debug build.
+    pub updates: Option<Updates>,
 }
 
 impl Services {
@@ -195,6 +200,7 @@ impl Services {
             position: store::ours("LOCALAPPDATA", "position.txt"),
             // SAFETY: a plain call.
             windows_language: Language::of_windows(unsafe { GetUserDefaultUILanguage() }),
+            updates: Updates::real(),
         }
     }
 }
@@ -251,6 +257,10 @@ struct App {
     double: Option<(Instant, (i32, i32))>,
     /// Where the user dragged the launcher; `None` where it goes at first.
     position: Option<Position>,
+    /// How the last check for a newer release went.
+    checked: Checked,
+    /// The newer release GitHub named, and how far installing it came.
+    update: Option<Update>,
 }
 
 /// What the left button went down on.
@@ -329,6 +339,7 @@ impl App {
         self.leave_out(&config.exclude);
         self.find_if_stale();
         self.config = config;
+        self.check_for_update();
     }
 
     /// Tells the sources that walk folders what to leave out; what one of
@@ -346,11 +357,99 @@ impl App {
     }
 
     /// What to tell the user, if anything: a problem in the config comes
-    /// before a refused hotkey.
+    /// before a refused hotkey, and both before a newer release.
     fn notice(&self) -> Option<Notice> {
         let problem = self.problem.clone().map(Notice::Config);
         let kept = self.hotkey();
-        problem.or_else(|| self.refused.map(|wanted| Notice::Hotkey { wanted, kept }))
+        let refused = || self.refused.map(|wanted| Notice::Hotkey { wanted, kept });
+        let update = || {
+            let current = self.services.updates.as_ref()?.current;
+            let update = self.offered()?.clone();
+            Some(Notice::Update { update, current })
+        };
+        problem.or_else(refused).or_else(update)
+    }
+
+    /// The newer release hyalo tells of: none while checking is off.
+    fn offered(&self) -> Option<&Update> {
+        self.update
+            .as_ref()
+            .filter(|_| self.config.check_for_updates)
+    }
+
+    /// Asks GitHub for the latest release, on a thread of its own, when
+    /// hyalo updates itself, checking is on and a check is due.
+    fn check_for_update(&mut self) {
+        let Some(updates) = &self.services.updates else {
+            return;
+        };
+        if !self.config.check_for_updates || !self.checked.due(now().0) {
+            return;
+        }
+        self.checked = Checked::Asking;
+        let latest = updates.latest.clone();
+        let (sender, window) = (self.found.0.clone(), self.hwnd.0 as isize);
+        std::thread::spawn(move || {
+            let answer = latest().map(|json| Release::parse(&json));
+            hand_over(&sender, window, Found::Latest(answer));
+        });
+    }
+
+    /// Takes in GitHub's answer: a release newer than this build is
+    /// offered; a check that failed is tried again later.
+    fn take_latest(&mut self, answer: std::result::Result<Option<Release>, String>) {
+        let at = now().0;
+        self.checked = match &answer {
+            Ok(_) => Checked::Answered(at),
+            Err(error) => {
+                eprintln!("hyalo: cannot ask GitHub for the latest release: {error}");
+                Checked::Failed(at)
+            }
+        };
+        if let (Ok(Some(latest)), Some(updates)) = (answer, &self.services.updates) {
+            self.update = Update::after_check(self.update.take(), latest, updates.current);
+        }
+        self.tell_update();
+    }
+
+    /// Installs the newer release on a thread of its own, unless it is
+    /// being installed already.
+    fn install(&mut self) {
+        let (Some(updates), Some(update)) = (&self.services.updates, &mut self.update) else {
+            return;
+        };
+        if update.progress == Progress::Installing {
+            return;
+        }
+        update.progress = Progress::Installing;
+        let (release, installer) = (update.release.clone(), updates.installer.clone());
+        let (sender, window) = (self.found.0.clone(), self.hwnd.0 as isize);
+        std::thread::spawn(move || {
+            let installed = update::install(&release, &installer);
+            hand_over(&sender, window, Found::Installed(installed));
+        });
+        self.tell_update();
+    }
+
+    /// How installing went: once the new build is in place and started,
+    /// this one closes, and the new one, which waits for that, takes
+    /// over; a failure is told, and this build runs on.
+    fn take_installed(&mut self, installed: std::result::Result<(), Failure>) {
+        let Err(failure) = installed else {
+            return post(self.hwnd, WM_CLOSE);
+        };
+        eprintln!("hyalo: the update did not install: {failure:?}");
+        if let Some(update) = &mut self.update {
+            update.progress = Progress::Failed(failure);
+        }
+        self.tell_update();
+    }
+
+    /// Tells what is known of a newer release: in the tray, and in the
+    /// settings window if it is open.
+    fn tell_update(&mut self) {
+        self.show_tray();
+        self.show_versions();
     }
 
     /// Watches the config, if there is one, from what it held at start,
@@ -368,7 +467,12 @@ impl App {
 
     /// What the tray's menu holds now.
     fn menu(&self) -> Vec<tray::Line> {
-        tray::menu(self.hotkey(), self.starts(), self.language())
+        tray::menu(
+            self.hotkey(),
+            self.starts(),
+            self.offered(),
+            self.language(),
+        )
     }
 
     /// Starts with Windows if it does not, and stops if it does.
@@ -812,6 +916,8 @@ impl App {
                     self.configure(settings::read(bytes.clone()));
                     self.show_written(bytes);
                 }
+                Found::Latest(answer) => self.take_latest(answer),
+                Found::Installed(installed) => self.take_installed(installed),
                 found => self.catalog.take(found),
             }
         }
@@ -869,9 +975,13 @@ thread_local! {
 }
 
 /// Opens the launcher, shown, in the tray, or with its settings window
-/// open, and runs until the window closes.
-pub fn run(start: Start) -> Result<()> {
-    begin(Services::real(), start)?;
+/// open, and runs until the window closes. Once it knows whether the
+/// window opened, it tidies up after an update, or, when it is a new
+/// build that could not start, goes back to the old one.
+pub fn run(start: Start, replace: bool) -> Result<()> {
+    let opened = begin(Services::real(), start);
+    update::settle_running(opened.is_ok(), replace);
+    opened?;
     message_loop();
     Ok(())
 }
@@ -930,6 +1040,8 @@ fn open(services: Services, shown: bool) -> Result<HWND> {
             pressed: None,
             double: None,
             position,
+            checked: Checked::Never,
+            update: None,
         };
         opened.find_picked();
         let loaded = seen.clone().map_or(Ok(Config::default()), settings::read);
@@ -1154,6 +1266,10 @@ fn on_command(hwnd: HWND, command: tray::Command) -> Result<()> {
             Ok(())
         }
         tray::Command::Exit => unsafe { DestroyWindow(hwnd) },
+        tray::Command::Install => {
+            with_app(App::install);
+            Ok(())
+        }
     }
 }
 
@@ -1320,6 +1436,7 @@ fn show(hwnd: HWND) -> Result<()> {
     with_app(|app| -> Result<()> {
         app.placement = placement;
         app.find_if_stale();
+        app.check_for_update();
         app.search();
         app.present()?;
         app.pointer = pointer_over(hwnd);
@@ -1523,6 +1640,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
+    use hyalo_core::config::DEFAULT;
     use hyalo_core::item::{Action, Item, Kind};
     use windows::Win32::Foundation::RECT;
     use windows::Win32::Graphics::Dwm::DwmGetWindowAttribute;
@@ -1690,6 +1808,7 @@ mod tests {
             picker: Rc::new(Chooser::default()),
             position: None,
             windows_language: Language::English,
+            updates: None,
         };
         (services, ran)
     }
@@ -2197,7 +2316,7 @@ mod tests {
             let (lines, at) = &menus[0];
             assert_eq!(
                 *lines,
-                tray::menu(Some(Hotkey::default()), None, Language::English)
+                tray::menu(Some(Hotkey::default()), None, None, Language::English)
             );
             assert_eq!((at.x, at.y), (1500, 1040));
             assert!(launcher.visible(), "nothing picked");
@@ -2277,7 +2396,7 @@ mod tests {
             let lines = &menus.last().expect("a menu").0;
             assert_eq!(
                 *lines,
-                tray::menu(Some(Hotkey::default()), Some(true), Language::English)
+                tray::menu(Some(Hotkey::default()), Some(true), None, Language::English)
             );
         });
     }
@@ -2351,7 +2470,7 @@ mod tests {
             let menus = taskbar.menus.borrow();
             assert_eq!(
                 menus[0].0,
-                tray::menu(Some(hotkey("Ctrl+Shift+K")), None, Language::English)
+                tray::menu(Some(hotkey("Ctrl+Shift+K")), None, None, Language::English)
             );
         });
     }
@@ -3680,6 +3799,266 @@ mod tests {
             second.press(VK_RETURN);
             let opened = Action::Open(tree.path("notes b.txt"));
             assert_eq!(*ran.borrow(), [(opened, false)]);
+        });
+    }
+
+    /// GitHub's answer about a release tagged `tag`, with `notes` as its
+    /// JSON writes them.
+    pub(super) fn release_json(tag: &str, notes: &str) -> Vec<u8> {
+        let url = format!("https://github.com/IlyaShorin/hyalo/releases/download/{tag}");
+        format!(
+            r#"{{"tag_name": "{tag}", "draft": false, "prerelease": false, "body": "{notes}",
+                "assets": [{{"name": "hyalo.exe", "browser_download_url": "{url}/hyalo.exe"}},
+                {{"name": "hyalo.exe.sha256", "browser_download_url": "{url}/hyalo.exe.sha256"}}]}}"#
+        )
+        .into_bytes()
+    }
+
+    /// Releases as a test keeps them: how often GitHub was asked, the exe
+    /// an update replaces (`old build`, in a scratch folder of its own),
+    /// and the exes started in its place.
+    pub(super) struct Releases {
+        pub(super) asked: Arc<AtomicUsize>,
+        pub(super) exe: PathBuf,
+        pub(super) started: Arc<Mutex<Vec<PathBuf>>>,
+        pub(super) _folder: Scratch,
+    }
+
+    impl Releases {
+        /// What the exe's folder holds: each file's name and text.
+        pub(super) fn files(&self) -> Vec<(String, String)> {
+            let folder = self.exe.parent().expect("a folder");
+            let mut files: Vec<(String, String)> = std::fs::read_dir(folder)
+                .expect("the folder")
+                .map(|entry| {
+                    let entry = entry.expect("an entry");
+                    let text = std::fs::read_to_string(entry.path()).expect("the file");
+                    (entry.file_name().to_string_lossy().into_owned(), text)
+                })
+                .collect();
+            files.sort();
+            files
+        }
+
+        pub(super) fn started(&self) -> Vec<PathBuf> {
+            self.started.lock().expect("started").clone()
+        }
+    }
+
+    /// The files of a folder, by name, with what they hold.
+    pub(super) fn named(files: &[(&str, &str)]) -> Vec<(String, String)> {
+        let named = files
+            .iter()
+            .map(|(name, text)| (name.to_string(), text.to_string()));
+        named.collect()
+    }
+
+    /// Updates for hyalo 0.0.1 from a GitHub that answers `latest`, and
+    /// serves `new build` with the sum of `summed`.
+    pub(super) fn releasing(
+        test: &str,
+        latest: std::result::Result<Vec<u8>, String>,
+        summed: &[u8],
+    ) -> (Updates, Releases) {
+        let folder = Scratch::new(test);
+        let exe = folder.0.join("hyalo.exe");
+        std::fs::write(&exe, b"old build").expect("the old build");
+        let asked = Arc::new(AtomicUsize::new(0));
+        let counted = asked.clone();
+        let sum: String = update::sha256(summed)
+            .0
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        let download = move |url: &str| match url.rsplit('/').next() {
+            Some("hyalo.exe") => Ok(b"new build".to_vec()),
+            Some("hyalo.exe.sha256") => Ok(format!("{sum}  hyalo.exe\n").into_bytes()),
+            _ => Err(format!("nothing at {url}")),
+        };
+        let started = Arc::new(Mutex::new(Vec::new()));
+        let noted = started.clone();
+        let updates = Updates {
+            current: hyalo_core::update::Version::parse("0.0.1").expect("a version"),
+            latest: Arc::new(move || {
+                counted.fetch_add(1, Ordering::SeqCst);
+                latest.clone()
+            }),
+            installer: Arc::new(update::Installer {
+                download: Arc::new(download),
+                exe: exe.clone(),
+                start: Arc::new(move |exe: &Path| {
+                    noted.lock().expect("started").push(exe.to_path_buf());
+                    Ok(())
+                }),
+            }),
+        };
+        let releases = Releases {
+            asked,
+            exe,
+            started,
+            _folder: folder,
+        };
+        (updates, releases)
+    }
+
+    /// A launcher on a config holding `text`, with `updates` and a
+    /// stand-in taskbar.
+    fn updating(test: &str, text: &str, updates: Updates) -> (Launcher, Rc<Taskbar>, Scratch) {
+        let (scratch, path) = config_file(test, text);
+        let taskbar = Rc::new(Taskbar::default());
+        let (mut services, _) = services(listing(&[]).0, None);
+        services.tray = taskbar.clone();
+        services.config = Some(path);
+        services.updates = Some(updates);
+        (Launcher::serving(services), taskbar, scratch)
+    }
+
+    /// Handles messages as the message loop would until the window is
+    /// gone; fails after five seconds.
+    pub(super) fn pump_until_closed(hwnd: HWND) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while unsafe { IsWindow(Some(hwnd)) }.as_bool() {
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for it to close"
+            );
+            let mut message = MSG::default();
+            while unsafe { PeekMessageW(&mut message, None, 0, 0, PM_REMOVE) }.as_bool() {
+                unsafe {
+                    let _ = TranslateMessage(&message);
+                    DispatchMessageW(&message);
+                }
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    #[test]
+    fn a_newer_release_is_told_under_the_empty_bar_in_the_tray_and_its_menu() {
+        on_hidden_desktop(|| {
+            let latest = Ok(release_json("v0.0.2", "Faster."));
+            let (updates, releases) = releasing("update-told", latest, b"new build");
+            let (launcher, taskbar, _scratch) = updating("update-told-config", DEFAULT, updates);
+            launcher.pump_until(|app| app.update.is_some());
+            assert_eq!(releases.asked.load(Ordering::SeqCst), 1);
+            launcher.search_for("", 1);
+            let (title, subtitle) = first_row();
+            assert_eq!(title, "hyalo 0.0.2 is out");
+            assert!(subtitle.starts_with("See what is new"), "{subtitle}");
+            let tip = taskbar.tips.borrow().last().cloned().expect("a tip");
+            assert_eq!(tip, "hyalo · hyalo 0.0.2 is out");
+            launcher.tray(WM_CONTEXTMENU, (0, 0));
+            assert_eq!(menu_labels(&taskbar)[1], "Install hyalo 0.0.2");
+            launcher.press(VK_RETURN);
+            launcher.pump_until(|app| app.settings.is_some());
+        });
+    }
+
+    #[test]
+    fn github_is_asked_once_at_start_not_on_every_show() {
+        on_hidden_desktop(|| {
+            let latest = Ok(release_json("v0.0.1", ""));
+            let (updates, releases) = releasing("update-once", latest, b"new build");
+            let (launcher, taskbar, _scratch) = updating("update-once-config", DEFAULT, updates);
+            launcher.pump_until(|app| matches!(app.checked, Checked::Answered(_)));
+            launcher.hotkey();
+            launcher.hotkey();
+            launcher.pump_until(|app| app.checked != Checked::Asking);
+            assert_eq!(releases.asked.load(Ordering::SeqCst), 1);
+            assert!(with_app(|app| app.update.is_none()).expect("app state"));
+            launcher.search_for("", 0);
+            launcher.tray(WM_CONTEXTMENU, (0, 0));
+            assert_eq!(menu_labels(&taskbar).len(), 4, "no install");
+        });
+    }
+
+    #[test]
+    fn a_check_that_fails_tells_nothing_and_is_tried_again_later() {
+        on_hidden_desktop(|| {
+            let (updates, releases) = releasing("update-offline", Err("offline".into()), b"");
+            let (launcher, taskbar, _scratch) = updating("update-offline-config", DEFAULT, updates);
+            launcher.pump_until(|app| matches!(app.checked, Checked::Failed(_)));
+            assert_eq!(releases.asked.load(Ordering::SeqCst), 1);
+            launcher.search_for("", 0);
+            let tip = taskbar.tips.borrow().last().cloned().expect("a tip");
+            assert_eq!(tip, "hyalo · Alt+Space");
+        });
+    }
+
+    #[test]
+    fn with_checking_off_github_is_not_asked_until_it_is_turned_on() {
+        on_hidden_desktop(|| {
+            let off = DEFAULT.replace("check_for_updates = true", "check_for_updates = false");
+            let latest = Ok(release_json("v0.0.2", ""));
+            let (updates, releases) = releasing("update-off", latest, b"new build");
+            let (launcher, _taskbar, scratch) = updating("update-off-config", &off, updates);
+            launcher.hotkey();
+            launcher.hotkey();
+            assert_eq!(
+                with_app(|app| app.checked).expect("app state"),
+                Checked::Never
+            );
+            let path = scratch.0.join("hyalo").join("config.toml");
+            std::fs::write(&path, DEFAULT).expect("turn it on");
+            launcher.pump_until(|app| app.update.is_some());
+            assert_eq!(releases.asked.load(Ordering::SeqCst), 1);
+            std::fs::write(&path, &off).expect("turn it off");
+            launcher.pump_until(|app| app.notice().is_none());
+            assert!(
+                with_app(|app| app.update.is_some()).expect("app state"),
+                "known still"
+            );
+        });
+    }
+
+    #[test]
+    fn install_from_the_tray_swaps_the_new_build_in_starts_it_and_closes_hyalo() {
+        on_hidden_desktop(|| {
+            let latest = Ok(release_json("v0.0.2", ""));
+            let (updates, releases) = releasing("update-install", latest, b"new build");
+            let (launcher, taskbar, _scratch) = updating("update-install-config", DEFAULT, updates);
+            launcher.pump_until(|app| app.update.is_some());
+            launcher.pick(&taskbar, tray::Command::Install);
+            pump_until_closed(launcher.0);
+            assert_eq!(
+                releases.files(),
+                named(&[("hyalo.exe", "new build"), ("hyalo.exe.old", "old build")])
+            );
+            assert_eq!(releases.started(), std::slice::from_ref(&releases.exe));
+        });
+    }
+
+    #[test]
+    fn a_build_its_sum_does_not_name_is_refused_told_and_hyalo_runs_on() {
+        on_hidden_desktop(|| {
+            let latest = Ok(release_json("v0.0.2", ""));
+            let (updates, releases) = releasing("update-refused", latest, b"another build");
+            let (launcher, taskbar, _scratch) = updating("update-refused-config", DEFAULT, updates);
+            launcher.pump_until(|app| app.update.is_some());
+            launcher.pick(&taskbar, tray::Command::Install);
+            launcher.pump_until(|app| {
+                app.update
+                    .as_ref()
+                    .is_some_and(|update| matches!(update.progress, Progress::Failed(_)))
+            });
+            launcher.search_for("", 1);
+            let (title, subtitle) = first_row();
+            let said =
+                "hyalo 0.0.2 is not installed: the download is not the build its SHA-256 names";
+            assert_eq!(title, said);
+            assert!(
+                subtitle.starts_with("hyalo 0.0.1 keeps running"),
+                "{subtitle}"
+            );
+            assert!(launcher.visible());
+            assert_eq!(releases.files(), named(&[("hyalo.exe", "old build")]));
+            assert!(releases.started().is_empty());
+            launcher.tray(WM_CONTEXTMENU, (0, 0));
+            assert_eq!(
+                menu_labels(&taskbar)[1],
+                "Install hyalo 0.0.2",
+                "to try again"
+            );
         });
     }
 

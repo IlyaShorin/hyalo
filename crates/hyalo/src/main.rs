@@ -28,6 +28,7 @@ mod settings;
 mod store;
 mod surface;
 mod tray;
+mod update;
 mod window;
 
 #[cfg(test)]
@@ -44,17 +45,19 @@ use windows::Win32::UI::HiDpi::{
 /// One launcher per session: the first start runs it, shown, in the tray
 /// (started with Windows) or with its settings open (`--settings`); a
 /// second start asks the first to show or to open its settings, and goes.
-/// A start with `--replace` waits for the launcher that runs to end, then
-/// runs in its place.
+/// A new build an update started (`--replace`) waits for the old one to
+/// end, then runs in its place.
 fn main() -> windows::core::Result<()> {
     let arguments: Vec<String> = std::env::args().collect();
     let start = instance::Start::from_args(arguments.clone());
-    let wait = instance::replacing(&arguments).then_some(instance::REPLACE_WAIT);
+    let replace = instance::replacing(&arguments);
+    let wait = replace.then_some(instance::REPLACE_WAIT);
+    let run = |start| run(start, replace);
     instance::first(instance::NAME, start, wait, run, window::ask_running)
 }
 
-fn run(start: instance::Start) -> windows::core::Result<()> {
+fn run(start: instance::Start, replace: bool) -> windows::core::Result<()> {
     // DPI awareness is per process and must be set before the first window.
     unsafe { SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2)? };
-    window::run(start)
+    window::run(start, replace)
 }

@@ -4,13 +4,15 @@
 //! window must do about it, if anything: write a change to the file, open
 //! the folder picker, switch starting with Windows, open the file, close.
 //!
-//! The page is built from a list of sections, each from the panel, so a
-//! later section (updates) is one more entry.
+//! The page is built from a list of sections, each from the panel: the
+//! updates section is one entry near the top, for a newer release, and
+//! one near the end, for the switch alone.
 
 use std::collections::HashMap;
 
 use hyalo_core::config::{Change, List, Problem, Why, Written};
 use hyalo_core::text::{Language, Text};
+use hyalo_core::update::{Progress, Update, Version};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     VIRTUAL_KEY, VK_ESCAPE, VK_RETURN, VK_SPACE, VK_TAB,
 };
@@ -36,7 +38,17 @@ pub enum Effect {
     Copy(String),
     /// Paste the clipboard's text into the field with the focus.
     Paste,
+    /// Install the newer release.
+    Install,
     Close,
+}
+
+/// What the updates section shows: the version that runs, and the newer
+/// release hyalo tells of, if any.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Versions {
+    pub current: Version,
+    pub update: Option<Update>,
 }
 
 /// How a control looks now.
@@ -62,8 +74,14 @@ enum Spot {
 
 /// The page's sections, top to bottom; each is left out when it has
 /// nothing to show.
-const SECTIONS: [fn(&Panel) -> Option<Section>; 4] =
-    [Panel::problem, Panel::launcher, Panel::folders, Panel::file];
+const SECTIONS: [fn(&Panel) -> Option<Section>; 6] = [
+    Panel::problem,
+    Panel::news,
+    Panel::launcher,
+    Panel::folders,
+    Panel::updates,
+    Panel::file,
+];
 
 /// How far one notch of the mouse wheel scrolls, in DIPs.
 const WHEEL_STEP: f32 = 48.0;
@@ -94,6 +112,9 @@ pub struct Panel {
     scroll: f32,
     /// The language Windows is shown in, which a file without one speaks.
     windows: Language,
+    /// The versions, where hyalo updates itself; `None` shows no updates
+    /// section.
+    updates: Option<Versions>,
 }
 
 impl Panel {
@@ -173,6 +194,12 @@ impl Panel {
     /// Whether hyalo starts with Windows now.
     pub fn set_starts(&mut self, starts: Option<bool>) {
         self.starts = starts;
+        self.settle_focus();
+    }
+
+    /// What is known of the versions now.
+    pub fn set_updates(&mut self, updates: Option<Versions>) {
+        self.updates = updates;
         self.settle_focus();
     }
 
@@ -431,6 +458,11 @@ impl Panel {
         match target {
             Target::Fix | Target::OpenConfig => Some(Effect::OpenConfig),
             Target::StartWithWindows => self.starts.map(|on| Effect::StartWithWindows(!on)),
+            Target::Install => Some(Effect::Install),
+            Target::CheckUpdates => self
+                .written
+                .as_ref()
+                .map(|written| Effect::Change(Change::CheckForUpdates(!written.check_for_updates))),
             Target::Pick(list) => Some(Effect::Pick(list)),
             Target::Language(language) => {
                 (language != self.language()).then_some(Effect::Change(Change::Language(language)))
@@ -439,11 +471,18 @@ impl Panel {
         }
     }
 
-    /// Whether `target` is on the page and may be used: only the way to
-    /// the file while the file has a problem.
+    /// Whether `target` is on the page and may be used: while the file
+    /// has a problem, only the way to the file and Install, which is no
+    /// setting; Install not while it installs.
     fn enabled(&self, target: Target) -> bool {
-        let file = matches!(target, Target::Fix | Target::OpenConfig);
-        self.has(target) && (file || self.problem.is_none())
+        let free = match target {
+            Target::Fix | Target::OpenConfig => true,
+            Target::Install => self
+                .update()
+                .is_some_and(|update| update.progress != Progress::Installing),
+            _ => self.problem.is_none(),
+        };
+        self.has(target) && free
     }
 
     /// Whether the page has `target`.
@@ -451,13 +490,26 @@ impl Panel {
         match target {
             Target::Fix => self.problem.is_some(),
             Target::OpenConfig => true,
-            Target::StartWithWindows => self.written.is_some() && self.starts.is_some(),
+            Target::Install => self.update().is_some(),
             Target::Remove(list, at) => at < self.entries(list).len(),
-            Target::Name(list) | Target::AddName(list) => {
-                list != List::Exclude && self.written.is_some()
-            }
-            Target::Hotkey | Target::Pick(_) | Target::Language(_) => self.written.is_some(),
+            setting => self.written.is_some() && self.shows(setting),
         }
+    }
+
+    /// Whether the page, showing good settings, has the control of the
+    /// setting `target`.
+    fn shows(&self, target: Target) -> bool {
+        match target {
+            Target::StartWithWindows => self.starts.is_some(),
+            Target::Name(list) | Target::AddName(list) => list != List::Exclude,
+            Target::CheckUpdates => self.updates.is_some(),
+            _ => true,
+        }
+    }
+
+    /// The newer release the page tells of, if any.
+    fn update(&self) -> Option<&Update> {
+        self.updates.as_ref()?.update.as_ref()
     }
 
     /// A focus on a control the page no longer has moves to the entry
@@ -490,9 +542,14 @@ impl Panel {
     /// The help line of the setting at `spot`: what went wrong there, as
     /// a warning, or `help`.
     fn help(&self, spot: Spot, help: Text) -> (String, bool) {
+        self.noted(spot, self.say(help))
+    }
+
+    /// The same, for help said already.
+    fn noted(&self, spot: Spot, help: String) -> (String, bool) {
         match &self.note {
             Some((noted, why)) if *noted == spot => (why.said(self.language()), true),
-            _ => (self.say(help), false),
+            _ => (help, false),
         }
     }
 
@@ -605,6 +662,72 @@ impl Panel {
         card(false, self.problem.is_some(), strips)
     }
 
+    /// A newer release, first after a problem in the file: what it is
+    /// with Install, its notes, and the switch.
+    fn news(&self) -> Option<Section> {
+        let update = self.update()?;
+        let mut cards = vec![self.newer(update)];
+        cards.extend(self.checking());
+        Some(Section {
+            title: Some(self.say(Text::Updates)),
+            cards,
+        })
+    }
+
+    /// The switch alone, near the end, while there is no newer release.
+    fn updates(&self) -> Option<Section> {
+        if self.update().is_some() {
+            return None;
+        }
+        Some(Section {
+            title: Some(self.say(Text::Updates)),
+            cards: vec![self.checking()?],
+        })
+    }
+
+    /// The newer release: its version with Install, how installing it
+    /// goes, and its notes.
+    fn newer(&self, update: &Update) -> Card {
+        let language = self.language();
+        let current = self.updates.as_ref().map(|versions| versions.current);
+        let current = current
+            .map(|version| version.to_string())
+            .unwrap_or_default();
+        let help = match &update.progress {
+            Progress::Offered => (language.fill(Text::InstallHelp, &[&current]), false),
+            Progress::Installing => (self.say(Text::InstallingHelp), false),
+            Progress::Failed(failure) => {
+                let why = failure.said(language);
+                (language.fill(Text::FailedHelp, &[&why]), true)
+            }
+        };
+        let version = update.release.version.to_string();
+        let name = language.fill(Text::UpdateOut, &[&version]);
+        let install = Control::Button(button(&self.say(Text::Install), Target::Install));
+        let mut strips = vec![setting(&name, help, Some(install))];
+        let notes = update.release.lines();
+        if !notes.is_empty() {
+            strips.push(Strip::Text {
+                text: notes.join("\n"),
+            });
+        }
+        card(false, false, strips)
+    }
+
+    /// The switch for checking for updates, with the version that runs.
+    fn checking(&self) -> Option<Card> {
+        let written = self.written.as_ref()?;
+        let current = self.updates.as_ref()?.current.to_string();
+        let help = self.language().fill(Text::CheckHelp, &[&current]);
+        let toggle = Control::Toggle {
+            target: Target::CheckUpdates,
+            on: written.check_for_updates,
+        };
+        let help = self.noted(Spot::Updates, help);
+        let strip = setting(&self.say(Text::CheckUpdates), help, Some(toggle));
+        Some(card(false, self.problem.is_some(), vec![strip]))
+    }
+
     /// The way to the file itself.
     fn file(&self) -> Option<Section> {
         let open = Control::Button(button(&self.say(Text::OpenConfig), Target::OpenConfig));
@@ -653,6 +776,7 @@ mod tests {
     use hyalo_core::config::{self, DEFAULT};
     use hyalo_core::hotkey::Hotkey;
     use hyalo_core::text::Language;
+    use hyalo_core::update::{Progress, Update, Version};
     use std::ops::Range;
     use windows::Win32::UI::Input::KeyboardAndMouse::{
         VK_A, VK_C, VK_DELETE, VK_END, VK_F4, VK_HOME, VK_K, VK_LEFT, VK_SPACE, VK_V, VK_X,
@@ -1557,5 +1681,252 @@ notes
             shown[2].starts_with("Строка 2: unknown field `hotkye`"),
             "{shown:?}"
         );
+    }
+
+    fn version(text: &str) -> Version {
+        Version::parse(text).expect("a version")
+    }
+
+    /// hyalo 0.0.1, and a newer release 0.0.2 with `notes`, as far as
+    /// `progress`.
+    fn offered(notes: &str, progress: Progress) -> Versions {
+        let release = hyalo_core::update::Release {
+            version: version("0.0.2"),
+            notes: notes.to_string(),
+            exe: String::new(),
+            sum: String::new(),
+        };
+        Versions {
+            current: version("0.0.1"),
+            update: Some(Update { release, progress }),
+        }
+    }
+
+    fn newest() -> Versions {
+        Versions {
+            current: version("0.0.1"),
+            update: None,
+        }
+    }
+
+    /// The headers of the page's sections, in order.
+    fn headers(panel: &Panel) -> Vec<String> {
+        let marks = laid(panel).marks.into_iter();
+        let headers = marks.filter_map(|mark| match mark.what {
+            What::Header(text) => Some(text),
+            _ => None,
+        });
+        headers.collect()
+    }
+
+    /// Whether the switch for `target` is on, if the page has it.
+    fn switch(panel: &Panel, target: Target) -> Option<bool> {
+        let marks = laid(panel).marks.into_iter();
+        let mut switches = marks.filter_map(|mark| match mark.what {
+            What::Toggle { on, target: at } if at == target => Some(on),
+            _ => None,
+        });
+        switches.next()
+    }
+
+    #[test]
+    fn where_hyalo_does_not_update_itself_there_is_no_updates_section() {
+        let panel = panel();
+        assert_eq!(headers(&panel), ["Launcher", "Folders", "config.toml"]);
+        assert_eq!(switch(&panel, Target::CheckUpdates), None);
+        assert!(laid(&panel).area(Target::Install).is_none());
+    }
+
+    #[test]
+    fn with_no_newer_release_the_switch_comes_last_but_for_the_file() {
+        let mut panel = panel();
+        panel.set_updates(Some(newest()));
+        let headers = headers(&panel);
+        assert_eq!(headers, ["Launcher", "Folders", "Updates", "config.toml"]);
+        assert_eq!(switch(&panel, Target::CheckUpdates), Some(true));
+        let help = "You have hyalo 0.0.1; GitHub is asked once a day, nothing installs by itself";
+        assert_eq!(
+            help_of(&panel, "Check for updates"),
+            What::Help {
+                text: help.to_string(),
+                alarm: false
+            }
+        );
+        assert!(laid(&panel).area(Target::Install).is_none());
+    }
+
+    #[test]
+    fn a_newer_release_comes_first_with_install_its_notes_and_the_switch() {
+        let mut panel = panel();
+        panel.set_updates(Some(offered(
+            "## What's new\n* Updates itself",
+            Progress::Offered,
+        )));
+        assert_eq!(
+            headers(&panel),
+            ["Updates", "Launcher", "Folders", "config.toml"]
+        );
+        let shown = texts(&panel);
+        let at = shown.iter().position(|text| text == "hyalo 0.0.2 is out");
+        let at = at.expect("the release");
+        assert_eq!(
+            shown[at..at + 4],
+            [
+                "hyalo 0.0.2 is out",
+                "What's new",
+                "• Updates itself",
+                "Check for updates"
+            ]
+        );
+        let help = "You have 0.0.1: Install downloads it, checks it and restarts hyalo";
+        assert_eq!(
+            help_of(&panel, "hyalo 0.0.2 is out"),
+            What::Help {
+                text: help.to_string(),
+                alarm: false
+            }
+        );
+        assert_eq!(click(&mut panel, Target::Install), Some(Effect::Install));
+    }
+
+    #[test]
+    fn a_release_without_notes_shows_none() {
+        let mut panel = panel();
+        panel.set_updates(Some(offered("", Progress::Offered)));
+        let shown = texts(&panel);
+        let at = shown.iter().position(|text| text == "hyalo 0.0.2 is out");
+        assert_eq!(shown[at.expect("the release") + 1], "Check for updates");
+    }
+
+    #[test]
+    fn install_is_used_once_and_a_failure_is_told_by_it() {
+        let mut panel = panel();
+        panel.set_updates(Some(offered("", Progress::Installing)));
+        let help = "Downloading and checking it; hyalo restarts once it is in place";
+        assert_eq!(
+            help_of(&panel, "hyalo 0.0.2 is out"),
+            What::Help {
+                text: help.to_string(),
+                alarm: false
+            }
+        );
+        assert!(!panel.look(Target::Install).enabled);
+        assert_eq!(click(&mut panel, Target::Install), None);
+        let failed = Progress::Failed(hyalo_core::update::Failure::Mismatch);
+        panel.set_updates(Some(offered("", failed)));
+        let said = "! Not installed: the download is not the build its SHA-256 names";
+        assert!(
+            texts(&panel).contains(&said.to_string()),
+            "{:?}",
+            texts(&panel)
+        );
+        assert!(panel.look(Target::Install).enabled, "to try again");
+        assert_eq!(click(&mut panel, Target::Install), Some(Effect::Install));
+    }
+
+    #[test]
+    fn the_switch_turns_checking_the_other_way_and_a_refusal_shows_by_it() {
+        let mut panel = panel();
+        panel.set_updates(Some(newest()));
+        let off = Change::CheckForUpdates(false);
+        assert_eq!(
+            click(&mut panel, Target::CheckUpdates),
+            Some(Effect::Change(off.clone()))
+        );
+        let text = DEFAULT.replace("check_for_updates = true", "check_for_updates = false");
+        panel.done(&off, Some(written(&text)));
+        assert_eq!(switch(&panel, Target::CheckUpdates), Some(false));
+        let on = Change::CheckForUpdates(true);
+        assert_eq!(
+            click(&mut panel, Target::CheckUpdates),
+            Some(Effect::Change(on.clone()))
+        );
+        panel.refused(&on, Why::Unsaved("the disk is full".to_string()));
+        assert_eq!(
+            help_of(&panel, "Check for updates"),
+            What::Help {
+                text: "cannot save config.toml: the disk is full".to_string(),
+                alarm: true
+            }
+        );
+    }
+
+    #[test]
+    fn while_the_file_is_broken_install_still_works_but_the_switch_does_not() {
+        let mut panel = panel();
+        panel.set_updates(Some(offered("", Progress::Offered)));
+        panel.reload(Err(broken()));
+        assert_eq!(
+            headers(&panel)[..2],
+            ["Updates".to_string(), "Launcher".to_string()]
+        );
+        assert!(panel.look(Target::Install).enabled);
+        assert!(!panel.look(Target::CheckUpdates).enabled);
+        assert_eq!(click(&mut panel, Target::CheckUpdates), None);
+        assert_eq!(click(&mut panel, Target::Install), Some(Effect::Install));
+    }
+
+    #[test]
+    fn a_file_broken_from_the_start_shows_no_switch() {
+        let mut panel = Panel::new(Err(broken()), None, Language::English);
+        panel.set_updates(Some(newest()));
+        assert_eq!(switch(&panel, Target::CheckUpdates), None);
+        assert!(!headers(&panel).contains(&"Updates".to_string()));
+    }
+
+    #[test]
+    fn tab_reaches_install_first_and_the_focus_leaves_it_when_the_release_goes() {
+        let mut panel = panel();
+        panel.set_updates(Some(offered("", Progress::Offered)));
+        plain(&mut panel, VK_TAB.0);
+        assert!(panel.look(Target::Install).ring);
+        plain(&mut panel, VK_TAB.0);
+        assert!(panel.look(Target::CheckUpdates).ring);
+        plain(&mut panel, VK_TAB.0);
+        assert!(
+            panel.look(Target::Hotkey).ring,
+            "then the launcher's settings"
+        );
+        let mut panel = Panel::new(Ok(written(DEFAULT)), None, Language::English);
+        panel.set_updates(Some(offered("", Progress::Offered)));
+        panel.press(Some(Target::Install));
+        assert!(panel.look(Target::Install).focused);
+        panel.set_updates(Some(newest()));
+        assert!(!panel.look(Target::Install).focused);
+        assert_eq!(
+            plain(&mut panel, VK_RETURN.0),
+            None,
+            "nothing has the focus"
+        );
+    }
+
+    #[test]
+    fn the_updates_section_speaks_russian() {
+        let mut panel = russian();
+        panel.set_updates(Some(offered("", Progress::Offered)));
+        assert_eq!(headers(&panel)[0], "Обновления");
+        let shown = texts(&panel);
+        assert!(
+            shown.contains(&"Вышла hyalo 0.0.2".to_string()),
+            "{shown:?}"
+        );
+        assert!(
+            shown.contains(&"Проверять обновления".to_string()),
+            "{shown:?}"
+        );
+        let help = "У вас 0.0.1: «Установить» скачает её, проверит и перезапустит hyalo";
+        assert_eq!(
+            help_of(&panel, "Вышла hyalo 0.0.2"),
+            What::Help {
+                text: help.to_string(),
+                alarm: false
+            }
+        );
+        let marks = laid(&panel).marks;
+        let install = marks.iter().find_map(|mark| match &mark.what {
+            What::Button { label, target } if *target == Target::Install => Some(label.clone()),
+            _ => None,
+        });
+        assert_eq!(install.as_deref(), Some("Установить"));
     }
 }

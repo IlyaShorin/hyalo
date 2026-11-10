@@ -30,6 +30,10 @@ pub enum Target {
     Fix,
     /// The option of the language choice for this language.
     Language(Language),
+    /// "Install" for a newer release.
+    Install,
+    /// The switch for checking for updates.
+    CheckUpdates,
 }
 
 /// What the window shows.

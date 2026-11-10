@@ -48,7 +48,7 @@ use crate::field;
 use crate::layout;
 use crate::page::{self, Laid, Target, What};
 use crate::paint::Painter;
-use crate::panel::{Effect, Panel};
+use crate::panel::{Effect, Panel, Versions};
 use crate::recorder::Mods;
 use crate::{clipboard, settings, tray};
 
@@ -500,11 +500,29 @@ impl App {
             },
             settings::written,
         );
-        Some(Panel::new(
-            file,
-            self.starts(),
-            self.services.windows_language,
-        ))
+        let mut panel = Panel::new(file, self.starts(), self.services.windows_language);
+        panel.set_updates(self.versions());
+        Some(panel)
+    }
+
+    /// The versions the settings window shows, where hyalo updates
+    /// itself.
+    fn versions(&self) -> Option<Versions> {
+        let updates = self.services.updates.as_ref()?;
+        Some(Versions {
+            current: updates.current,
+            update: self.offered().cloned(),
+        })
+    }
+
+    /// Shows the versions as they are now in the settings window, if it
+    /// is open.
+    pub(super) fn show_versions(&mut self) {
+        let versions = self.versions();
+        if let Some(window) = &mut self.settings {
+            window.panel.set_updates(versions);
+            window.redraw_or_say();
+        }
     }
 
     /// Whether hyalo starts with Windows; `None` where it may not.
@@ -584,8 +602,18 @@ impl App {
 
     /// Takes in what the config file holds now.
     pub(super) fn show_written(&mut self, bytes: Vec<u8>) {
+        // Checking may have been turned on or off: what is offered too.
+        let versions = self.versions();
         if let Some(window) = &mut self.settings {
             window.panel.reload(settings::written(bytes));
+            window.panel.set_updates(versions);
+            window.redraw_or_say();
+        }
+    }
+
+    /// Draws the settings window again, if it is open.
+    fn redraw_settings(&mut self) {
+        if let Some(window) = &mut self.settings {
             window.redraw_or_say();
         }
     }
@@ -629,6 +657,9 @@ fn carry_out(hwnd: HWND, effect: Effect) {
         Effect::OpenConfig => {
             with_app(App::open_config);
         }
+        Effect::Install => {
+            with_app(App::install);
+        }
         Effect::Copy(text) => {
             with_app(|app| (app.services.run)(&Action::CopyText(text), false));
         }
@@ -637,11 +668,7 @@ fn carry_out(hwnd: HWND, effect: Effect) {
             ours(hwnd, |window| window.panel.paste(&text));
         }
     }
-    with_app(|app| {
-        if let Some(window) = &mut app.settings {
-            window.redraw_or_say();
-        }
-    });
+    with_app(App::redraw_settings);
 }
 
 /// Opens the folder picker for `list`, and adds what is picked to it.
@@ -770,7 +797,8 @@ mod tests {
     };
 
     use super::super::tests::{
-        Chooser, Keyboard, Launcher, Ran, Taskbar, config_file, hold, listing, services,
+        Chooser, Keyboard, Launcher, Ran, Taskbar, config_file, hold, listing, named,
+        pump_until_closed, release_json, releasing, services,
     };
     use super::super::{HOTKEY_TOGGLE, MOUSE_SHIFT, tray};
     use super::*;
@@ -778,6 +806,7 @@ mod tests {
     use crate::scratch::Scratch;
     use crate::surface::Frame;
     use crate::test_desktop::{in_own_window_station, on_hidden_desktop};
+    use crate::update::Updates;
 
     /// A launcher on a config of its own, with the stand-ins a test looks
     /// at. The launcher goes first, then its folder.
@@ -794,6 +823,16 @@ mod tests {
     /// A launcher whose config holds `text`, starting with Windows as
     /// `autostart` has it.
     fn set_up(test: &str, text: &str, autostart: Option<Autostart>) -> Setup {
+        set_up_updating(test, text, autostart, None)
+    }
+
+    /// The same, updating itself with `updates`.
+    fn set_up_updating(
+        test: &str,
+        text: &str,
+        autostart: Option<Autostart>,
+        updates: Option<Updates>,
+    ) -> Setup {
         let (scratch, path) = config_file(test, text);
         let (mut services, ran) = services(listing(&["Notepad"]).0, None);
         let (taskbar, keyboard) = (Rc::new(Taskbar::default()), Rc::new(Keyboard::default()));
@@ -803,6 +842,7 @@ mod tests {
         services.picker = chooser.clone();
         services.config = Some(path.clone());
         services.autostart = autostart;
+        services.updates = updates;
         let launcher = Launcher::serving(services);
         Setup {
             launcher,
@@ -1748,6 +1788,101 @@ mod tests {
                 (info.ptMinTrackSize.x, info.ptMinTrackSize.y),
                 (width, height)
             );
+        });
+    }
+
+    #[test]
+    fn a_newer_release_comes_first_and_install_swaps_it_in_and_closes_hyalo() {
+        on_hidden_desktop(|| {
+            let latest = Ok(release_json("v0.0.2", "Faster.\\nSmaller."));
+            let (updates, releases) = releasing("settings-update-install", latest, b"new build");
+            let setup = set_up_updating("settings-update", DEFAULT, None, Some(updates));
+            setup.launcher.pump_until(|app| app.update.is_some());
+            setup.launcher.search_for("", 1);
+            setup.launcher.press(VK_RETURN);
+            setup.launcher.pump_until(|app| app.settings.is_some());
+            let settings = Settings::find();
+            let shown = settings.texts();
+            assert_eq!(
+                shown[..4],
+                [
+                    "hyalo 0.0.2 is out",
+                    "Faster.",
+                    "Smaller.",
+                    "Check for updates"
+                ]
+            );
+            settings.click(Target::Install);
+            pump_until_closed(setup.launcher.0);
+            assert!(!settings.open(), "gone with the launcher");
+            assert_eq!(
+                releases.files(),
+                named(&[("hyalo.exe", "new build"), ("hyalo.exe.old", "old build")])
+            );
+            assert_eq!(releases.started(), std::slice::from_ref(&releases.exe));
+        });
+    }
+
+    #[test]
+    fn the_switch_turns_checking_off_in_the_file_and_the_release_leaves_the_page() {
+        on_hidden_desktop(|| {
+            let latest = Ok(release_json("v0.0.2", ""));
+            let (updates, _releases) = releasing("settings-update-off", latest, b"new build");
+            let setup = set_up_updating("settings-update-switch", DEFAULT, None, Some(updates));
+            setup.launcher.pump_until(|app| app.update.is_some());
+            let settings = setup.settings();
+            assert!(settings.shows("hyalo 0.0.2 is out"));
+            settings.click(Target::CheckUpdates);
+            let off = DEFAULT.replace("check_for_updates = true", "check_for_updates = false");
+            assert_eq!(setup.file(), off);
+            setup.until(|window| {
+                window.laid.area(Target::Install).is_none()
+                    && window.laid.area(Target::CheckUpdates).is_some()
+            });
+            assert!(settings.shows("Check for updates"));
+            let tip = setup.taskbar.tips.borrow().last().cloned().expect("a tip");
+            assert_eq!(tip, "hyalo · Alt+Space");
+            settings.click(Target::CheckUpdates);
+            assert_eq!(setup.file(), DEFAULT);
+            setup.until(|window| window.laid.area(Target::Install).is_some());
+        });
+    }
+
+    #[test]
+    fn a_build_that_does_not_install_is_told_by_install_and_the_window_stays() {
+        on_hidden_desktop(|| {
+            let latest = Ok(release_json("v0.0.2", ""));
+            let (updates, releases) = releasing("settings-update-refused", latest, b"another");
+            let setup = set_up_updating("settings-update-bad", DEFAULT, None, Some(updates));
+            setup.launcher.pump_until(|app| app.update.is_some());
+            let settings = setup.settings();
+            settings.click(Target::Install);
+            let said = "! Not installed: the download is not the build its SHA-256 names";
+            setup.until(|window| {
+                let laid = &window.laid;
+                laid.marks.iter().any(|mark| {
+                    matches!(&mark.what, What::Help { text, alarm: true } if format!("! {text}") == said)
+                })
+            });
+            assert!(settings.open());
+            assert_eq!(releases.files(), named(&[("hyalo.exe", "old build")]));
+        });
+    }
+
+    #[test]
+    fn with_no_newer_release_the_page_ends_with_the_switch_and_the_file() {
+        on_hidden_desktop(|| {
+            let latest = Ok(release_json("v0.0.1", ""));
+            let (updates, _releases) = releasing("settings-update-none", latest, b"");
+            let setup = set_up_updating("settings-update-newest", DEFAULT, None, Some(updates));
+            setup
+                .launcher
+                .pump_until(|app| matches!(app.checked, hyalo_core::update::Checked::Answered(_)));
+            let settings = setup.settings();
+            let shown = settings.texts();
+            let last = &shown[shown.len() - 2..];
+            assert_eq!(last, ["Check for updates", "Edit the file instead"]);
+            assert!(settings.state(|window| window.laid.area(Target::Install).is_none()));
         });
     }
 
