@@ -186,7 +186,7 @@ pub fn due(newest: Option<Date>, checked: Option<Date>, today: Date) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// The bank's answer on 10 November 2026, saved as it came.
@@ -202,7 +202,7 @@ mod tests {
 
     /// A daily file of the bank's shape with these `Valute` elements,
     /// each currency's name "Доллар" in windows-1251, as the bank sends it.
-    fn daily(date: &str, valutes: &[String]) -> Vec<u8> {
+    pub(crate) fn daily(date: &str, valutes: &[String]) -> Vec<u8> {
         let mut xml = format!(
             "<?xml version=\"1.0\" encoding=\"windows-1251\"?>\
              <ValCurs Date=\"{date}\" name=\"Foreign Currency Market\">"
@@ -217,7 +217,7 @@ mod tests {
     }
 
     /// One currency as the bank lists it; `@` marks where its name goes.
-    fn valute(code: &str, nominal: &str, value: &str) -> String {
+    pub(crate) fn valute(code: &str, nominal: &str, value: &str) -> String {
         format!(
             "<Valute ID=\"R01235\"><NumCode>840</NumCode><CharCode>{code}</CharCode>\
              <Nominal>{nominal}</Nominal><Name>@</Name><Value>{value}</Value>\

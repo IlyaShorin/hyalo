@@ -25,11 +25,7 @@ pub fn answer(query: &str) -> Option<Item> {
         return None;
     }
     let value = expression::evaluate(query)?;
-    let mark = match query.contains(',') {
-        true => ',',
-        false => '.',
-    };
-    let copied = written(value, mark);
+    let copied = written(value, mark(query));
     Some(Item {
         id: ItemId(ID.to_string()),
         title: grouped(&copied),
@@ -39,10 +35,18 @@ pub fn answer(query: &str) -> Option<Item> {
     })
 }
 
+/// The decimal mark `query` uses: a comma if it has one, else a point.
+pub(crate) fn mark(query: &str) -> char {
+    match query.contains(',') {
+        true => ',',
+        false => '.',
+    }
+}
+
 /// `value` to 15 significant digits with `mark` before the decimals; in
 /// exponent form past 15 digits or below a millionth, where plain digits
 /// would run long or end in made-up zeros.
-fn written(value: f64, mark: char) -> String {
+pub(crate) fn written(value: f64, mark: char) -> String {
     let rounded: f64 = format!("{value:.14e}")
         .parse()
         .expect("a float reads back what it writes");
@@ -58,7 +62,7 @@ fn written(value: f64, mark: char) -> String {
 /// `written` with its whole part in groups of three digits, apart by a
 /// no-break space as in Windows' Russian number format: "1 234 500,5".
 /// The narrow one (U+202F) is too thin to see at the row's text size.
-fn grouped(written: &str) -> String {
+pub(crate) fn grouped(written: &str) -> String {
     let (sign, unsigned) = written.split_at(usize::from(written.starts_with('-')));
     let whole = unsigned
         .find(|letter: char| !letter.is_ascii_digit())
