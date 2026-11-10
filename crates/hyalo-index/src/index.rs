@@ -1,6 +1,8 @@
 //! The entries and their names, and the changes a walk or a journal makes
 //! to them.
 
+use std::borrow::Cow;
+
 use hyalo_core::item::Item;
 use hyalo_core::matcher;
 
@@ -75,6 +77,18 @@ impl Entry {
         self.parent == NO_PARENT
     }
 
+    /// The same entry, its names at `name` and `folded` in the arenas,
+    /// with the lengths given.
+    fn named(self, name: u32, name_len: usize, folded: u32, folded_len: usize) -> Entry {
+        let lengths = name_len as u32 | (folded_len as u32) << LENGTH_BITS;
+        Entry {
+            name,
+            folded,
+            lengths: lengths | self.flags() << (2 * LENGTH_BITS),
+            ..self
+        }
+    }
+
     /// The entry as a snapshot keeps it: its four fields, little-endian.
     pub(crate) fn to_bytes(self) -> [u8; 16] {
         let fields = [self.parent, self.name, self.folded, self.lengths].map(u32::to_le_bytes);
@@ -100,16 +114,57 @@ pub(crate) struct Parts {
     pub(crate) free: Vec<u32>,
 }
 
+/// The end of a list of entries, or a folder with none.
+const NONE: u32 = u32::MAX;
+
+/// Where an entry sits in the list of its folder's entries, and where
+/// its own list starts if it is a folder: so a folder's entries are found
+/// without a pass over the index.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Links {
+    /// The first entry in it.
+    first: u32,
+    /// The entries before and after it in its folder.
+    previous: u32,
+    next: u32,
+}
+
+const UNLINKED: Links = Links {
+    first: NONE,
+    previous: NONE,
+    next: NONE,
+};
+
 /// Every file and folder fed in so far.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct Index {
     pub(crate) entries: Vec<Entry>,
+    /// Beside each entry, its place among its folder's entries.
+    links: Vec<Links>,
+    /// The first root; the roots are listed as a folder's entries are.
+    top: u32,
     /// Every name, one after another, as given.
     names: String,
     /// Every name folded, in the same order.
     folded: String,
     /// Removed entries, given to the next ones added.
     free: Vec<u32>,
+    /// Bytes of `names` that no entry names any more.
+    garbage: usize,
+}
+
+impl Default for Index {
+    fn default() -> Self {
+        Index {
+            entries: Vec::new(),
+            links: Vec::new(),
+            top: NONE,
+            names: String::new(),
+            folded: String::new(),
+            free: Vec::new(),
+            garbage: 0,
+        }
+    }
 }
 
 impl Index {
@@ -127,21 +182,38 @@ impl Index {
         Ok(self.place(parent.0, name, &folded, folder))
     }
 
-    /// Removes an entry and, if it is a folder, everything under it. A
-    /// folder costs one pass over the whole index.
-    pub fn remove(&mut self, id: EntryId) -> Result<(), Error> {
-        let entry = self.live(id)?;
-        self.kill(id.0);
-        if entry.is_folder() {
-            for orphan in self.orphans() {
-                self.kill(orphan);
+    /// The file or folder named `name` in the folder `parent`, added if
+    /// it is not there: one of the other kind there is replaced. Unlike
+    /// `add`, which a walk of a folder it has not seen uses, it looks
+    /// among the folder's entries first, so it may run twice.
+    pub fn put(&mut self, parent: EntryId, name: &str, folder: bool) -> Result<EntryId, Error> {
+        self.folder(parent)?;
+        match self.child(parent.0, name) {
+            Some(at) if self.entries[at as usize].is_folder() == folder => Ok(EntryId(at)),
+            Some(at) => {
+                self.remove(EntryId(at))?;
+                self.add(parent, name, folder)
             }
+            None => self.add(parent, name, folder),
         }
+    }
+
+    /// Removes an entry and, if it is a folder, everything under it.
+    pub fn remove(&mut self, id: EntryId) -> Result<(), Error> {
+        self.live(id)?;
+        self.unlink(id.0);
+        let mut doomed = vec![id.0];
+        while let Some(at) = doomed.pop() {
+            doomed.extend(self.children(at));
+            self.kill(at);
+        }
+        self.reclaim();
         Ok(())
     }
 
     /// Moves an entry into the folder `parent` under the name `name`; what
-    /// is under it moves along.
+    /// is under it moves along. Another entry by that name there is
+    /// replaced, as a move that replaces a file does.
     pub fn rename(&mut self, id: EntryId, parent: EntryId, name: &str) -> Result<(), Error> {
         let entry = self.live(id)?;
         self.folder(parent)?;
@@ -149,7 +221,14 @@ impl Index {
             return Err(Error::WouldLoop);
         }
         let folded = checked(name, false)?;
+        if let Some(there) = self.child(parent.0, name).filter(|&at| at != id.0) {
+            self.remove(EntryId(there))?;
+        }
+        self.unlink(id.0);
+        self.garbage += entry.name_len();
         self.entries[id.0 as usize] = self.store(parent.0, name, &folded, entry.is_folder());
+        self.link(id.0);
+        self.reclaim();
         Ok(())
     }
 
@@ -183,34 +262,70 @@ impl Index {
 
     /// The entry at the full path `path`, such as `C:\Users\me`, names
     /// compared regardless of case, as Windows compares them. Each name
-    /// costs one pass over the index.
+    /// costs a look through one folder's entries.
     pub fn find(&self, path: &str) -> Option<EntryId> {
-        let path = lower(path.trim_end_matches('\\'));
-        let found = self.roots().find_map(|root| {
-            let rest = path.strip_prefix(&lower(self.name_at(root)))?;
-            let rest = match rest {
-                "" => rest,
-                _ => rest.strip_prefix('\\')?,
-            };
-            let mut names = rest.split('\\').filter(|name| !name.is_empty());
-            names.try_fold(root, |at, name| self.child(at, name))
+        let names: Vec<&str> = path.split('\\').filter(|name| !name.is_empty()).collect();
+        let found = self.children(NO_PARENT).find_map(|root| {
+            let top: Vec<&str> = self.name_at(root).split('\\').collect();
+            let rest = names.get(top.len()..)?;
+            let ours = top.iter().zip(&names).all(|(one, other)| same(one, other));
+            ours.then_some(())?;
+            rest.iter().try_fold(root, |at, name| self.child(at, name))
         });
         found.map(EntryId)
     }
 
-    /// The live roots, such as `C:`, or a folder walked from the top.
-    fn roots(&self) -> impl Iterator<Item = u32> + '_ {
-        let roots = self.entries.iter().enumerate();
-        let roots = roots.filter(|(_, entry)| entry.is_live() && entry.is_root());
-        roots.map(|(at, _)| offset(at))
+    /// The entries in the folder `parent`, or the roots for `NO_PARENT`.
+    fn children(&self, parent: u32) -> impl Iterator<Item = u32> + '_ {
+        let first = Some(self.first(parent)).filter(|&at| at != NONE);
+        std::iter::successors(first, |&at| {
+            let next = self.links[at as usize].next;
+            (next != NONE).then_some(next)
+        })
     }
 
-    /// The live entry named `name`, lowercased, in the folder `parent`.
+    /// The entry named `name`, in any case, in the folder `parent`.
     fn child(&self, parent: u32, name: &str) -> Option<u32> {
-        let named = |entry: &Entry| {
-            entry.parent == parent && entry.is_live() && lower(self.name_of(*entry)) == name
-        };
-        self.entries.iter().position(named).map(offset)
+        self.children(parent)
+            .find(|&at| same(self.name_at(at), name))
+    }
+
+    /// Where the list of the folder `parent`'s entries starts.
+    fn first(&self, parent: u32) -> u32 {
+        match parent {
+            NO_PARENT => self.top,
+            _ => self.links[parent as usize].first,
+        }
+    }
+
+    fn first_mut(&mut self, parent: u32) -> &mut u32 {
+        match parent {
+            NO_PARENT => &mut self.top,
+            _ => &mut self.links[parent as usize].first,
+        }
+    }
+
+    /// Puts the entry at `at` first in its folder's list.
+    fn link(&mut self, at: u32) {
+        let first = *self.first_mut(self.entries[at as usize].parent);
+        let links = &mut self.links[at as usize];
+        (links.previous, links.next) = (NONE, first);
+        if first != NONE {
+            self.links[first as usize].previous = at;
+        }
+        *self.first_mut(self.entries[at as usize].parent) = at;
+    }
+
+    /// Takes the entry at `at` out of its folder's list.
+    fn unlink(&mut self, at: u32) {
+        let Links { previous, next, .. } = self.links[at as usize];
+        match previous {
+            NONE => *self.first_mut(self.entries[at as usize].parent) = next,
+            _ => self.links[previous as usize].next = next,
+        }
+        if next != NONE {
+            self.links[next as usize].previous = previous;
+        }
     }
 
     /// The row a search lists for the entry.
@@ -222,6 +337,7 @@ impl Index {
     /// hold up to twice what they use.
     pub fn shrink_to_fit(&mut self) {
         self.entries.shrink_to_fit();
+        self.links.shrink_to_fit();
         self.names.shrink_to_fit();
         self.folded.shrink_to_fit();
         self.free.shrink_to_fit();
@@ -230,6 +346,7 @@ impl Index {
     /// The bytes it holds on the heap.
     pub fn memory(&self) -> usize {
         self.entries.capacity() * size_of::<Entry>()
+            + self.links.capacity() * size_of::<Links>()
             + self.names.capacity()
             + self.folded.capacity()
             + self.free.capacity() * size_of::<u32>()
@@ -248,14 +365,23 @@ impl Index {
     /// so the folded copy always is the fold of the name.
     pub(crate) fn from_parts(parts: Parts) -> Option<Index> {
         let mut index = Index {
+            links: vec![UNLINKED; parts.entries.len()],
             entries: parts.entries,
             names: parts.names,
-            folded: String::new(),
             free: parts.free,
+            ..Index::default()
         };
         let sound = index.entries.iter().all(|&entry| index.sound(entry));
         let whole = sound && index.rooted() && index.free_is_removed();
-        (whole && index.fold_names()).then_some(index)
+        if !(whole && index.rebuild(Fold::Again)) {
+            return None;
+        }
+        for at in (0..index.entries.len()).rev() {
+            if index.entries[at].is_live() {
+                index.link(offset(at));
+            }
+        }
+        Some(index)
     }
 
     fn sound(&self, entry: Entry) -> bool {
@@ -271,28 +397,46 @@ impl Index {
         !entry.is_live() || (named && in_folder())
     }
 
-    /// Folds every live name into a fresh arena; whether each was a name
-    /// `add` would take.
-    fn fold_names(&mut self) -> bool {
-        self.folded.reserve_exact(self.names.len());
+    /// Copies every live name and its folded copy into fresh arenas, which
+    /// leaves out the names given up; whether each was a name `add` would
+    /// take. A removed entry is left naming nothing.
+    fn rebuild(&mut self, fold: Fold) -> bool {
+        let live = self.entries.iter().filter(|entry| entry.is_live());
+        let room: usize = live.map(|entry| entry.name_len()).sum();
+        let (mut names, mut folded) = (String::with_capacity(room), String::with_capacity(room));
         for at in 0..self.entries.len() {
             let entry = self.entries[at];
-            if !entry.is_live() {
-                continue;
-            }
-            let Ok(folded) = checked(self.name_of(entry), entry.is_root()) else {
-                return false;
+            let moved = match entry.is_live() {
+                true => {
+                    let name = self.name_of(entry);
+                    let Some(copy) = fold.of(self, entry) else {
+                        return false;
+                    };
+                    let moved = entry.named(
+                        offset(names.len()),
+                        name.len(),
+                        offset(folded.len()),
+                        copy.len(),
+                    );
+                    names.push_str(name);
+                    folded.push_str(&copy);
+                    moved
+                }
+                false => entry.named(0, 0, 0, 0),
             };
-            self.entries[at] = Entry {
-                folded: offset(self.folded.len()),
-                lengths: entry.lengths & !(LENGTH_MASK << LENGTH_BITS)
-                    | (folded.len() as u32) << LENGTH_BITS,
-                ..entry
-            };
-            self.folded.push_str(&folded);
+            self.entries[at] = moved;
         }
-        self.folded.shrink_to_fit();
+        folded.shrink_to_fit();
+        (self.names, self.folded, self.garbage) = (names, folded, 0);
         true
+    }
+
+    /// Rebuilds the arenas once more than half of the names are given up,
+    /// so a long run of changes takes no more room than a walk.
+    fn reclaim(&mut self) {
+        if self.garbage * 2 > self.names.len() {
+            self.rebuild(Fold::Kept);
+        }
     }
 
     /// Whether every live entry reaches a root: no folder is inside itself.
@@ -380,16 +524,20 @@ impl Index {
     /// Stores a new entry, in the place of a removed one if there is one.
     fn place(&mut self, parent: u32, name: &str, folded: &str, folder: bool) -> EntryId {
         let entry = self.store(parent, name, folded, folder);
-        match self.free.pop() {
+        let at = match self.free.pop() {
             Some(at) => {
                 self.entries[at as usize] = entry;
-                EntryId(at)
+                self.links[at as usize] = UNLINKED;
+                at
             }
             None => {
                 self.entries.push(entry);
-                EntryId(offset(self.entries.len() - 1))
+                self.links.push(UNLINKED);
+                offset(self.entries.len() - 1)
             }
-        }
+        };
+        self.link(at);
+        EntryId(at)
     }
 
     /// Appends both names to the arenas, and gives the entry for them.
@@ -398,53 +546,51 @@ impl Index {
             true => FOLDER,
             false => 0,
         };
-        let lengths = name.len() as u32 | (folded.len() as u32) << LENGTH_BITS;
         let entry = Entry {
             parent,
-            name: offset(self.names.len()),
-            folded: offset(self.folded.len()),
-            lengths: lengths | flags << (2 * LENGTH_BITS),
+            name: 0,
+            folded: 0,
+            lengths: flags << (2 * LENGTH_BITS),
         };
+        let entry = entry.named(
+            offset(self.names.len()),
+            name.len(),
+            offset(self.folded.len()),
+            folded.len(),
+        );
         self.names.push_str(name);
         self.folded.push_str(folded);
         entry
     }
 
+    /// Marks the entry at `at` removed, its place free and its name given
+    /// up. It is no longer in any list.
     fn kill(&mut self, at: u32) {
-        self.entries[at as usize].lengths |= REMOVED << (2 * LENGTH_BITS);
+        let entry = &mut self.entries[at as usize];
+        entry.lengths |= REMOVED << (2 * LENGTH_BITS);
+        self.garbage += entry.name_len();
+        self.links[at as usize] = UNLINKED;
         self.free.push(at);
     }
+}
 
-    /// The live entries with a removed folder above them.
-    fn orphans(&self) -> Vec<u32> {
-        let mut known = vec![None; self.entries.len()];
-        let mut chain = Vec::new();
-        let all = 0..offset(self.entries.len());
-        let live = all.filter(|&at| self.entries[at as usize].is_live());
-        live.filter(|&at| self.under_removed(at, &mut known, &mut chain))
-            .collect()
-    }
+/// Where `rebuild` takes a name's folded copy from.
+#[derive(Clone, Copy)]
+enum Fold {
+    /// Folds the name again, refusing one `add` would refuse.
+    Again,
+    /// The copy the arena holds.
+    Kept,
+}
 
-    /// Whether a removed entry is above `at`, remembering the answer for
-    /// every folder on the way up. `chain` is scratch space.
-    fn under_removed(&self, at: u32, known: &mut [Option<bool>], chain: &mut Vec<u32>) -> bool {
-        chain.clear();
-        let mut verdict = false;
-        for step in self.ancestry(at) {
-            if let Some(answer) = known[step as usize] {
-                verdict = answer;
-                break;
-            }
-            if !self.entries[step as usize].is_live() {
-                verdict = true;
-                break;
-            }
-            chain.push(step);
+impl Fold {
+    fn of(self, index: &Index, entry: Entry) -> Option<Cow<'_, str>> {
+        match self {
+            Fold::Again => checked(index.name_of(entry), entry.is_root())
+                .ok()
+                .map(Cow::Owned),
+            Fold::Kept => Some(Cow::Borrowed(index.folded_of(entry))),
         }
-        for &step in chain.iter() {
-            known[step as usize] = Some(verdict);
-        }
-        verdict
     }
 }
 
@@ -454,9 +600,15 @@ fn offset(at: usize) -> u32 {
     u32::try_from(at).expect("the index stays under 4 GB of names and 4 billion entries")
 }
 
-/// `text` lowercased, as Windows compares names: `Ё` as `ё`, never as `е`.
-fn lower(text: &str) -> String {
-    text.to_lowercase()
+/// Whether two names are the same to Windows, which compares them letter
+/// by letter in any case: `Ё` as `ё`, never as `е`.
+fn same(one: &str, other: &str) -> bool {
+    let lower = |name: &str| {
+        name.chars()
+            .flat_map(char::to_lowercase)
+            .collect::<Vec<_>>()
+    };
+    one == other || lower(one) == lower(other)
 }
 
 /// The name folded, if it can be a name: not empty, not too long either
@@ -723,6 +875,76 @@ mod tests {
     }
 
     #[test]
+    fn putting_a_name_already_there_keeps_the_one_entry() {
+        let (mut index, [_, _, me, notes, ..]) = drive();
+        assert_eq!(index.put(me, "notes.txt", false), Ok(notes));
+        assert_eq!(index.put(me, "NOTES.TXT", false), Ok(notes), "in any case");
+        assert_eq!(index.len(), 6);
+        assert_eq!(index.name(notes), Some("notes.txt"));
+    }
+
+    #[test]
+    fn putting_a_new_name_adds_it() {
+        let (mut index, [_, _, me, ..]) = drive();
+        let todo = index.put(me, "todo.md", false).unwrap();
+        assert_eq!(index.path(todo).as_deref(), Some(r"C:\Users\Me\todo.md"));
+        assert_eq!(index.find(r"C:\Users\Me\todo.md"), Some(todo));
+        assert_eq!(index.len(), 7);
+        assert_eq!(index.put(todo, "x", false), Err(Error::NotAFolder));
+    }
+
+    #[test]
+    fn putting_a_name_of_the_other_kind_replaces_it() {
+        let (mut index, [_, users, me, ..]) = drive();
+        let folder = index.put(me, "notes.txt", true).unwrap();
+        assert_eq!(index.is_folder(folder), Some(true));
+        assert_eq!(index.len(), 6);
+        let file = index.put(users, "Me", false).unwrap();
+        assert_eq!(index.is_folder(file), Some(false));
+        let inside = index.find(r"C:\Users\Me\notes.txt");
+        assert_eq!(inside, None, "gone with the folder");
+        assert_eq!(index.len(), 5, "Me and notes.txt went, the file Me came");
+    }
+
+    #[test]
+    fn a_moved_entry_is_found_at_its_new_path_only() {
+        let (mut index, [_, _, me, notes, windows, _]) = drive();
+        index.rename(notes, windows, "n.txt").unwrap();
+        assert_eq!(index.find(r"C:\Users\Me\notes.txt"), None);
+        assert_eq!(index.find(r"C:\Windows\n.txt"), Some(notes));
+        index.rename(me, windows, "Me").unwrap();
+        assert_eq!(index.find(r"C:\Users\Me"), None);
+        assert_eq!(index.find(r"C:\Windows\Me"), Some(me));
+    }
+
+    #[test]
+    fn a_rename_onto_a_name_there_takes_its_place() {
+        let (mut index, [_, _, me, notes, windows, _]) = drive();
+        let there = index.add(windows, "a.txt", false).unwrap();
+        index.rename(notes, windows, "A.TXT").unwrap();
+        assert_eq!(index.find(r"C:\Windows\a.txt"), Some(notes));
+        assert_eq!(index.name(there), None, "replaced");
+        assert_eq!(index.len(), 6);
+        index.rename(notes, windows, "a.txt").unwrap();
+        assert_eq!(index.name(notes), Some("a.txt"), "a change of case alone");
+        assert_eq!(index.len(), 6);
+        assert!(index.path(me).is_some());
+    }
+
+    #[test]
+    fn names_given_up_are_reclaimed() {
+        let (mut index, [_, _, me, notes, ..]) = drive();
+        for n in 0..10_000 {
+            let temporary = index.put(me, &format!("temporary file {n}.tmp"), false);
+            index.remove(temporary.unwrap()).unwrap();
+            index.rename(notes, me, &format!("notes {n}.txt")).unwrap();
+        }
+        assert!(index.memory() < 4096, "{} bytes", index.memory());
+        assert_eq!(index.find(r"C:\Users\Me\notes 9999.txt"), Some(notes));
+        assert_eq!(index.find(r"C:\Windows\System32").map(|_| ()), Some(()));
+    }
+
+    #[test]
     fn an_entry_is_sixteen_bytes() {
         assert_eq!(size_of::<Entry>(), 16);
     }
@@ -742,9 +964,9 @@ mod tests {
         let (mut index, [_, _, _, notes, ..]) = drive();
         index.remove(notes).unwrap();
         index.shrink_to_fit();
-        // Six entries; C:, Users, Me, notes.txt, Windows, System32 twice;
-        // one free place.
-        assert_eq!(index.memory(), 6 * 16 + 2 * 33 + 4);
+        // Six entries and their links; C:, Users, Me, notes.txt, Windows,
+        // System32 twice; one free place.
+        assert_eq!(index.memory(), 6 * (16 + 12) + 2 * 33 + 4);
         assert_eq!(
             index.path(EntryId(5)).as_deref(),
             Some(r"C:\Windows\System32")

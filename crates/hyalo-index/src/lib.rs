@@ -5,7 +5,9 @@
 //!
 //! Names live in one arena, with a folded copy (as `matcher::folded`
 //! gives it) in another; each file or folder is a 16-byte entry pointing
-//! into both and at the folder it is in. Full paths are built only for
+//! into both and at the folder it is in. Beside each entry, links put it
+//! in its folder's list of entries, so a path is found, and a folder
+//! removed, without a pass over the index. Full paths are built only for
 //! the rows a search returns.
 
 mod index;

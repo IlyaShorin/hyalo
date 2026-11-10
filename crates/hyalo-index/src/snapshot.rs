@@ -172,11 +172,23 @@ mod tests {
     }
 
     #[test]
+    fn a_loaded_index_finds_entries_by_path_and_changes_them() {
+        let mut back = loaded(&saved(&small())).expect("load");
+        let a = back.find(r"C:\A").expect("a folder");
+        assert_eq!(back.put(a, "b.txt", false).map(|_| back.len()), Ok(4));
+        let tree = back.find(r"C:\a\ёлка.txt").expect("found in any case");
+        back.remove(a).unwrap();
+        assert_eq!(back.name(tree), None, "went with its folder");
+        assert_eq!(back.len(), 1);
+    }
+
+    #[test]
     fn loading_takes_no_more_memory_than_it_needs() {
         let back = loaded(&saved(&small())).expect("load");
-        // Four entries; C:, a, gone and Ёлка.txt; the three live ones
-        // folded; one free place.
-        assert_eq!(back.memory(), 4 * 16 + 19 + 15 + 4);
+        // Four entries and their links; C:, a and Ёлка.txt as given and
+        // folded (the name of the one removed is not loaded); one free
+        // place.
+        assert_eq!(back.memory(), 4 * (16 + 12) + 15 + 15 + 4);
     }
 
     #[test]
