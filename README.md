@@ -102,6 +102,13 @@ git tag -a v0.0.2 -m "What is new" -m "* one line per change"
 git push origin v0.0.2
 ```
 
+Or from this machine, with the same checks and the same two assets: `scripts/release.ps1` builds the commit checked out (committed and pushed), writes `target\release-dist\hyalo.exe` and `hyalo.exe.sha256`, and creates the release with `gh`, which puts the tag on that commit; the workflow that tag starts finds the release out and publishes nothing. `-DryRun` does everything but talk to GitHub.
+
+```sh
+powershell -ExecutionPolicy Bypass -File scripts/release.ps1 -Tag v0.0.2 -NotesFile notes.md -DryRun
+powershell -ExecutionPolicy Bypass -File scripts/release.ps1 -Tag v0.0.2 -NotesFile notes.md
+```
+
 ## Development
 
 Changes follow [ub-mode](https://github.com/unclebob/ub-mode): test first, smallest edit, pure logic behind thin platform glue, small commits. Quality gates use Uncle Bob's [crapper](https://github.com/unclebob/crapper), [dryer](https://github.com/unclebob/dryer) and [mutator](https://github.com/unclebob/mutator):

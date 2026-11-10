@@ -669,6 +669,19 @@ mod tests {
     }
 
     #[test]
+    fn the_release_script_publishes_the_same_exe_and_sum_as_the_workflow() {
+        let script = include_str!("../../../scripts/release.ps1");
+        for line in [
+            format!(r#"$exe = Join-Path $dist "{EXE}""#),
+            format!(r#"$sum = Join-Path $dist "{SUM}""#),
+            format!(r#"[IO.File]::WriteAllText($sum, "$hash  {EXE}`n")"#),
+            "gh release create $Tag $exe $sum --target $commit".to_string(),
+        ] {
+            assert!(script.contains(&line), "{line}");
+        }
+    }
+
+    #[test]
     fn the_sum_file_is_named_after_the_exe() {
         assert_eq!(SUM, format!("{EXE}.sha256"));
         assert_eq!(

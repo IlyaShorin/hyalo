@@ -10,7 +10,9 @@
 #   git tag -a v0.0.2 -m "What is new, one line per change"
 #   git push origin v0.0.2
 #
-# A tag that does not name the workspace version fails the workflow.
+# A tag that does not name the workspace version fails the workflow. A
+# release that is out already (scripts/release.ps1 publishes from a
+# machine of its own, and creates the tag with it) is left as it is.
 name: Release
 
 on:
@@ -32,7 +34,7 @@ jobs:
     env:
       TAG: ${{ github.ref_name }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Check that the tag names the workspace version
         run: |
@@ -69,5 +71,10 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          gh release view $env:TAG *> $null
+          if ($LASTEXITCODE -eq 0) {
+            "The release $env:TAG is out already: nothing to publish."
+            exit 0
+          }
           gh release create $env:TAG dist\hyalo.exe dist\hyalo.exe.sha256 `
             --verify-tag --title "hyalo $env:VERSION" --notes-file notes.md
