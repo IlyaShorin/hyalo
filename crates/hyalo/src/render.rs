@@ -156,6 +156,11 @@ impl Renderer {
         }
         self.draw_separator(w)?;
         self.draw_selection(scene.selected, w)?;
+        self.draw_rows(scene, w)
+    }
+
+    /// Each row in its place, the asking one's question in amber.
+    fn draw_rows(&mut self, scene: &Scene, w: f32) -> Result<()> {
         for (index, row) in scene.rows.iter().enumerate() {
             let asks = scene.asking && index == scene.selected;
             let said = match asks {
@@ -361,11 +366,7 @@ impl Renderer {
 
     /// A row at `top`, its second line in `said`.
     fn draw_row(&mut self, row: &Row, top: f32, w: f32, said: D2D1_COLOR_F) -> Result<()> {
-        match (row.icon, row.glyph) {
-            (Some(icon), _) => self.draw_icon(row.id, icon, top)?,
-            (None, Some(glyph)) => self.draw_glyph(glyph, top)?,
-            (None, None) => {}
-        }
+        self.draw_picture(row, top)?;
         let width = w - TEXT_LEFT - TEXT_RIGHT_PAD;
         let (title_top, title_height) = TITLE_LINE;
         let title = self
@@ -399,6 +400,15 @@ impl Renderer {
                 .DrawBitmap(&bitmap, Some(&place), 1.0, smooth, None, None)
         };
         Ok(())
+    }
+
+    /// The row's icon, or its symbol where it has none.
+    fn draw_picture(&mut self, row: &Row, top: f32) -> Result<()> {
+        match (row.icon, row.glyph) {
+            (Some(icon), _) => self.draw_icon(row.id, icon, top),
+            (None, Some(glyph)) => self.draw_glyph(glyph, top),
+            (None, None) => Ok(()),
+        }
     }
 
     /// A symbol in the icon's place, centred in it.

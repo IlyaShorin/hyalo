@@ -120,12 +120,11 @@ const fn item(
     russian: &'static str,
     keywords: &'static [&'static str],
 ) -> Setting {
+    let opened = page(target, english, russian, keywords);
     Setting {
-        opens: Opens::Shell(target),
         icon: target,
         panel: Panel::ControlPanel,
-        names: [english, russian],
-        keywords,
+        ..opened
     }
 }
 
@@ -138,12 +137,10 @@ const fn program(
     russian: &'static str,
     keywords: &'static [&'static str],
 ) -> Setting {
+    let shown = item(icon, english, russian, keywords);
     Setting {
         opens: Opens::Program(program, arguments),
-        icon,
-        panel: Panel::ControlPanel,
-        names: [english, russian],
-        keywords,
+        ..shown
     }
 }
 

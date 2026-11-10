@@ -1519,10 +1519,22 @@ fn hide(hwnd: HWND) {
 /// it only when the row has a folder to show.
 fn on_key(hwnd: HWND, key: VIRTUAL_KEY) -> Result<()> {
     let held = held();
-    let command = keys::command(key, held);
-    if !matches!(command, Some(Command::Open { .. })) {
-        with_app(App::calm).unwrap_or(Ok(()))?;
+    match keys::command(key, held) {
+        Some(command @ Command::Open { .. }) => on_enter(hwnd, command),
+        command => {
+            with_app(App::calm).unwrap_or(Ok(()))?;
+            on_other_key(hwnd, (key, held), command)
+        }
     }
+}
+
+/// Any key but Enter, once the selected row stopped asking: moves the
+/// selection, hides, acts on the row, or edits the query.
+fn on_other_key(
+    hwnd: HWND,
+    (key, held): (VIRTUAL_KEY, Held),
+    command: Option<Command>,
+) -> Result<()> {
     let moved = match command {
         Some(Command::Up) => with_app(|app| app.move_selection(Results::up)),
         Some(Command::Down) => with_app(|app| app.move_selection(Results::down)),
@@ -1530,7 +1542,6 @@ fn on_key(hwnd: HWND, key: VIRTUAL_KEY) -> Result<()> {
             hide(hwnd);
             None
         }
-        Some(command @ Command::Open { .. }) => return on_enter(hwnd, command),
         Some(command) => {
             if with_app(|app| app.act(command)) == Some(true) {
                 hide(hwnd);
