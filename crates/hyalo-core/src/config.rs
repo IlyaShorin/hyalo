@@ -177,11 +177,12 @@ fn unreadable(text: &str, error: &toml::de::Error) -> Problem {
 }
 
 /// An excluded path: a full path below a drive, with backslashes and no
-/// backslash at the end.
+/// backslash at the end. A drive alone, `C:\`, is `C:` once its
+/// backslash is gone, which is no full path.
 fn excluded(text: &str) -> Result<String, String> {
     let path = text.trim().replace('/', "\\");
     let path = path.trim_end_matches('\\');
-    match path.len() > 3 && places::full_path(path) {
+    match places::full_path(path) {
         true => Ok(path.to_string()),
         false => Err(format!("`{text}` is not a full path such as `D:\\old`")),
     }
