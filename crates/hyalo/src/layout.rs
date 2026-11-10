@@ -1,6 +1,8 @@
 //! Where the launcher window goes on a monitor, and what is where in it.
 //! Pure math, no Win32.
 
+use crate::results::MAX_ROWS;
+
 /// A rectangle in physical pixels.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Rect {
@@ -33,19 +35,95 @@ const MAX_WIDTH_SHARE: f32 = 0.9;
 /// The top edge sits this far down the work area.
 const TOP_SHARE: f32 = 0.22;
 
-/// Places the launcher on a monitor: centred horizontally, in the upper
-/// part of the work area, sized for the monitor's DPI scale. With `rows`
-/// results it grows down from the bar, which stays where it was.
-pub fn launcher_rect(work_area: Rect, scale: f32, rows: usize) -> Rect {
-    let width = (WIDTH_DIP * scale)
-        .min(work_area.width as f32 * MAX_WIDTH_SHARE)
-        .round() as i32;
+/// Places the launcher on a monitor, sized for the monitor's DPI scale:
+/// at `position` if the user dragged it somewhere, kept within the work
+/// area; else centred horizontally, in the upper part of the work area.
+/// With `rows` results it grows down from the bar, which stays where it
+/// was.
+pub fn launcher_rect(work_area: Rect, scale: f32, rows: usize, position: Option<Position>) -> Rect {
+    let width = launcher_width(work_area, scale);
+    let centre = centre_x(work_area, width);
+    let (x, y) = match position {
+        None => (
+            centre,
+            work_area.y + (work_area.height as f32 * TOP_SHARE).round() as i32,
+        ),
+        Some(position) => within(
+            work_area,
+            (width, scale),
+            (
+                centre + (position.x * scale).round() as i32,
+                work_area.y + (position.y * scale).round() as i32,
+            ),
+        ),
+    };
     Rect {
-        x: work_area.x + (work_area.width - width) / 2,
-        y: work_area.y + (work_area.height as f32 * TOP_SHARE).round() as i32,
+        x,
+        y,
         width,
         height: (height(rows) * scale).round() as i32,
     }
+}
+
+/// Where the user put the launcher: its centre's offset from its work
+/// area's centre, and its top's offset from the work area's top, in DIPs,
+/// so that it is the same place on a monitor of another size or scale.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Position {
+    pub x: f32,
+    pub y: f32,
+}
+
+impl Position {
+    /// The position a position file holds: two numbers.
+    pub fn parse(text: &str) -> Option<Position> {
+        let mut numbers = text.split_whitespace().map(|number| {
+            let number = number.parse::<f32>().ok();
+            number.filter(|number| number.is_finite())
+        });
+        let (x, y) = (numbers.next()??, numbers.next()??);
+        numbers.next().is_none().then_some(Position { x, y })
+    }
+
+    /// The position as a position file holds it.
+    pub fn written(self) -> String {
+        format!("{} {}\n", self.x, self.y)
+    }
+}
+
+/// The position of a launcher whose top left corner is at `corner`, in
+/// pixels, on a monitor with `work_area` and `scale`: moved as little as
+/// keeps the launcher, with its longest list, within the work area.
+pub fn position_at(corner: (i32, i32), work_area: Rect, scale: f32) -> Position {
+    let width = launcher_width(work_area, scale);
+    let (x, y) = within(work_area, (width, scale), corner);
+    Position {
+        x: (x - centre_x(work_area, width)) as f32 / scale,
+        y: (y - work_area.y) as f32 / scale,
+    }
+}
+
+/// The launcher's width in pixels on a monitor with `work_area` and
+/// `scale`: never more than most of the work area.
+fn launcher_width(work_area: Rect, scale: f32) -> i32 {
+    (WIDTH_DIP * scale)
+        .min(work_area.width as f32 * MAX_WIDTH_SHARE)
+        .round() as i32
+}
+
+/// Where a launcher `width` wide starts when it is centred.
+fn centre_x(work_area: Rect, width: i32) -> i32 {
+    work_area.x + (work_area.width - width) / 2
+}
+
+/// `corner` moved as little as keeps a launcher `width` pixels wide, at
+/// `scale`, with its longest list, within `work_area`; at the top where
+/// the work area is too short for that list.
+fn within(work_area: Rect, (width, scale): (i32, f32), (x, y): (i32, i32)) -> (i32, i32) {
+    let tallest = (height(MAX_ROWS) * scale).round() as i32;
+    let right = (work_area.x + work_area.width - width).max(work_area.x);
+    let bottom = (work_area.y + work_area.height - tallest).max(work_area.y);
+    (x.clamp(work_area.x, right), y.clamp(work_area.y, bottom))
 }
 
 /// The launcher's height in DIPs: the bar, then the list if it has rows.
@@ -157,7 +235,7 @@ mod tests {
 
     #[test]
     fn sits_centred_in_the_upper_part_of_the_screen() {
-        let rect = launcher_rect(FULL_HD, 1.0, 0);
+        let rect = launcher_rect(FULL_HD, 1.0, 0, None);
         assert_eq!(
             rect,
             Rect {
@@ -177,7 +255,7 @@ mod tests {
             width: 3840,
             height: 2100,
         };
-        let rect = launcher_rect(work_area, 1.5, 0);
+        let rect = launcher_rect(work_area, 1.5, 0, None);
         assert_eq!(
             rect,
             Rect {
@@ -197,21 +275,21 @@ mod tests {
             width: 600,
             height: 800,
         };
-        let rect = launcher_rect(work_area, 1.0, 0);
+        let rect = launcher_rect(work_area, 1.0, 0, None);
         assert_eq!((rect.x, rect.width), (30, 540));
     }
 
     #[test]
     fn grows_down_by_a_row_per_result_plus_padding_around_the_list() {
-        let bar = launcher_rect(FULL_HD, 1.0, 0);
-        let list = launcher_rect(FULL_HD, 1.0, 3);
+        let bar = launcher_rect(FULL_HD, 1.0, 0, None);
+        let list = launcher_rect(FULL_HD, 1.0, 3, None);
         assert_eq!((list.x, list.y, list.width), (bar.x, bar.y, bar.width));
         assert_eq!(list.height, 64 + 8 + 3 * 48 + 8);
     }
 
     #[test]
     fn the_list_grows_with_the_monitor_scale_too() {
-        let rect = launcher_rect(FULL_HD, 1.5, 8);
+        let rect = launcher_rect(FULL_HD, 1.5, 8, None);
         assert_eq!(rect.height, 696);
     }
 
@@ -276,6 +354,91 @@ mod tests {
             Part::Text,
             "the bar keeps its text"
         );
+    }
+
+    #[test]
+    fn where_it_shows_by_default_is_a_position_too() {
+        let default = launcher_rect(FULL_HD, 1.0, 0, None);
+        let position = position_at((default.x, default.y), FULL_HD, 1.0);
+        assert_eq!(position, Position { x: 0.0, y: 229.0 });
+        assert_eq!(launcher_rect(FULL_HD, 1.0, 0, Some(position)), default);
+    }
+
+    #[test]
+    fn a_position_is_its_centre_from_the_work_areas_centre_and_its_top_in_dips() {
+        let work_area = Rect {
+            x: -1920,
+            y: 40,
+            width: 1920,
+            height: 1040,
+        };
+        let position = position_at((-1920 + 300, 40 + 150), work_area, 1.5);
+        assert_eq!(position, Position { x: -80.0, y: 100.0 });
+        let rect = launcher_rect(work_area, 1.5, 3, Some(position));
+        assert_eq!((rect.x, rect.y), (-1920 + 300, 40 + 150));
+        assert_eq!(rect.width, 1080);
+        assert_eq!(rect.height, launcher_rect(work_area, 1.5, 3, None).height);
+    }
+
+    #[test]
+    fn a_position_dragged_past_the_work_area_stops_where_the_tallest_list_still_fits() {
+        let tallest = launcher_rect(FULL_HD, 1.0, 8, None).height;
+        let corners = [(-500, -500), (5000, 5000), (5000, -500), (-500, 5000)];
+        let expected = [
+            (0, 0),
+            (1200, 1040 - tallest),
+            (1200, 0),
+            (0, 1040 - tallest),
+        ];
+        for (corner, expected) in corners.into_iter().zip(expected) {
+            let position = position_at(corner, FULL_HD, 1.0);
+            let rect = launcher_rect(FULL_HD, 1.0, 0, Some(position));
+            assert_eq!((rect.x, rect.y), expected, "{corner:?}");
+        }
+    }
+
+    #[test]
+    fn a_position_kept_from_a_larger_monitor_still_fits_a_smaller_one() {
+        let small = Rect {
+            x: 0,
+            y: 0,
+            width: 1280,
+            height: 600,
+        };
+        let far = position_at((1200, 576 - 1), FULL_HD, 1.0);
+        let rect = launcher_rect(small, 1.0, 0, Some(far));
+        let tallest = launcher_rect(small, 1.0, 8, None).height;
+        assert_eq!((rect.x, rect.y), (1280 - 720, 600 - tallest));
+        let tiny = Rect {
+            x: 10,
+            y: 20,
+            width: 700,
+            height: 300,
+        };
+        let rect = launcher_rect(tiny, 1.0, 0, Some(far));
+        assert_eq!(
+            (rect.x, rect.y),
+            (10 + 700 - 630, 20),
+            "too short for the list: at the top"
+        );
+    }
+
+    #[test]
+    fn a_position_is_written_as_two_numbers_and_read_back() {
+        let position = Position {
+            x: -120.5,
+            y: 300.0,
+        };
+        assert_eq!(position.written(), "-120.5 300\n");
+        assert_eq!(Position::parse(&position.written()), Some(position));
+        assert_eq!(Position::parse("  7 8 "), Some(Position { x: 7.0, y: 8.0 }));
+    }
+
+    #[test]
+    fn a_position_file_that_does_not_read_is_no_position() {
+        for text in ["", "7", "7 8 9", "x 8", "7 y", "NaN 8", "7 inf"] {
+            assert_eq!(Position::parse(text), None, "{text:?}");
+        }
     }
 
     #[test]
@@ -346,7 +509,7 @@ mod tests {
             width: 1920,
             height: 1040,
         };
-        let rect = launcher_rect(left_monitor, 1.0, 0);
+        let rect = launcher_rect(left_monitor, 1.0, 0, None);
         assert_eq!((rect.x, rect.y), (-1320, 329));
     }
 }

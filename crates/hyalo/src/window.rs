@@ -10,7 +10,7 @@
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, channel};
@@ -41,9 +41,9 @@ use windows::Win32::UI::Shell::{NIN_SELECT, NINF_KEY};
 use windows::Win32::UI::WindowsAndMessaging::{
     AllowSetForegroundWindow, CS_DBLCLKS, CW_USEDEFAULT, CreateWindowExW, DefWindowProcW,
     DestroyWindow, DispatchMessageW, FindWindowW, GetCursorPos, GetMessagePos, GetMessageW,
-    GetSystemMetrics, GetWindowThreadProcessId, HTCLIENT, HWND_TOPMOST, IDC_ARROW, IDC_IBEAM,
-    IsWindow, IsWindowVisible, LoadCursorW, MSG, PostMessageW, PostQuitMessage, RegisterClassExW,
-    SM_CXDOUBLECLK, SM_CYDOUBLECLK, SW_HIDE, SW_SHOW, SWP_NOACTIVATE, SetCursor,
+    GetSystemMetrics, GetWindowRect, GetWindowThreadProcessId, HTCLIENT, HWND_TOPMOST, IDC_ARROW,
+    IDC_IBEAM, IsWindow, IsWindowVisible, LoadCursorW, MSG, PostMessageW, PostQuitMessage,
+    RegisterClassExW, SM_CXDOUBLECLK, SM_CYDOUBLECLK, SW_HIDE, SW_SHOW, SWP_NOACTIVATE, SetCursor,
     SetForegroundWindow, SetWindowPos, ShowWindow, TranslateMessage, WA_INACTIVE, WM_ACTIVATE,
     WM_APP, WM_CHAR, WM_CONTEXTMENU, WM_DESTROY, WM_HOTKEY, WM_KEYDOWN, WM_LBUTTONDBLCLK,
     WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCCALCSIZE, WM_NCHITTEST, WM_SETCURSOR,
@@ -62,7 +62,7 @@ use crate::highlight::utf16_ranges;
 use crate::hotkeys::{self, Hotkeys};
 use crate::instance::Start;
 use crate::keys::{self, Command, Held};
-use crate::layout::{self, Part, Rect};
+use crate::layout::{self, Part, Position, Rect};
 use crate::notice::Notice;
 use crate::picker::{self, Picker};
 use crate::render::{Renderer, Row, Scene};
@@ -98,9 +98,10 @@ struct Placement {
 }
 
 impl Placement {
-    /// The launcher's rectangle with `rows` results listed.
-    fn rect(self, rows: usize) -> Rect {
-        layout::launcher_rect(self.work_area, layout::scale(self.dpi), rows)
+    /// The launcher's rectangle with `rows` results listed, at `position`
+    /// if the user dragged it somewhere.
+    fn rect(self, rows: usize, position: Option<Position>) -> Rect {
+        layout::launcher_rect(self.work_area, layout::scale(self.dpi), rows, position)
     }
 }
 
@@ -139,6 +140,9 @@ pub struct Services {
     pub autostart: Option<Autostart>,
     /// Asks the user for a folder, for the settings window.
     pub picker: Rc<dyn Picker>,
+    /// Where the place the launcher was dragged to is kept; `None` keeps
+    /// it in memory.
+    pub position: Option<PathBuf>,
 }
 
 impl Services {
@@ -183,6 +187,7 @@ impl Services {
             config: settings::default_path(),
             autostart: Autostart::real(),
             picker: Rc::new(picker::System),
+            position: store::ours("LOCALAPPDATA", "position.txt"),
         }
     }
 }
@@ -237,15 +242,20 @@ struct App {
     /// When and where the last double-click in the query was, until a
     /// third click uses it.
     double: Option<(Instant, (i32, i32))>,
+    /// Where the user dragged the launcher; `None` where it goes at first.
+    position: Option<Position>,
 }
 
 /// What the left button went down on.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 enum Press {
     /// The query: moving selects.
     Text,
     /// A row: letting go over it opens it.
     Row(usize),
+    /// The glass: the launcher follows the pointer, which holds it at
+    /// this point, in client pixels.
+    Drag(POINT),
 }
 
 impl App {
@@ -372,9 +382,15 @@ impl App {
         self.save_picks();
     }
 
+    /// The window's rectangle for the rows it lists, where it goes.
+    fn rect(&self) -> Rect {
+        self.placement
+            .rect(self.results.rows().len(), self.position)
+    }
+
     /// Sizes the window for the rows it lists and draws it.
     fn present(&mut self) -> Result<()> {
-        let rect = self.placement.rect(self.results.rows().len());
+        let rect = self.rect();
         let (width, height) = (rect.width as u32, rect.height as u32);
         let dpi = self.placement.dpi;
         match &mut self.renderer {
@@ -384,6 +400,12 @@ impl App {
         self.redraw()?;
         // The picture first, then the window: growing, it never shows
         // glass without the picture for a frame.
+        self.put_window()
+    }
+
+    /// Puts the window where it goes, at the size of what it lists.
+    fn put_window(&self) -> Result<()> {
+        let rect = self.rect();
         unsafe {
             SetWindowPos(
                 self.hwnd,
@@ -394,6 +416,46 @@ impl App {
                 rect.height,
                 SWP_NOACTIVATE,
             )
+        }
+    }
+
+    /// Moves the launcher with the pointer, at `point` in client pixels,
+    /// that holds it at `grab`, as far as it stays within its work area.
+    fn drag(&mut self, point: POINT, grab: POINT) -> Result<()> {
+        let mut rect = RECT::default();
+        // SAFETY: a plain call into a live RECT.
+        unsafe { GetWindowRect(self.hwnd, &mut rect)? };
+        let corner = (rect.left + point.x - grab.x, rect.top + point.y - grab.y);
+        let (work_area, scale) = (self.placement.work_area, layout::scale(self.placement.dpi));
+        self.position = Some(layout::position_at(corner, work_area, scale));
+        self.put_window()
+    }
+
+    /// The launcher goes back where it goes at first, and stays there.
+    fn put_back(&mut self) -> Result<()> {
+        self.position = None;
+        self.keep_position();
+        self.put_window()
+    }
+
+    /// Keeps where the launcher was dragged to in the position file, if
+    /// there is one; with no position, the file goes.
+    fn keep_position(&self) {
+        let Some(path) = &self.services.position else {
+            return;
+        };
+        let kept = match self.position {
+            Some(position) => store::replace(path, position.written().as_bytes()),
+            None => std::fs::remove_file(path).or_else(|error| match error.kind() {
+                std::io::ErrorKind::NotFound => Ok(()),
+                _ => Err(error),
+            }),
+        };
+        if let Err(error) = kept {
+            eprintln!(
+                "hyalo: cannot keep the launcher's place in {}: {error}",
+                path.display()
+            );
         }
     }
 
@@ -433,7 +495,7 @@ impl App {
     fn part_at(&self, point: POINT) -> Part {
         let scale = layout::scale(self.placement.dpi);
         let rows = self.results.rows().len();
-        let width = self.placement.rect(rows).width as f32 / scale;
+        let width = self.rect().width as f32 / scale;
         let (x, y) = (point.x as f32 / scale, point.y as f32 / scale);
         layout::part_at(x, y, width, rows)
     }
@@ -462,7 +524,7 @@ impl App {
             Part::Text if self.third(point) => (None, self.query.apply(Edit::SelectAll)),
             Part::Text => (Some(Press::Text), self.place(point, shift)),
             Part::Row(row) => (Some(Press::Row(row)), Edited::Nothing),
-            Part::Glass => (None, Edited::Nothing),
+            Part::Glass => (Some(Press::Drag(point)), Edited::Nothing),
         };
         self.pressed = pressed;
         self.refresh(edited)
@@ -481,11 +543,19 @@ impl App {
     }
 
     /// A double-click at `point`: in the query it selects the word there;
-    /// elsewhere it is a press like any other.
+    /// on the glass it puts the launcher back where it goes at first; on a
+    /// row it is a press like any other.
     fn double_click(&mut self, point: POINT) -> Result<()> {
-        if self.part_at(point) != Part::Text {
-            return self.press(point, false);
+        match self.part_at(point) {
+            Part::Text => self.select_word(point),
+            Part::Glass => self.put_back(),
+            Part::Row(_) => self.press(point, false),
         }
+    }
+
+    /// Selects the word at `point` in the query, and notes the
+    /// double-click for a third click.
+    fn select_word(&mut self, point: POINT) -> Result<()> {
         self.double = Some((Instant::now(), (point.x, point.y)));
         self.pressed = None;
         let edited = self
@@ -502,16 +572,28 @@ impl App {
                 let edited = self.place(point, true);
                 self.refresh(edited)
             }
+            Some(Press::Drag(grab)) => self.drag(point, grab),
             _ => self.hover(point),
         }
     }
 
     /// The left button came up at `point`: over the row it went down on,
-    /// that row opens, as Enter would. Whether one did.
+    /// that row opens, as Enter would; after a drag, where the launcher
+    /// went is kept. Whether a row opened.
     fn release(&mut self, point: POINT) -> bool {
-        let Some(Press::Row(row)) = self.pressed.take() else {
-            return false;
-        };
+        match self.pressed.take() {
+            Some(Press::Row(row)) => self.open(row, point),
+            Some(Press::Drag(_)) => {
+                self.keep_position();
+                false
+            }
+            _ => false,
+        }
+    }
+
+    /// Opens row `row` if the button came up over it at `point`; whether
+    /// it did.
+    fn open(&mut self, row: usize, point: POINT) -> bool {
         if self.row_under(point) != Some(row) {
             return false;
         }
@@ -798,6 +880,7 @@ fn open(services: Services, shown: bool) -> Result<HWND> {
     let sources = services.sources.len();
     let places = services.places.clone();
     let seen = services.config.as_deref().and_then(settings::contents);
+    let position = services.position.as_deref().and_then(read_position);
     APP.with_borrow_mut(|app| {
         let mut opened = App {
             hwnd,
@@ -821,6 +904,7 @@ fn open(services: Services, shown: bool) -> Result<HWND> {
             settings: None,
             pressed: None,
             double: None,
+            position,
         };
         opened.find_picked();
         let loaded = seen.clone().map_or(Ok(Config::default()), settings::read);
@@ -1136,10 +1220,11 @@ fn set_cursor_over(hwnd: HWND, at: POINT) -> Result<()> {
     Ok(())
 }
 
-/// Takes the mouse for `hwnd` when the button went down in the query.
+/// Takes the mouse for `hwnd` while the button is down on something, so
+/// selecting and dragging go on outside it.
 fn capture_while(hwnd: HWND, pressed: Option<Result<Option<Press>>>) -> Result<()> {
     match pressed {
-        Some(Ok(Some(Press::Text))) => {
+        Some(Ok(Some(_))) => {
             // SAFETY: a plain call on a window of this thread.
             unsafe { SetCapture(hwnd) };
             Ok(())
@@ -1310,6 +1395,11 @@ fn text_edited(changed: bool) -> Edited {
         true => Edited::Text,
         false => Edited::Nothing,
     }
+}
+
+/// The position the file at `path` keeps, if it keeps one.
+fn read_position(path: &Path) -> Option<Position> {
+    Position::parse(&std::fs::read_to_string(path).ok()?)
 }
 
 /// Where the launcher goes: the monitor under the mouse cursor.
@@ -1547,6 +1637,7 @@ mod tests {
             config: None,
             autostart: None,
             picker: Rc::new(Chooser::default()),
+            position: None,
         };
         (services, ran)
     }
@@ -1724,7 +1815,7 @@ mod tests {
         pub(super) fn mouse_with(&self, message: u32, x: f32, y: f32, keys: usize) {
             let scale = layout::scale(self.placement().dpi);
             let (x, y) = ((x * scale) as isize, (y * scale) as isize);
-            let point = LPARAM(y << 16 | x);
+            let point = LPARAM((y & 0xFFFF) << 16 | (x & 0xFFFF));
             unsafe { SendMessageW(self.0, message, Some(WPARAM(keys)), Some(point)) };
         }
 
@@ -1865,7 +1956,7 @@ mod tests {
             assert!(launcher.visible());
             let monitor = unsafe { MonitorFromWindow(launcher.0, MONITOR_DEFAULTTONEAREST) };
             let placement = placement_on(monitor).expect("placement");
-            assert_eq!(launcher.rect(), placement.rect(0));
+            assert_eq!(launcher.rect(), placement.rect(0, None));
         });
     }
 
@@ -2286,12 +2377,12 @@ mod tests {
             let (launcher, _, _) = configured(&path, &keyboard);
             assert_eq!(
                 launcher.rect(),
-                launcher.placement().rect(1),
+                launcher.placement().rect(1, None),
                 "broken at start"
             );
             std::fs::write(&path, "hotkey = 'Ctrl+Alt+H'\n").expect("save");
             launcher.pump_until(|app| app.results.rows().is_empty());
-            assert_eq!(launcher.rect(), launcher.placement().rect(0));
+            assert_eq!(launcher.rect(), launcher.placement().rect(0, None));
             assert_eq!(keyboard.held(), ["Ctrl+Alt+H"]);
         });
     }
@@ -2523,7 +2614,7 @@ mod tests {
             launcher.press(VK_DELETE);
             assert_eq!(launcher.query(), "");
             launcher.pump_until(|app| app.results.rows().is_empty());
-            let bar = launcher.placement().rect(0);
+            let bar = launcher.placement().rect(0, None);
             assert_eq!(launcher.rect(), bar);
         });
     }
@@ -2648,7 +2739,7 @@ mod tests {
             launcher.type_text("note");
             let list = launcher.rect();
             assert_eq!((list.x, list.y, list.width), (bar.x, bar.y, bar.width));
-            assert_eq!(list, launcher.placement().rect(2));
+            assert_eq!(list, launcher.placement().rect(2, None));
             assert_eq!(launcher.frame().height, list.height as usize);
         });
     }
@@ -2659,7 +2750,7 @@ mod tests {
             let launcher = Launcher::listing(&["Notepad"]);
             launcher.type_text("no");
             launcher.type_text("\u{8}\u{8}");
-            assert_eq!(launcher.rect(), launcher.placement().rect(0));
+            assert_eq!(launcher.rect(), launcher.placement().rect(0, None));
         });
     }
 
@@ -2705,7 +2796,7 @@ mod tests {
             launcher.type_text("note");
             launcher.press(VK_ESCAPE);
             launcher.hotkey();
-            assert_eq!(launcher.rect(), launcher.placement().rect(0));
+            assert_eq!(launcher.rect(), launcher.placement().rect(0, None));
         });
     }
 
@@ -2727,10 +2818,10 @@ mod tests {
             let (provider, release) = gated(&[], &["Notepad"]);
             let launcher = Launcher::with(provider);
             launcher.type_text("note");
-            assert_eq!(launcher.rect(), launcher.placement().rect(0));
+            assert_eq!(launcher.rect(), launcher.placement().rect(0, None));
             release.send(()).expect("release the provider");
             launcher.pump_until(|app| !app.catalog.items.is_empty());
-            assert_eq!(launcher.rect(), launcher.placement().rect(1));
+            assert_eq!(launcher.rect(), launcher.placement().rect(1, None));
         });
     }
 
@@ -2745,7 +2836,7 @@ mod tests {
             assert!(!launcher.visible());
             launcher.hotkey();
             launcher.type_text("note");
-            assert_eq!(launcher.rect(), launcher.placement().rect(1));
+            assert_eq!(launcher.rect(), launcher.placement().rect(1, None));
         });
     }
 
@@ -2904,6 +2995,109 @@ mod tests {
         });
     }
 
+    /// Drags the launcher by its search icon by (x, y) DIPs; how far it
+    /// moved, in pixels, as the mouse messages carry it.
+    fn drag_by(launcher: &Launcher, (x, y): (f32, f32)) -> (i32, i32) {
+        let scale = layout::scale(launcher.placement().dpi);
+        let icon = (20.0, layout::BAR_HEIGHT / 2.0);
+        launcher.mouse(WM_LBUTTONDOWN, icon.0, icon.1);
+        launcher.mouse(WM_MOUSEMOVE, icon.0 + x, icon.1 + y);
+        launcher.mouse(WM_LBUTTONUP, icon.0 + x, icon.1 + y);
+        let pixels = |dips: f32| (dips * scale) as i32;
+        (
+            pixels(icon.0 + x) - pixels(icon.0),
+            pixels(icon.1 + y) - pixels(icon.1),
+        )
+    }
+
+    #[test]
+    fn dragging_the_glass_moves_the_launcher_and_it_shows_there_again() {
+        on_hidden_desktop(|| {
+            let launcher = Launcher::listing(&["Notepad"]);
+            let before = launcher.rect();
+            let (x, y) = drag_by(&launcher, (100.0, 50.0));
+            let moved = launcher.rect();
+            assert_eq!((moved.x, moved.y), (before.x + x, before.y + y));
+            assert_eq!((moved.width, moved.height), (before.width, before.height));
+            launcher.press(VK_ESCAPE);
+            launcher.hotkey();
+            assert_eq!(launcher.rect(), moved);
+            launcher.search_for("note", 1);
+            let listed = launcher.rect();
+            assert_eq!(
+                (listed.x, listed.y),
+                (moved.x, moved.y),
+                "the list grows down"
+            );
+        });
+    }
+
+    #[test]
+    fn pressing_the_query_or_a_row_moves_nothing() {
+        on_hidden_desktop(|| {
+            let launcher = Launcher::listing(&["Notepad"]);
+            launcher.search_for("note", 1);
+            let before = launcher.rect();
+            for y in [layout::BAR_HEIGHT / 2.0, middle_of(0)] {
+                launcher.mouse(WM_LBUTTONDOWN, 200.0, y);
+                launcher.mouse(WM_MOUSEMOVE, 300.0, y + 20.0);
+                assert_eq!(launcher.rect(), before, "{y}");
+                launcher.mouse(WM_LBUTTONUP, 300.0, y + 20.0);
+            }
+        });
+    }
+
+    #[test]
+    fn a_double_click_on_the_glass_puts_it_back_in_its_first_place() {
+        on_hidden_desktop(|| {
+            let launcher = Launcher::open();
+            let first = launcher.rect();
+            drag_by(&launcher, (100.0, 50.0));
+            assert_ne!(launcher.rect(), first);
+            launcher.mouse(WM_LBUTTONDBLCLK, 20.0, layout::BAR_HEIGHT / 2.0);
+            launcher.mouse(WM_LBUTTONUP, 20.0, layout::BAR_HEIGHT / 2.0);
+            assert_eq!(launcher.rect(), first);
+        });
+    }
+
+    #[test]
+    fn it_stops_where_its_tallest_list_still_fits_its_work_area() {
+        on_hidden_desktop(|| {
+            let launcher = Launcher::open();
+            drag_by(&launcher, (3000.0, 3000.0));
+            let placement = launcher.placement();
+            let (work, tallest) = (placement.work_area, placement.rect(MAX_ROWS, None));
+            let rect = launcher.rect();
+            assert_eq!(rect.x + rect.width, work.x + work.width);
+            assert_eq!(rect.y + tallest.height, work.y + work.height);
+        });
+    }
+
+    #[test]
+    fn where_it_was_dragged_to_is_kept_across_starts_until_put_back() {
+        on_hidden_desktop(|| {
+            let folder = Scratch::new("window-position");
+            let file = PathBuf::from(folder.path("position.txt"));
+            let start = || {
+                let (mut services, _) = services(listing(&[]).0, None);
+                services.position = Some(file.clone());
+                Launcher::serving(services)
+            };
+            let first = start();
+            let at_first = first.rect();
+            drag_by(&first, (-100.0, 40.0));
+            let moved = first.rect();
+            drop(first);
+            assert!(file.exists());
+            let second = start();
+            assert_eq!(second.rect(), moved);
+            second.mouse(WM_LBUTTONDBLCLK, 20.0, layout::BAR_HEIGHT / 2.0);
+            assert!(!file.exists(), "put back, nothing to keep");
+            drop(second);
+            assert_eq!(start().rect(), at_first);
+        });
+    }
+
     #[test]
     fn the_pointer_is_an_i_beam_over_the_query_and_an_arrow_elsewhere() {
         on_hidden_desktop(|| {
@@ -2991,7 +3185,7 @@ mod tests {
         on_hidden_desktop(|| {
             let (launcher, ran) = Launcher::listing_with(&["Notepad"], None);
             launcher.type_text("2+2*2");
-            assert_eq!(launcher.rect(), launcher.placement().rect(1));
+            assert_eq!(launcher.rect(), launcher.placement().rect(1, None));
             launcher.press(VK_RETURN);
             let copy = Action::CopyText("6".to_string());
             assert_eq!(*ran.borrow(), [(copy, false)]);
@@ -3032,7 +3226,7 @@ mod tests {
             release.send(()).expect("let the rates go");
             launcher.pump_until(|app| app.catalog.rates.is_some());
             launcher.type_text("100 usd");
-            assert_eq!(launcher.rect(), launcher.placement().rect(1));
+            assert_eq!(launcher.rect(), launcher.placement().rect(1, None));
             let (title, subtitle) = first_row();
             assert_eq!(title, "8\u{A0}275.36\u{A0}₽");
             assert!(subtitle.contains("10.11.2026"), "{subtitle}");
@@ -3056,7 +3250,7 @@ mod tests {
             release.send(()).expect("let the rates go");
             launcher.pump_until(|app| app.results.rows().len() == 1);
             assert_eq!(first_row().0, "4.83\u{A0}$");
-            assert_eq!(launcher.rect(), launcher.placement().rect(1));
+            assert_eq!(launcher.rect(), launcher.placement().rect(1, None));
         });
     }
 
@@ -3084,7 +3278,7 @@ mod tests {
                 with_app(|app| titles(app)).expect("app state"),
                 ["Notes", "notes.txt"]
             );
-            assert_eq!(launcher.rect(), launcher.placement().rect(2));
+            assert_eq!(launcher.rect(), launcher.placement().rect(2, None));
             let red = [0, 0, 255, 255];
             assert_eq!(launcher.pixel_at(28.0, layout::row_top(1) + 24.0), red);
         });
@@ -3102,10 +3296,10 @@ mod tests {
             });
             let launcher = Launcher::serving(walking(roots, None).0);
             launcher.type_text("report");
-            assert_eq!(launcher.rect(), launcher.placement().rect(0));
+            assert_eq!(launcher.rect(), launcher.placement().rect(0, None));
             release.send(()).expect("release the walk");
             launcher.pump_until(|app| !app.results.rows().is_empty());
-            assert_eq!(launcher.rect(), launcher.placement().rect(1));
+            assert_eq!(launcher.rect(), launcher.placement().rect(1, None));
         });
     }
 
