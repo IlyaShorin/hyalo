@@ -328,11 +328,11 @@ impl App {
         }
     }
 
-    /// Opens the config in the editor Windows has for it.
+    /// Opens the config in the editor Windows has for it, or Notepad.
     fn open_settings(&mut self) {
         if let Some(path) = &self.services.config {
             let path = path.to_string_lossy().into_owned();
-            (self.services.run)(&Action::Open(path), false);
+            (self.services.run)(&Action::Edit(path), false);
         }
     }
 
@@ -638,7 +638,13 @@ fn open(services: Services, shown: bool) -> Result<HWND> {
             places,
         };
         opened.find_picked();
-        opened.configure(seen.clone().map_or(Ok(Config::default()), settings::read));
+        let loaded = seen.clone().map_or(Ok(Config::default()), settings::read);
+        // A file broken at start keeps the last good settings: the
+        // defaults.
+        if loaded.is_err() {
+            opened.apply(Config::default());
+        }
+        opened.configure(loaded);
         opened.watch_config(seen);
         *app = Some(opened);
     });
@@ -1638,10 +1644,10 @@ mod tests {
     #[test]
     fn settings_from_the_menu_opens_the_config() {
         on_hidden_desktop(|| {
-            let config = PathBuf::from(r"C:\nowhere\hyalo\config.toml");
-            let (launcher, taskbar, ran) = in_the_tray(Some(config), None);
+            let (_scratch, config) = config_file("window-settings", "");
+            let (launcher, taskbar, ran) = in_the_tray(Some(config.clone()), None);
             launcher.pick(&taskbar, tray::Command::Settings);
-            let opened = Action::Open(r"C:\nowhere\hyalo\config.toml".to_string());
+            let opened = Action::Edit(config.to_string_lossy().into_owned());
             assert_eq!(*ran.borrow(), [(opened, false)]);
         });
     }
@@ -1826,7 +1832,7 @@ mod tests {
                     .contains("line 2")
             );
             launcher.press(VK_RETURN);
-            let opened = Action::Open(path.to_string_lossy().into_owned());
+            let opened = Action::Edit(path.to_string_lossy().into_owned());
             assert_eq!(*ran.borrow(), [(opened, false)]);
             assert!(!picked.exists(), "a notice is not a pick");
         });
@@ -1847,6 +1853,18 @@ mod tests {
             launcher.pump_until(|app| app.results.rows().is_empty());
             assert_eq!(launcher.rect(), launcher.placement().rect(0));
             assert_eq!(keyboard.held(), ["Ctrl+Alt+H"]);
+        });
+    }
+
+    #[test]
+    fn a_config_broken_at_start_runs_on_the_defaults() {
+        on_hidden_desktop(|| {
+            let (_scratch, path) = config_file("window-config-broken-start", "hotkey = 5\n");
+            let keyboard = Rc::new(Keyboard::default());
+            let _launcher = configured(&path, &keyboard);
+            assert_eq!(keyboard.held(), ["Alt+Space"]);
+            let leaves_out = with_app(|app| app.config.exclude.clone()).expect("app state");
+            assert_eq!(leaves_out, Config::default().exclude);
         });
     }
 

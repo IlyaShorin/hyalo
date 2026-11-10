@@ -44,7 +44,7 @@ impl Notice {
             title: self.said(),
             subtitle: format!("{advice} · Enter to open config.toml"),
             kind: Kind::Notice,
-            action: Action::Open(config.to_string_lossy().into_owned()),
+            action: Action::Edit(config.to_string_lossy().into_owned()),
         }
     }
 }
@@ -112,7 +112,7 @@ mod tests {
     #[test]
     fn enter_opens_the_config_and_the_row_is_a_notice() {
         let item = problem().item(Path::new(CONFIG));
-        assert_eq!(item.action, Action::Open(CONFIG.to_string()));
+        assert_eq!(item.action, Action::Edit(CONFIG.to_string()));
         assert_eq!(item.kind, Kind::Notice);
         assert_eq!(item.id, ItemId("hyalo:notice".to_string()));
         assert_eq!(item.path(), None, "not a file to show in its folder");
