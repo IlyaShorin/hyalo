@@ -88,15 +88,17 @@ pub fn text() -> Option<String> {
     // stays the clipboard's, and is only read while locked.
     unsafe {
         let memory = HGLOBAL(GetClipboardData(UNICODE_TEXT).ok()?.0);
-        let units = GlobalLock(memory).cast::<u16>().cast_const();
-        if units.is_null() {
+        let bytes = GlobalLock(memory).cast::<u8>().cast_const();
+        if bytes.is_null() {
             return None;
         }
         // The text ends at its NUL, and never past its memory.
-        let room = GlobalSize(memory) / size_of::<u16>();
-        let all = std::slice::from_raw_parts(units, room);
-        let length = all.iter().position(|&unit| unit == 0).unwrap_or(room);
-        let text = String::from_utf16_lossy(&all[..length]);
+        let all = std::slice::from_raw_parts(bytes, GlobalSize(memory));
+        let (pairs, _) = all.as_chunks::<2>();
+        let units = pairs.iter().map(|&pair| u16::from_le_bytes(pair));
+        let text = char::decode_utf16(units.take_while(|&unit| unit != 0))
+            .map(|letter| letter.unwrap_or(char::REPLACEMENT_CHARACTER))
+            .collect();
         let _ = GlobalUnlock(memory);
         Some(text)
     }

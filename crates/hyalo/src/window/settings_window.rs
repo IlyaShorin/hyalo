@@ -316,10 +316,8 @@ impl SettingsWindow {
     /// With the button down in a name field, the selection follows the
     /// pointer to `lparam`; whether it moved.
     fn drag(&mut self, lparam: LPARAM) -> bool {
-        let Some(list) = self.panel.dragging() else {
-            return false;
-        };
-        let at = self.char_at(list, lparam);
+        let dragging = self.panel.dragging();
+        let at = dragging.and_then(|list| self.char_at(list, lparam));
         at.is_some_and(|at| self.panel.place(at, true))
     }
 
@@ -1344,6 +1342,28 @@ mod tests {
             );
             settings.type_text("y");
             assert!(settings.shows("[y]"));
+        });
+    }
+
+    #[test]
+    fn a_click_in_a_name_field_scrolled_to_its_end_lands_where_it_was_clicked() {
+        on_hidden_desktop(|| {
+            let setup = set_up("settings-window-field-scrolled-click", DEFAULT, None);
+            let settings = setup.settings();
+            let name = Target::Name(List::RankLower);
+            settings.click(name);
+            let long = "a_folder_name_longer_than_the_field_shows_".repeat(3);
+            settings.type_text(&long);
+            let area = settings.state(|window| window.laid.area(name).expect("on the page"));
+            let near_the_end = settings.point_in(name, page::field_inside(area).width - 4.0);
+            settings.send(WM_LBUTTONDOWN, 0, near_the_end);
+            settings.send(WM_LBUTTONUP, 0, near_the_end);
+            let caret = settings.selection(List::RankLower);
+            let length = long.len() as u32;
+            assert!(
+                caret.is_empty() && caret.start + 3 >= length,
+                "{caret:?} of {length}"
+            );
         });
     }
 

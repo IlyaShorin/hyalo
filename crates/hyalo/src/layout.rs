@@ -30,6 +30,8 @@ const TEXT_GRASP: f32 = 8.0;
 /// The band round the launcher's edge that is its glass alone, in DIPs:
 /// as wide as the room beside a selected row.
 const EDGE: f32 = 6.0;
+// The bottom edge falls in the list's padding, so no row reaches it.
+const _: () = assert!(LIST_PADDING >= EDGE);
 /// The launcher never takes more than this share of the monitor width.
 const MAX_WIDTH_SHARE: f32 = 0.9;
 /// The top edge sits this far down the work area.
@@ -163,11 +165,13 @@ pub enum Part {
 }
 
 /// What the point (x, y), in DIPs, of a launcher `width` DIPs wide that
-/// lists `rows` rows is on.
+/// lists `rows` rows is on. The edges are glass: the left and right ones
+/// by their width, the top one above the query, and the bottom one is in
+/// the list's padding, or below the query when nothing is listed.
 pub fn part_at(x: f32, y: f32, width: f32, rows: usize) -> Part {
-    let inside = (EDGE..width - EDGE).contains(&x) && (EDGE..height(rows) - EDGE).contains(&y);
-    let text =
-        (TEXT_LEFT - TEXT_GRASP..width - TEXT_RIGHT_PAD).contains(&x) && y < BAR_HEIGHT - EDGE;
+    let inside = (EDGE..width - EDGE).contains(&x);
+    let text = (TEXT_LEFT - TEXT_GRASP..width - TEXT_RIGHT_PAD).contains(&x)
+        && (EDGE..BAR_HEIGHT - EDGE).contains(&y);
     match row_at(y, rows) {
         _ if !inside => Part::Glass,
         _ if text => Part::Text,

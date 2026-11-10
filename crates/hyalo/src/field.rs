@@ -303,7 +303,7 @@ impl Field {
 
     /// Types `letter`, if there is one, in place of the selection.
     fn insert(&mut self, letter: Option<char>) -> bool {
-        letter.is_some_and(|letter| self.replace(letter.encode_utf8(&mut [0; 4])))
+        letter.is_some_and(|letter| self.replace(&letter.to_string()))
     }
 
     /// Puts `with` in place of the selection, the caret after it; whether
@@ -877,18 +877,20 @@ mod tests {
     fn a_click_soon_after_a_double_click_and_near_it_is_the_third() {
         let then = Instant::now();
         let soon = Duration::from_millis(500);
-        let room = (4, 4);
+        // Taller than wide, so neither side is measured by the other's room.
+        let room = (4, 8);
         let third = |after: u64, at| {
             let now = then + Duration::from_millis(after);
             third_click(Some((then, (100, 30))), now, at, soon, room)
         };
         assert!(third(0, (100, 30)));
-        assert!(third(500, (102, 28)), "just in time, at the box's edge");
+        assert!(third(500, (102, 26)), "just in time, at the box's corner");
+        assert!(third(10, (100, 34)), "as low as the box goes");
         assert!(!third(501, (100, 30)), "too late");
         assert!(!third(10, (103, 30)), "too far right");
         assert!(!third(10, (97, 30)), "too far left");
-        assert!(!third(10, (100, 33)), "too far down");
-        assert!(!third(10, (100, 27)), "too far up");
+        assert!(!third(10, (100, 35)), "too far down");
+        assert!(!third(10, (100, 25)), "too far up");
         assert!(!third_click(None, then, (100, 30), soon, room));
     }
 

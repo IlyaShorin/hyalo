@@ -455,7 +455,7 @@ impl Painter {
         };
         self.write(words, &self.fonts.plain, inside, color)?;
         match typing {
-            true => self.draw_caret(inside.x + 1.0, inside),
+            true => self.draw_caret(inside.x, inside),
             false => Ok(()),
         }
     }
@@ -475,7 +475,7 @@ impl Painter {
         let drawn = self
             .draw_selection(&layout, selection, left, inside)
             .and_then(|()| self.surface.draw_text(&layout, left, inside.y, TEXT))
-            .and_then(|()| self.draw_caret(left + caret_x(&layout, caret)? + 1.0, inside));
+            .and_then(|()| self.draw_caret(left + caret_x(&layout, caret)?, inside));
         unsafe { dc.PopAxisAlignedClip() };
         drawn
     }
@@ -505,7 +505,7 @@ impl Painter {
         let inside = field_inside(at);
         let layout = self.typed(typed, inside)?;
         let scroll = scrolled(&layout, caret, inside)?;
-        hit(&layout, x - inside.x + scroll, inside.height / 2.0)
+        hit(&layout, x - inside.x + scroll)
     }
 
     /// `typed` laid out whole on one line as high as `inside`.
@@ -529,10 +529,11 @@ impl Painter {
         self.fill(under, line)
     }
 
-    /// The caret at `x`, in the field's inside `inside`.
+    /// The caret just right of `x`, where a letter ends or the line starts,
+    /// in the field's inside `inside`.
     fn draw_caret(&self, x: f32, inside: Area) -> Result<()> {
         let caret = Area {
-            x,
+            x: x + 1.0,
             y: inside.y + 8.0,
             width: 1.5,
             height: (inside.height - 16.0).max(0.0),

@@ -268,12 +268,14 @@ pub fn line_width(layout: &IDWriteTextLayout) -> Result<f32> {
     Ok(metrics.widthIncludingTrailingWhitespace)
 }
 
-/// Where a click (x, y) DIPs from the start of `layout` puts the caret: a
-/// UTF-16 position. Past the middle of a letter is after it.
-pub fn hit(layout: &IDWriteTextLayout, x: f32, y: f32) -> Result<u32> {
+/// Where a click `x` DIPs from the start of `layout`, a line of text, puts
+/// the caret: a UTF-16 position. Past the middle of a letter is after it.
+/// How high the click is tells nothing on one line: DirectWrite takes the
+/// nearest line to a point above or below it.
+pub fn hit(layout: &IDWriteTextLayout, x: f32) -> Result<u32> {
     let (mut trailing, mut inside) = (BOOL::default(), BOOL::default());
     let mut hit = DWRITE_HIT_TEST_METRICS::default();
-    unsafe { layout.HitTestPoint(x, y, &mut trailing, &mut inside, &mut hit)? };
+    unsafe { layout.HitTestPoint(x, 0.0, &mut trailing, &mut inside, &mut hit)? };
     let after = match trailing.as_bool() {
         true => hit.length,
         false => 0,

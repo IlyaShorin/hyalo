@@ -563,12 +563,12 @@ impl App {
 
     /// A double-click at `point`: in the query it selects the word there;
     /// on the glass it puts the launcher back where it goes at first; on a
-    /// row it is a press like any other.
-    fn double_click(&mut self, point: POINT) -> Result<()> {
+    /// row it is a press like any other, `shift` held or not.
+    fn double_click(&mut self, point: POINT, shift: bool) -> Result<()> {
         match self.part_at(point) {
             Part::Text => self.select_word(point),
             Part::Glass => self.put_back(),
-            Part::Row(_) => self.press(point, false),
+            Part::Row(_) => self.press(point, shift),
         }
     }
 
@@ -1060,7 +1060,8 @@ fn on_message(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> Optio
         WM_MOUSEMOVE | WM_LBUTTONDOWN | WM_LBUTTONDBLCLK | WM_LBUTTONUP => {
             Some(on_mouse(hwnd, message, wparam, client_point(lparam)))
         }
-        WM_SETCURSOR if (lparam.0 & 0xFFFF) as u32 == HTCLIENT => Some(on_set_cursor(hwnd)),
+        // Always over the client area: WM_NCHITTEST above says so.
+        WM_SETCURSOR => Some(on_set_cursor(hwnd)),
         _ => on_app_message(hwnd, message, wparam, lparam),
     }
 }
@@ -1204,13 +1205,13 @@ const MOUSE_SHIFT: usize = 0x0004;
 /// window has the mouse, so selecting goes on outside it; a click that
 /// opens a row hides the launcher.
 fn on_mouse(hwnd: HWND, message: u32, wparam: WPARAM, point: POINT) -> Result<()> {
+    let shift = wparam.0 & MOUSE_SHIFT != 0;
     match message {
         WM_LBUTTONDOWN => {
-            let shift = wparam.0 & MOUSE_SHIFT != 0;
             let pressed = with_app(|app| app.press(point, shift).map(|()| app.pressed));
             capture_while(hwnd, pressed)
         }
-        WM_LBUTTONDBLCLK => with_app(|app| app.double_click(point)).unwrap_or(Ok(())),
+        WM_LBUTTONDBLCLK => with_app(|app| app.double_click(point, shift)).unwrap_or(Ok(())),
         WM_LBUTTONUP => {
             // SAFETY: a plain call; without the mouse it does nothing.
             let _ = unsafe { ReleaseCapture() };
@@ -3044,6 +3045,41 @@ mod tests {
             assert_eq!(launcher.caret_x(), caret, "the icon is not the query");
             launcher.click_pixel(end + 100);
             assert_eq!(launcher.caret_x(), end, "past the text is its end");
+        });
+    }
+
+    #[test]
+    fn a_click_in_a_query_scrolled_to_its_end_lands_where_it_was_clicked() {
+        on_hidden_desktop(|| {
+            let launcher = Launcher::open();
+            launcher.type_text(&"notepad notes ".repeat(8));
+            let end = launcher.caret_x();
+            launcher.click_pixel(end - 40);
+            let caret = launcher.caret_x();
+            assert!(
+                caret.abs_diff(end - 40) < 10,
+                "clicked {}, caret at {caret}",
+                end - 40
+            );
+        });
+    }
+
+    #[test]
+    fn the_query_takes_clicks_up_to_its_room_on_the_right_and_low_in_the_bar() {
+        on_hidden_desktop(|| {
+            let launcher = Launcher::open();
+            launcher.type_text("note");
+            launcher.press(VK_HOME);
+            let scale = layout::scale(launcher.placement().dpi);
+            let (width, _) = launcher.client_size();
+            let room = width as f32 / scale - layout::TEXT_RIGHT_PAD;
+            let low = layout::BAR_HEIGHT - 8.0;
+            launcher.click(room + 4.0, low);
+            launcher.type_text("x");
+            assert_eq!(launcher.query(), "xnote", "right of the room is glass");
+            launcher.click(room - 4.0, low);
+            launcher.type_text("y");
+            assert_eq!(launcher.query(), "xnotey", "the query's own room");
         });
     }
 

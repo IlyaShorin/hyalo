@@ -219,7 +219,7 @@ impl Renderer {
         let layout = self
             .surface
             .layout(text, &self.fonts.query, 0.0, BAR_HEIGHT)?;
-        hit(&layout, x - TEXT_LEFT + self.scroll, BAR_HEIGHT / 2.0)
+        hit(&layout, x - TEXT_LEFT + self.scroll)
     }
 
     /// The query or the placeholder, what is selected in the query, and
