@@ -185,14 +185,50 @@ fn written(value: &str, clock: Clock) -> Option<RangeInclusive<i64>> {
     }
     let (sign, rest) = sign(value);
     let span = period(rest)?;
-    let (start, end) = (*span.start(), *span.end());
+    ranged(sign, *span.start(), *span.end())
+}
+
+/// What `sign` asks of something from `start` to `end`: after its end,
+/// from its start, before its start, until its end, or in it; `None`
+/// when nothing is after or before it.
+fn ranged<T: Bound>(sign: Sign, start: T, end: T) -> Option<RangeInclusive<T>> {
     Some(match sign {
-        Sign::After => end.checked_add(1)?..=i64::MAX,
-        Sign::From => start..=i64::MAX,
-        Sign::Before => i64::MIN..=start.checked_sub(1)?,
-        Sign::Until => i64::MIN..=end,
-        Sign::In => span,
+        Sign::After => end.next()?..=T::MOST,
+        Sign::From => start..=T::MOST,
+        Sign::Before => T::LEAST..=start.previous()?,
+        Sign::Until => T::LEAST..=end,
+        Sign::In => start..=end,
     })
+}
+
+/// What a range of sizes or times runs between.
+trait Bound: Copy {
+    const LEAST: Self;
+    const MOST: Self;
+    fn next(self) -> Option<Self>;
+    fn previous(self) -> Option<Self>;
+}
+
+impl Bound for u64 {
+    const LEAST: u64 = 0;
+    const MOST: u64 = u64::MAX;
+    fn next(self) -> Option<u64> {
+        self.checked_add(1)
+    }
+    fn previous(self) -> Option<u64> {
+        self.checked_sub(1)
+    }
+}
+
+impl Bound for i64 {
+    const LEAST: i64 = i64::MIN;
+    const MOST: i64 = i64::MAX;
+    fn next(self) -> Option<i64> {
+        self.checked_add(1)
+    }
+    fn previous(self) -> Option<i64> {
+        self.checked_sub(1)
+    }
 }
 
 /// How a value is compared.
@@ -227,13 +263,11 @@ fn size(value: &str) -> Option<RangeInclusive<u64>> {
     let (sign, rest) = sign(value);
     let about = bytes(rest)?;
     let amount = *about.start();
-    Some(match sign {
-        Sign::After => amount.checked_add(1)?..=u64::MAX,
-        Sign::From => amount..=u64::MAX,
-        Sign::Before => 0..=amount.checked_sub(1)?,
-        Sign::Until => 0..=amount,
-        Sign::In => about,
-    })
+    let end = match sign {
+        Sign::In => *about.end(),
+        _ => amount,
+    };
+    ranged(sign, amount, end)
 }
 
 /// Units of size, 1024 apiece, as Windows counts them.
@@ -297,33 +331,37 @@ fn ago(value: &str, now: i64) -> Option<RangeInclusive<i64>> {
 
 /// `2026`, `2026-11` or `2026-11-10`, local, as the seconds it spans.
 fn date(value: &str, offset: i64) -> Option<RangeInclusive<i64>> {
+    let (first, after) = days(value)?;
+    Some(first * DAY - offset..=after * DAY - offset - 1)
+}
+
+/// The days a year, a month or a day spans, counted from 1970: its first,
+/// and the first after it.
+fn days(value: &str) -> Option<(i64, i64)> {
     let parts: Vec<&str> = value.split('-').collect();
-    let number = |at: usize, digits: usize| -> Option<i64> {
-        let part = parts.get(at)?;
-        (part.len() == digits && part.bytes().all(|byte| byte.is_ascii_digit()))
-            .then(|| part.parse().ok())?
-    };
-    let year = number(0, 4).filter(|year| (1601..=9999).contains(year))?;
-    let (start, end) = match parts.len() {
-        1 => ((year, 1, 1), (year + 1, 1, 1)),
-        2 => {
-            let month = number(1, 2).filter(|month| (1..=12).contains(month))?;
-            let next = if month == 12 {
-                (year + 1, 1)
-            } else {
-                (year, month + 1)
-            };
-            ((year, month, 1), (next.0, next.1, 1))
+    let year = number(parts[0], 4).filter(|year| (1601..=9999).contains(year))?;
+    let first = |month, day| days_since_1970(year, month, day);
+    match parts[1..] {
+        [] => Some((first(1, 1), days_since_1970(year + 1, 1, 1))),
+        // Month 13 is next year's January.
+        [month] => month_of(month).map(|month| (first(month, 1), first(month + 1, 1))),
+        [month, day] => {
+            let month = month_of(month)?;
+            let day = number(day, 2).filter(|&day| day >= 1 && day <= days_in(year, month))?;
+            Some((first(month, day), first(month, day) + 1))
         }
-        3 => {
-            let month = number(1, 2).filter(|month| (1..=12).contains(month))?;
-            let day = number(2, 2).filter(|&day| day >= 1 && day <= days_in(year, month))?;
-            ((year, month, day), (year, month, day + 1))
-        }
-        _ => return None,
-    };
-    let seconds = |(year, month, day)| days_since_1970(year, month, day) * DAY - offset;
-    Some(seconds(start)..=seconds(end) - 1)
+        _ => None,
+    }
+}
+
+/// `part` as a number, if it is just so many digits.
+fn number(part: &str, digits: usize) -> Option<i64> {
+    let all = part.len() == digits && part.bytes().all(|byte| byte.is_ascii_digit());
+    all.then(|| part.parse().ok())?
+}
+
+fn month_of(part: &str) -> Option<i64> {
+    number(part, 2).filter(|month| (1..=12).contains(month))
 }
 
 fn days_in(year: i64, month: i64) -> i64 {

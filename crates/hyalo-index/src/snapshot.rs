@@ -55,30 +55,35 @@ impl Index {
         let entries = exactly(input, entries * 16)?;
         let names = String::from_utf8(exactly(input, names)?).map_err(|_| LoadError::Damaged)?;
         let free = exactly(input, free * 4)?;
-        let sizes = exactly(input, entries.len() / 16 * 8)?;
-        let times = exactly(input, entries.len() / 16 * 4)?;
-        ended(input)?;
-        let entries = entries.as_chunks::<16>().0.iter();
-        let free = free.as_chunks::<4>().0.iter();
+        let (sizes, times) = stats(input, entries.len() / 16)?;
         let parts = Parts {
-            entries: entries.map(|&bytes| Entry::from_bytes(bytes)).collect(),
+            entries: decoded(&entries, Entry::from_bytes),
             names,
-            free: free.map(|&bytes| u32::from_le_bytes(bytes)).collect(),
-            sizes: sizes
-                .as_chunks::<8>()
-                .0
-                .iter()
-                .map(|&bytes| u64::from_le_bytes(bytes))
-                .collect(),
-            times: times
-                .as_chunks::<4>()
-                .0
-                .iter()
-                .map(|&bytes| u32::from_le_bytes(bytes))
-                .collect(),
+            free: decoded(&free, u32::from_le_bytes),
+            sizes: decoded(&sizes, u64::from_le_bytes),
+            times: decoded(&times, u32::from_le_bytes),
         };
         Index::from_parts(parts).ok_or(LoadError::Damaged)
     }
+}
+
+/// The bytes of each of `count` entries' sizes, then of their times;
+/// nothing may follow.
+fn stats(input: &mut impl Read, count: usize) -> Result<(Vec<u8>, Vec<u8>), LoadError> {
+    let sizes = exactly(input, count * 8)?;
+    let times = exactly(input, count * 4)?;
+    ended(input)?;
+    Ok((sizes, times))
+}
+
+/// `bytes` cut into pieces of `N`, each read by `read`.
+fn decoded<const N: usize, T>(bytes: &[u8], read: fn([u8; N]) -> T) -> Vec<T> {
+    bytes
+        .as_chunks::<N>()
+        .0
+        .iter()
+        .map(|&piece| read(piece))
+        .collect()
 }
 
 /// How a snapshot starts: the magic, the version and the three lengths.
