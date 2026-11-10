@@ -5,6 +5,7 @@ pub mod calculator;
 pub mod currency;
 pub mod expression;
 pub mod frecency;
+pub mod hotkey;
 pub mod item;
 pub mod keyboard;
 pub mod matcher;
