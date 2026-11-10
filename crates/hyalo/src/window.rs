@@ -834,9 +834,9 @@ impl App {
     /// Notes a pick, on disk too when there is a picks file; a file or
     /// folder is kept to rank with the apps from now on. A calculator
     /// answer is not noted: it already comes first, and each sum would
-    /// leave a pick behind.
+    /// leave a pick behind; nor is a web search, for the same reasons.
     fn note(&mut self, item: Item) {
-        if matches!(item.kind, Kind::Calculator | Kind::Notice) {
+        if matches!(item.kind, Kind::Calculator | Kind::Web | Kind::Notice) {
             return;
         }
         self.frecency.record(&item.id, self.query.text(), now());
@@ -881,7 +881,10 @@ impl App {
         };
         let answer = match text.is_empty() {
             true => self.notice_row(),
-            false => results::answer(text, self.catalog.rates.as_ref(), self.language()),
+            false => {
+                let rates = self.catalog.rates.as_ref();
+                results::answer(text, rates, &self.config.search, self.language())
+            }
         };
         found.answered(answer)
     }
@@ -3749,6 +3752,53 @@ mod tests {
             let copy = Action::CopyText("6".to_string());
             assert_eq!(*ran.borrow(), [(copy, false)]);
             assert!(!launcher.visible());
+        });
+    }
+
+    #[test]
+    fn a_prefix_and_words_list_a_web_search_first_and_enter_opens_it() {
+        on_hidden_desktop(|| {
+            let picks = PicksFile::new("window-web-search");
+            let (launcher, ran) = Launcher::listing_with(&["Git Bash"], Some(picks.0.clone()));
+            launcher.type_text("git");
+            assert_eq!(listed(), ["Git Bash"], "a word that starts like gh");
+            hold(&[VK_CONTROL]);
+            launcher.press(VK_A);
+            hold(&[]);
+            launcher.type_text("g привет мир");
+            let title = "Search Google for “привет мир”";
+            assert_eq!(
+                first_row(),
+                (
+                    title.to_string(),
+                    "Web search · Enter to open in the browser".to_string()
+                )
+            );
+            launcher.press(VK_RETURN);
+            let url = "https://www.google.com/search?q=%D0%BF%D1%80%D0%B8%D0%B2%D0%B5%D1%82%20%D0%BC%D0%B8%D1%80";
+            assert_eq!(*ran.borrow(), [(Action::Open(url.to_string()), false)]);
+            assert!(!launcher.visible());
+            assert!(!picks.0.exists(), "a web search is not a pick");
+        });
+    }
+
+    #[test]
+    fn a_web_search_of_the_configs_is_listed_and_changes_when_saved() {
+        on_hidden_desktop(|| {
+            let so = "[search]\nso = 'https://stackoverflow.com/search?q={query}'\n";
+            let (_scratch, path) = config_file("window-config-search", so);
+            let keyboard = Rc::new(Keyboard::default());
+            let (launcher, _, _) = configured(&path, &keyboard);
+            launcher.type_text("so borrow");
+            assert_eq!(first_row().0, "Search stackoverflow.com for “borrow”");
+            std::fs::write(
+                &path,
+                "[search]\nso = 'https://sourcegraph.com/search?q={query}'\n",
+            )
+            .expect("save");
+            launcher.pump_until(|app| {
+                app.results.rows()[0].item.title == "Search sourcegraph.com for “borrow”"
+            });
         });
     }
 

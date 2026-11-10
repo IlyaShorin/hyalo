@@ -10,17 +10,27 @@ use hyalo_core::rank::{self, Ranked, rank};
 use hyalo_core::rates::Rates;
 use hyalo_core::system_commands::Command;
 use hyalo_core::text::{Language, Text};
+use hyalo_core::web::{self, Engine};
 use hyalo_core::{calculator, currency};
 
 /// The most rows the window lists.
 pub const MAX_ROWS: usize = 8;
 
-/// The answer for `query`, listed first: the calculator's when the query
-/// is arithmetic, else a currency conversion at `rates`, once there are
-/// any.
-pub fn answer(query: &str, rates: Option<&Rates>, language: Language) -> Option<Item> {
-    let calculated = calculator::answer(query, language);
-    calculated.or_else(|| currency::answer(query, rates?, language))
+/// The answer for `query`, listed first: a web search when the query
+/// starts with a prefix of the user's `engines` or a built-in one, else
+/// the calculator's when the query is arithmetic, else a currency
+/// conversion at `rates`, once there are any.
+pub fn answer(
+    query: &str,
+    rates: Option<&Rates>,
+    engines: &[Engine],
+    language: Language,
+) -> Option<Item> {
+    let searched = web::answer(query, engines, language);
+    let calculated = || calculator::answer(query, language);
+    searched
+        .or_else(calculated)
+        .or_else(|| currency::answer(query, rates?, language))
 }
 
 /// The second line of a row, in `language`: what the item says, or, for
@@ -386,7 +396,36 @@ mod tests {
     }
 
     fn answer_title(query: &str, rates: Option<&Rates>) -> Option<String> {
-        answer(query, rates, Language::English).map(|item| item.title)
+        answer(query, rates, &[], Language::English).map(|item| item.title)
+    }
+
+    #[test]
+    fn a_prefix_and_words_are_answered_with_a_web_search_and_the_rows_follow() {
+        let query = "g it";
+        let rows = search(query, &apps(&["Git Bash", "Paint"]));
+        let results = rows.answered(answer(query, None, &[], Language::English));
+        assert_eq!(titles(&results), ["Search Google for “it”"]);
+        let git = search("git", &apps(&["Git Bash"]));
+        let results = git.answered(answer("git", None, &[], Language::English));
+        assert_eq!(titles(&results), ["Git Bash"], "no web row for a word");
+        let notes = search("w notes", &apps(&["w notes app"]));
+        let results = notes.answered(answer("w notes", None, &[], Language::English));
+        assert_eq!(
+            titles(&results),
+            ["Search Wikipedia for “notes”", "w notes app"]
+        );
+    }
+
+    #[test]
+    fn the_users_engines_are_asked_before_the_built_in_ones() {
+        let ddg = Engine::custom("g", "https://duckduckgo.com/?q={query}").expect("an engine");
+        let item = answer("g 2+2", None, &[ddg], Language::English).expect("a search");
+        assert_eq!(item.title, "Search duckduckgo.com for “2+2”");
+        assert_eq!(
+            answer_title("2+2", None),
+            Some("4".to_string()),
+            "no prefix"
+        );
     }
 
     #[test]

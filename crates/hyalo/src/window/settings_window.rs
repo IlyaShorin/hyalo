@@ -627,14 +627,16 @@ impl App {
     }
 }
 
-/// The title of the folder picker for a list, in `language`.
-fn picking(list: List, language: Language) -> &'static str {
+/// The title of the folder picker for a list, in `language`; `None` for
+/// the web searches, which take no folder.
+fn picking(list: List, language: Language) -> Option<&'static str> {
     let title = match list {
         List::Exclude => Text::PickExclude,
         List::RankLower => Text::PickLower,
         List::RankHigher => Text::PickHigher,
+        List::Search => return None,
     };
-    language.say(title)
+    Some(language.say(title))
 }
 
 /// Carries out what the panel said to do. Called with no app state
@@ -679,7 +681,10 @@ fn pick(hwnd: HWND, list: List) {
         return;
     };
     let language = ours(hwnd, |window| window.panel.language()).unwrap_or_default();
-    if let Some(path) = picker.pick(hwnd, picking(list, language)) {
+    let Some(title) = picking(list, language) else {
+        return;
+    };
+    if let Some(path) = picker.pick(hwnd, title) {
         with_app(|app| app.change(Change::Add(list, path)));
     }
 }
@@ -1353,6 +1358,23 @@ mod tests {
             );
             assert!(settings.shows("vendor"));
             assert!(!settings.shows("[vendor]"));
+        });
+    }
+
+    #[test]
+    fn a_web_search_typed_is_written_in_the_search_table_and_its_cross_takes_it_out() {
+        on_hidden_desktop(|| {
+            let setup = set_up("settings-window-search", DEFAULT, None);
+            let settings = setup.settings();
+            let so = "so https://stackoverflow.com/search?q={query}";
+            settings.click(Target::Name(List::Search));
+            settings.type_text(so);
+            settings.click(Target::AddName(List::Search));
+            let line = "so = \"https://stackoverflow.com/search?q={query}\"\n";
+            assert_eq!(setup.file(), format!("{DEFAULT}{line}"));
+            assert!(settings.shows(so));
+            settings.click(Target::Remove(List::Search, 0));
+            assert_eq!(setup.file(), DEFAULT, "the comments survive both");
         });
     }
 

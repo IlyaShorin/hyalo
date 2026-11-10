@@ -18,3 +18,4 @@ pub mod system_commands;
 pub mod system_settings;
 pub mod text;
 pub mod update;
+pub mod web;

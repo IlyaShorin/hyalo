@@ -43,6 +43,9 @@ pub enum Kind {
     Setting,
     /// A system command, such as Restart.
     Command,
+    /// A web search for what was typed after a prefix: never ranked,
+    /// never remembered as a pick.
+    Web,
     /// What hyalo tells the user, such as a mistake in the config: never
     /// ranked, never remembered as a pick.
     Notice,

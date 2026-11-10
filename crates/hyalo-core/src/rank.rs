@@ -84,8 +84,9 @@ fn kind_weight(kind: Kind) -> f64 {
         // Windows' settings rank like apps: a page should not drown
         // under files.
         Kind::App | Kind::Setting | Kind::Command => 2,
-        // A notice is never ranked; it goes first, as an answer does.
-        Kind::Calculator | Kind::Notice => 3,
+        // A notice or a web search is never ranked; it goes first, as an
+        // answer does.
+        Kind::Calculator | Kind::Web | Kind::Notice => 3,
     };
     f64::from(step) * KIND_STEP
 }
