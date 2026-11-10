@@ -3,10 +3,11 @@
 use std::collections::HashSet;
 
 use hyalo_core::frecency::{Frecency, Timestamp};
-use hyalo_core::item::Item;
+use hyalo_core::item::{Item, Kind};
 use hyalo_core::places::Places;
 use hyalo_core::rank::{Ranked, rank};
 use hyalo_core::rates::Rates;
+use hyalo_core::text::{Language, Text};
 use hyalo_core::{calculator, currency};
 
 /// The most rows the window lists.
@@ -15,8 +16,18 @@ pub const MAX_ROWS: usize = 8;
 /// The answer for `query`, listed first: the calculator's when the query
 /// is arithmetic, else a currency conversion at `rates`, once there are
 /// any.
-pub fn answer(query: &str, rates: Option<&Rates>) -> Option<Item> {
-    calculator::answer(query).or_else(|| currency::answer(query, rates?))
+pub fn answer(query: &str, rates: Option<&Rates>, language: Language) -> Option<Item> {
+    let calculated = calculator::answer(query, language);
+    calculated.or_else(|| currency::answer(query, rates?, language))
+}
+
+/// The second line of a row, in `language`: what the item says, or, for
+/// an app with no path to show, that it is an app.
+pub fn subtitle(item: &Item, language: Language) -> &str {
+    match (item.kind, item.subtitle.is_empty()) {
+        (Kind::App, true) => language.say(Text::App),
+        _ => &item.subtitle,
+    }
 }
 
 /// One row of the list: an item, and the letters of its title the query
@@ -216,7 +227,22 @@ mod tests {
 
     /// The rows for `query` under the calculator's answer.
     fn answered(query: &str, items: &[Item]) -> Results {
-        search(query, items).answered(calculator::answer(query))
+        search(query, items).answered(calculator::answer(query, Language::English))
+    }
+
+    #[test]
+    fn an_app_with_no_path_says_it_is_an_app_in_the_language() {
+        let mut app = apps(&["Calculator"]).remove(0);
+        app.subtitle = String::new();
+        assert_eq!(subtitle(&app, Language::English), "App");
+        assert_eq!(subtitle(&app, Language::Russian), "Приложение");
+        app.subtitle = r"C:\Tools\calc.exe".to_string();
+        assert_eq!(subtitle(&app, Language::Russian), r"C:\Tools\calc.exe");
+        let folder = Item::file(r"C:\Users".to_string(), true);
+        assert_eq!(subtitle(&folder, Language::Russian), r"C:\");
+        let mut nothing = Item::file(r"C:\Users".to_string(), true);
+        nothing.subtitle = String::new();
+        assert_eq!(subtitle(&nothing, Language::Russian), "", "not an app");
     }
 
     #[test]
@@ -227,7 +253,7 @@ mod tests {
     }
 
     fn answer_title(query: &str, rates: Option<&Rates>) -> Option<String> {
-        answer(query, rates).map(|item| item.title)
+        answer(query, rates, Language::English).map(|item| item.title)
     }
 
     #[test]

@@ -9,6 +9,7 @@ use std::time::Duration;
 use std::{fs, io};
 
 use hyalo_core::config::{self, Change, Config, Problem, Refusal, Why, Written};
+use hyalo_core::text::Language;
 use windows::Win32::Foundation::{HANDLE, WAIT_TIMEOUT};
 use windows::Win32::Storage::FileSystem::{
     FILE_NOTIFY_CHANGE_FILE_NAME, FILE_NOTIFY_CHANGE_LAST_WRITE, FindCloseChangeNotification,
@@ -28,16 +29,17 @@ pub fn default_path() -> Option<PathBuf> {
 }
 
 /// What the file at `path` holds; a file that is not there is written
-/// with the defaults first, so there is one to edit. `None` when it
-/// cannot be read at all (an editor holding it, say).
-pub fn contents(path: &Path) -> Option<Vec<u8>> {
+/// with the defaults first, in `language`, so there is one to edit.
+/// `None` when it cannot be read at all (an editor holding it, say).
+pub fn contents(path: &Path, language: Language) -> Option<Vec<u8>> {
     match fs::read(path) {
         Ok(bytes) => Some(bytes),
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            if let Err(error) = store::replace(path, config::DEFAULT.as_bytes()) {
+            let first = config::default_file(language);
+            if let Err(error) = store::replace(path, first.as_bytes()) {
                 eprintln!("hyalo: cannot write {}: {error}", path.display());
             }
-            Some(config::DEFAULT.as_bytes().to_vec())
+            Some(first.into_bytes())
         }
         Err(error) => {
             eprintln!("hyalo: cannot read {}: {error}", path.display());
@@ -69,11 +71,13 @@ fn text(bytes: Vec<u8>) -> Result<String, Problem> {
 }
 
 /// The text the file at `path` holds now, read afresh (a file that is not
-/// there is written with the defaults first), with `change` made in it;
-/// `None` when the change makes no difference. Nothing is written.
-pub fn edited(path: &Path, change: &Change) -> Result<Option<String>, Refusal> {
+/// there is written with the defaults first, in `language`), with
+/// `change` made in it; `None` when the change makes no difference.
+/// Nothing is written.
+pub fn edited(path: &Path, change: &Change, language: Language) -> Result<Option<String>, Refusal> {
     let unreadable = || Refusal::Wrong(Why::Unreadable);
-    let text = text(contents(path).ok_or_else(unreadable)?).map_err(Refusal::Broken)?;
+    let bytes = contents(path, language).ok_or_else(unreadable)?;
+    let text = text(bytes).map_err(Refusal::Broken)?;
     let edited = config::edit(&text, change)?;
     Ok((edited != text).then_some(edited))
 }
@@ -164,16 +168,24 @@ mod tests {
     }
 
     fn load(path: &Path) -> Option<Loaded> {
-        contents(path).map(read)
+        contents(path, Language::English).map(read)
     }
 
     #[test]
-    fn a_missing_file_is_written_with_the_defaults() {
+    fn a_missing_file_is_written_with_the_defaults_in_the_language_given() {
         let scratch = Scratch::new("settings-missing");
         let path = config_in(&scratch);
-        assert_eq!(load(&path), Some(Ok(Config::default())));
+        let english = Config {
+            language: Some(Language::English),
+            ..Config::default()
+        };
+        assert_eq!(load(&path), Some(Ok(english)));
         let written = fs::read_to_string(&path).expect("written");
         assert_eq!(written, config::DEFAULT);
+        let russian = Scratch::new("settings-missing-russian");
+        let path = config_in(&russian);
+        let bytes = contents(&path, Language::Russian).expect("written");
+        assert_eq!(bytes, config::default_file(Language::Russian).into_bytes());
     }
 
     #[test]
@@ -222,7 +234,8 @@ mod tests {
         let scratch = Scratch::new("settings-edit").with(&["hyalo\\"]);
         let path = config_in(&scratch);
         fs::write(&path, "# mine\nhotkey = 'F4'\n").expect("write");
-        let edited = edited(&path, &change(List::RankHigher, "notes")).expect("edited");
+        let edited =
+            edited(&path, &change(List::RankHigher, "notes"), Language::English).expect("edited");
         let text = edited.expect("a change");
         let expected = "# mine\nhotkey = 'F4'\n\n[folders]\nrank_higher = ['notes']\n";
         assert_eq!(text, expected);
@@ -240,7 +253,8 @@ mod tests {
     fn a_change_to_a_missing_file_is_made_in_the_defaults() {
         let scratch = Scratch::new("settings-edit-missing");
         let path = config_in(&scratch);
-        let edited = edited(&path, &change(List::Exclude, r"D:\old")).expect("edited");
+        let edited =
+            edited(&path, &change(List::Exclude, r"D:\old"), Language::English).expect("edited");
         let text = edited.expect("a change");
         assert!(text.starts_with("# hyalo's settings."), "{text}");
         assert!(
@@ -253,7 +267,10 @@ mod tests {
     #[test]
     fn a_change_that_changes_nothing_is_not_there_to_write() {
         let (_scratch, path) = configured("settings-edit-same");
-        assert_eq!(edited(&path, &change(List::RankLower, "TARGET")), Ok(None));
+        assert_eq!(
+            edited(&path, &change(List::RankLower, "TARGET"), Language::English),
+            Ok(None)
+        );
     }
 
     #[test]
@@ -261,13 +278,15 @@ mod tests {
         let scratch = Scratch::new("settings-edit-broken").with(&["hyalo\\"]);
         let path = config_in(&scratch);
         fs::write(&path, "\nhotkye = 'F4'\n").expect("write");
-        let refused = edited(&path, &change(List::RankLower, "x")).expect_err("refused");
+        let refused =
+            edited(&path, &change(List::RankLower, "x"), Language::English).expect_err("refused");
         assert!(
             matches!(refused, Refusal::Broken(Problem { line: 2, .. })),
             "{refused:?}"
         );
         fs::write(&path, b"# \xC0\n").expect("write");
-        let refused = edited(&path, &change(List::RankLower, "x")).expect_err("refused");
+        let refused =
+            edited(&path, &change(List::RankLower, "x"), Language::English).expect_err("refused");
         assert!(
             matches!(refused, Refusal::Broken(Problem { line: 1, .. })),
             "{refused:?}"
@@ -277,7 +296,11 @@ mod tests {
     #[test]
     fn a_file_that_cannot_be_read_is_not_changed() {
         let scratch = Scratch::new("settings-edit-folder").with(&["hyalo\\config.toml\\"]);
-        let refused = edited(&config_in(&scratch), &change(List::RankLower, "x"));
+        let refused = edited(
+            &config_in(&scratch),
+            &change(List::RankLower, "x"),
+            Language::English,
+        );
         assert_eq!(refused, Err(Refusal::Wrong(Why::Unreadable)));
     }
 

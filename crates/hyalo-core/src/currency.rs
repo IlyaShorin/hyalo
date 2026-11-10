@@ -18,6 +18,7 @@ use crate::expression;
 use crate::item::{Action, Item, ItemId, Kind};
 use crate::keyboard;
 use crate::rates::{Code, Rates};
+use crate::text::{Language, Text};
 
 /// The currency row's id: there is one at a time.
 pub const ID: &str = "hyalo:currency";
@@ -77,9 +78,10 @@ const WORDS: [(&[&str], &str); 4] = [
     (&["юань", "юаня", "юаней", "юани", "юанях", "yuan"], "CNY"),
 ];
 
-/// The row converting what `query` asks, at `rates`; `None` unless it
-/// asks for an amount of a currency both it and the target have rates.
-pub fn answer(query: &str, rates: &Rates) -> Option<Item> {
+/// The row converting what `query` asks, at `rates`, its second line in
+/// `language`; `None` unless it asks for an amount of a currency both it
+/// and the target have rates.
+pub fn answer(query: &str, rates: &Rates, language: Language) -> Option<Item> {
     let question = question(query, rates)?;
     let value = rates.convert(question.amount, question.from, question.to)?;
     let mark = mark(query);
@@ -89,9 +91,9 @@ pub fn answer(query: &str, rates: &Rates) -> Option<Item> {
     Some(Item {
         id: ItemId(ID.to_string()),
         title: format!("{}\u{A0}{}", grouped(&copied), sign(&question.to)),
-        subtitle: format!(
-            "{asked} {from} → {to} · Bank of Russia, {} · Enter to copy",
-            rates.date()
+        subtitle: language.fill(
+            Text::Currency,
+            &[&asked, from, to, &rates.date().to_string()],
         ),
         kind: Kind::Calculator,
         action: Action::CopyText(copied),
@@ -213,7 +215,8 @@ mod tests {
 
     /// What the row for `query` shows and copies.
     fn answered(query: &str) -> (String, String) {
-        let item = answer(query, &rates()).unwrap_or_else(|| panic!("no answer to {query:?}"));
+        let item = answer(query, &rates(), Language::English)
+            .unwrap_or_else(|| panic!("no answer to {query:?}"));
         let Action::CopyText(copied) = item.action else {
             panic!("{query:?} answers with {:?}", item.action);
         };
@@ -225,12 +228,14 @@ mod tests {
     }
 
     fn subtitle(query: &str) -> String {
-        answer(query, &rates()).expect("an answer").subtitle
+        answer(query, &rates(), Language::English)
+            .expect("an answer")
+            .subtitle
     }
 
     #[test]
     fn dollars_convert_to_roubles_at_the_banks_rate_of_its_date() {
-        let item = answer("100 usd", &rates()).expect("an answer");
+        let item = answer("100 usd", &rates(), Language::English).expect("an answer");
         assert_eq!(item.id, ItemId("hyalo:currency".to_string()));
         assert_eq!(item.kind, Kind::Calculator);
         assert_eq!(item.title, shown("8 000.00 ₽"));
@@ -239,6 +244,11 @@ mod tests {
             "100 USD → RUB · Bank of Russia, 10.11.2026 · Enter to copy"
         );
         assert_eq!(item.action, Action::CopyText("8000.00".to_string()));
+        let russian = answer("100 usd", &rates(), Language::Russian).expect("an answer");
+        assert_eq!(
+            russian.subtitle,
+            "100 USD → RUB · Банк России, 10.11.2026 · Enter — скопировать"
+        );
     }
 
     #[test]
@@ -323,7 +333,11 @@ mod tests {
     #[test]
     fn a_currency_without_a_rate_answers_nothing() {
         for query in ["100 xyz", "100 abc", "100 ₺", "10 usd in ₺", "1 TRY"] {
-            assert_eq!(answer(query, &rates()), None, "{query:?}");
+            assert_eq!(
+                answer(query, &rates(), Language::English),
+                None,
+                "{query:?}"
+            );
         }
     }
 
@@ -365,7 +379,11 @@ mod tests {
             "1/0 usd",
         ];
         for query in questions {
-            assert_eq!(answer(query, &rates()), None, "{query:?}");
+            assert_eq!(
+                answer(query, &rates(), Language::English),
+                None,
+                "{query:?}"
+            );
         }
     }
 
@@ -433,7 +451,7 @@ mod tests {
 
     #[test]
     fn a_short_name_in_the_wrong_layout_is_too_likely_meant_as_typed() {
-        assert_eq!(answer("100 h", &rates()), None, "р");
-        assert_eq!(answer("100 d", &rates()), None, "в");
+        assert_eq!(answer("100 h", &rates(), Language::English), None, "р");
+        assert_eq!(answer("100 d", &rates(), Language::English), None, "в");
     }
 }

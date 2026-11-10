@@ -475,7 +475,8 @@ impl App {
     /// change.
     fn fresh_panel(&self) -> Option<Panel> {
         let path = self.services.config.as_deref()?;
-        let file = settings::contents(path).map_or_else(
+        let language = self.services.windows_language;
+        let file = settings::contents(path, language).map_or_else(
             || {
                 Err(Problem {
                     line: 1,
@@ -544,7 +545,8 @@ impl App {
         path: &Path,
         change: &Change,
     ) -> std::result::Result<Option<String>, Refusal> {
-        let Some(text) = settings::edited(path, change)? else {
+        let language = self.services.windows_language;
+        let Some(text) = settings::edited(path, change, language)? else {
             return Ok(None);
         };
         let before = self.hotkey();
@@ -1393,7 +1395,10 @@ mod tests {
             setup.until(|window| window.laid.area(Target::Fix).is_some());
             assert!(settings.shows("config.toml has a problem"));
             assert!(
-                settings.shows("Line 2: unknown field `hotkye`, expected `hotkey` or `folders`")
+                settings
+                    .texts()
+                    .iter()
+                    .any(|text| text.starts_with("Line 2: unknown field `hotkye`"))
             );
             settings.click(Target::Remove(List::Exclude, 0));
             assert_eq!(setup.file(), broken);

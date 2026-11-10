@@ -41,6 +41,8 @@ use crate::surface::{
 /// What to draw.
 pub struct Scene<'a> {
     pub query: &'a str,
+    /// What the bar says while nothing is typed.
+    pub placeholder: &'a str,
     /// The caret in the query, and what is selected there, in UTF-16
     /// units.
     pub caret: u32,
@@ -62,7 +64,6 @@ pub struct Row<'a> {
     pub icon: Option<&'a Icon>,
 }
 
-const PLACEHOLDER: &str = "Search apps, files, settings";
 const QUERY_SIZE: f32 = 24.0;
 const TITLE_SIZE: f32 = 15.0;
 const SUBTITLE_SIZE: f32 = 12.0;
@@ -253,7 +254,7 @@ impl Renderer {
         if scene.query.is_empty() {
             let placeholder =
                 self.surface
-                    .layout(PLACEHOLDER, &self.fonts.query, 0.0, BAR_HEIGHT)?;
+                    .layout(scene.placeholder, &self.fonts.query, 0.0, BAR_HEIGHT)?;
             return self
                 .surface
                 .draw_text(&placeholder, left, 0.0, PLACEHOLDER_TEXT);
@@ -459,6 +460,7 @@ mod tests {
             let end = query.encode_utf16().count() as u32;
             Scene {
                 query,
+                placeholder: "Search apps, files, settings",
                 caret: end,
                 selection: end..end,
                 rows: Vec::new(),
@@ -480,6 +482,18 @@ mod tests {
         on_hidden_desktop(|| {
             let frame = drawn(&Scene::bar(""), (720, 64), 96);
             assert_looks_like("bar-empty-100", &frame);
+        });
+    }
+
+    #[test]
+    fn the_empty_bar_in_russian() {
+        on_hidden_desktop(|| {
+            let scene = Scene {
+                placeholder: "Поиск приложений, файлов и настроек",
+                ..Scene::bar("")
+            };
+            let frame = drawn(&scene, (720, 64), 96);
+            assert_looks_like("bar-empty-ru-100", &frame);
         });
     }
 

@@ -6,6 +6,7 @@
 use std::sync::OnceLock;
 
 use hyalo_core::hotkey::Hotkey;
+use hyalo_core::text::{Language, Text};
 use windows::Win32::Foundation::{HWND, LPARAM, POINT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::{GetDpiForSystem, GetSystemMetricsForDpi};
@@ -71,26 +72,27 @@ pub enum Line {
 /// The menu: Show (with the hotkey that does it, if one is registered),
 /// Settings, Start with Windows (checked when hyalo starts with Windows;
 /// grayed when `starts` is `None`, as for a build that may not start with
-/// Windows), Exit.
-pub fn menu(hotkey: Option<Hotkey>, starts: Option<bool>) -> Vec<Line> {
+/// Windows), Exit; in `language`.
+pub fn menu(hotkey: Option<Hotkey>, starts: Option<bool>, language: Language) -> Vec<Line> {
+    let show = language.say(Text::Show);
     let show = match hotkey {
         // A tab puts the keys on the right, as menus show shortcuts.
-        Some(hotkey) => format!("Show hyalo\t{hotkey}"),
-        None => "Show hyalo".to_string(),
+        Some(hotkey) => format!("{show}\t{hotkey}"),
+        None => show.to_string(),
     };
     let start = Line::Entry(Entry {
         command: Command::StartWithWindows,
-        label: "Start with Windows".to_string(),
+        label: language.say(Text::StartWithWindows).to_string(),
         checked: starts == Some(true),
         enabled: starts.is_some(),
     });
     vec![
         Command::Show.entry(show),
         Line::Separator,
-        Command::Settings.entry("Settings".to_string()),
+        Command::Settings.entry(language.say(Text::Settings).to_string()),
         start,
         Line::Separator,
-        Command::Exit.entry("Exit".to_string()),
+        Command::Exit.entry(language.say(Text::Exit).to_string()),
     ]
 }
 
@@ -295,7 +297,7 @@ mod tests {
 
     #[test]
     fn the_menu_shows_settings_start_with_windows_and_exit() {
-        let lines = menu(alt_space(), Some(false));
+        let lines = menu(alt_space(), Some(false), Language::English);
         let labels: Vec<Option<&str>> = lines
             .iter()
             .map(|line| match line {
@@ -320,24 +322,57 @@ mod tests {
     }
 
     #[test]
+    fn the_menu_speaks_russian_in_russian() {
+        let lines = menu(alt_space(), Some(false), Language::Russian);
+        let labels: Vec<&str> = lines
+            .iter()
+            .filter_map(|line| match line {
+                Line::Entry(entry) => Some(entry.label.as_str()),
+                Line::Separator => None,
+            })
+            .collect();
+        let expected = [
+            "Показать hyalo\tAlt+Space",
+            "Параметры",
+            "Запускать вместе с Windows",
+            "Выход",
+        ];
+        assert_eq!(labels, expected);
+        let show = entry(&menu(None, None, Language::Russian), Command::Show);
+        assert_eq!(show.label, "Показать hyalo");
+    }
+
+    #[test]
     fn show_names_no_hotkey_when_none_is_registered() {
-        assert_eq!(entry(&menu(None, None), Command::Show).label, "Show hyalo");
+        assert_eq!(
+            entry(&menu(None, None, Language::English), Command::Show).label,
+            "Show hyalo"
+        );
         let ctrl_k = Hotkey::parse("Ctrl+K").ok();
-        let show = entry(&menu(ctrl_k, None), Command::Show);
+        let show = entry(&menu(ctrl_k, None, Language::English), Command::Show);
         assert_eq!(show.label, "Show hyalo\tCtrl+K");
     }
 
     #[test]
     fn start_with_windows_is_checked_when_it_does_and_grayed_when_it_may_not() {
-        let on = entry(&menu(alt_space(), Some(true)), Command::StartWithWindows);
+        let on = entry(
+            &menu(alt_space(), Some(true), Language::English),
+            Command::StartWithWindows,
+        );
         assert!(on.checked && on.enabled);
-        let off = entry(&menu(alt_space(), Some(false)), Command::StartWithWindows);
+        let off = entry(
+            &menu(alt_space(), Some(false), Language::English),
+            Command::StartWithWindows,
+        );
         assert!(!off.checked && off.enabled);
-        let unavailable = entry(&menu(alt_space(), None), Command::StartWithWindows);
+        let unavailable = entry(
+            &menu(alt_space(), None, Language::English),
+            Command::StartWithWindows,
+        );
         assert!(!unavailable.checked && !unavailable.enabled);
         let others = [Command::Show, Command::Settings, Command::Exit];
         for command in others {
-            assert!(!entry(&menu(alt_space(), Some(true)), command).checked);
+            assert!(!entry(&menu(alt_space(), Some(true), Language::English), command).checked);
         }
     }
 
@@ -471,7 +506,7 @@ mod tests {
             unsafe { DestroyMenu(built) }.expect("destroy the menu");
             items
         };
-        let items = built(&menu(alt_space(), Some(true)));
+        let items = built(&menu(alt_space(), Some(true), Language::English));
         let show = (Some("Show hyalo	Alt+Space".to_string()), 1, false, false);
         assert_eq!(items[0], show);
         assert_eq!(items[1].0, None, "a separator");
@@ -479,7 +514,10 @@ mod tests {
         let start = (Some("Start with Windows".to_string()), 3, true, false);
         assert_eq!(items[3], start);
         assert_eq!(items[5], (Some("Exit".to_string()), 4, false, false));
-        assert!(built(&menu(alt_space(), None))[3].3, "grayed");
+        assert!(
+            built(&menu(alt_space(), None, Language::English))[3].3,
+            "grayed"
+        );
     }
 
     /// The pixel at (x, y) of `icon`, as BGRA.

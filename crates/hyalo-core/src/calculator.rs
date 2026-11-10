@@ -9,6 +9,7 @@
 
 use crate::expression;
 use crate::item::{Action, Item, ItemId, Kind};
+use crate::text::{Language, Text};
 
 /// The calculator row's id: there is one at a time.
 pub const ID: &str = "hyalo:calculator";
@@ -18,8 +19,9 @@ pub const ID: &str = "hyalo:calculator";
 /// not push "7-Zip" down with an answer that repeats the query.
 const OPERATORS: &str = "+-*/^%";
 
-/// The calculator's row for `query`, when the query is arithmetic.
-pub fn answer(query: &str) -> Option<Item> {
+/// The calculator's row for `query`, when the query is arithmetic, its
+/// second line in `language`.
+pub fn answer(query: &str, language: Language) -> Option<Item> {
     let operates = |letter: char| OPERATORS.contains(letter) || letter.is_alphabetic();
     if !query.contains(operates) {
         return None;
@@ -29,7 +31,7 @@ pub fn answer(query: &str) -> Option<Item> {
     Some(Item {
         id: ItemId(ID.to_string()),
         title: grouped(&copied),
-        subtitle: "Calculator · Enter to copy".to_string(),
+        subtitle: language.say(Text::Calculator).to_string(),
         kind: Kind::Calculator,
         action: Action::CopyText(copied),
     })
@@ -85,7 +87,8 @@ mod tests {
 
     /// The answer as shown and as copied.
     fn answered(query: &str) -> (String, String) {
-        let item = answer(query).unwrap_or_else(|| panic!("no answer to {query:?}"));
+        let item =
+            answer(query, Language::English).unwrap_or_else(|| panic!("no answer to {query:?}"));
         let Action::CopyText(copied) = item.action else {
             panic!("{query:?} answers with {:?}", item.action);
         };
@@ -98,25 +101,28 @@ mod tests {
 
     #[test]
     fn arithmetic_gets_its_answer_to_show_and_to_copy() {
-        let item = answer("2+2*2").expect("an answer");
+        let item = answer("2+2*2", Language::English).expect("an answer");
         assert_eq!(item.id, ItemId("hyalo:calculator".to_string()));
         assert_eq!(item.kind, Kind::Calculator);
         assert_eq!(item.title, "6");
         assert_eq!(item.subtitle, "Calculator · Enter to copy");
         assert_eq!(item.action, Action::CopyText("6".to_string()));
+        let russian = answer("2+2*2", Language::Russian).expect("an answer");
+        assert_eq!(russian.subtitle, "Калькулятор · Enter — скопировать");
+        assert_eq!((russian.title, russian.action), (item.title, item.action));
     }
 
     #[test]
     fn a_bare_number_gets_no_answer_so_it_still_just_searches() {
         for query in ["42", "7", "2,5", "(7)", " 3 "] {
-            assert_eq!(answer(query), None, "{query:?}");
+            assert_eq!(answer(query, Language::English), None, "{query:?}");
         }
     }
 
     #[test]
     fn text_that_is_not_arithmetic_gets_no_answer() {
         for query in ["", "notepad", "7-zip", "2+", "sqrt"] {
-            assert_eq!(answer(query), None, "{query:?}");
+            assert_eq!(answer(query, Language::English), None, "{query:?}");
         }
     }
 

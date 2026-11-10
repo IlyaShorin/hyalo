@@ -54,6 +54,7 @@ pub struct Look {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Spot {
     Hotkey,
+    Language,
     List(List),
 }
 
@@ -171,6 +172,7 @@ impl Panel {
     pub fn refused(&mut self, change: &Change, why: Why) {
         let spot = match change {
             Change::Hotkey(_) => Spot::Hotkey,
+            Change::Language(_) => Spot::Language,
             Change::Add(list, _) | Change::Remove(list, _) => Spot::List(*list),
         };
         self.note = Some((spot, why));
@@ -783,8 +785,11 @@ mod tests {
         let shown = texts(&panel);
         assert_eq!(shown[1], "config.toml has a problem");
         assert_eq!(
-            shown[2],
-            "Line 2: unknown field `hotkye`, expected `hotkey` or `folders`"
+            shown[2..4],
+            [
+                "Line 2: unknown field `hotkye`, expected one of `hotkey`, `language`,",
+                "`folders`"
+            ]
         );
         assert!(
             shown.contains(&"Hotkey".to_string()),
@@ -838,7 +843,7 @@ mod tests {
     fn a_file_broken_from_the_start_shows_its_problem_and_the_way_to_it() {
         let panel = Panel::new(Err(broken()), Some(true));
         let shown = texts(&panel);
-        assert_eq!(shown.len(), 5, "{shown:?}");
+        assert_eq!(shown.len(), 6, "{shown:?}");
         assert!(shown[2].starts_with("Line 2: "));
         assert_eq!(laid(&panel).targets(), [Target::Fix, Target::OpenConfig]);
         let help = laid(&panel)

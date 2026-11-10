@@ -39,12 +39,13 @@ pub fn item(name: &str, parsing_name: &str) -> Option<Item> {
 }
 
 /// A path or an address tells where the app lives. An AppUserModelID
-/// tells a person nothing, so the row just says it is an app.
+/// tells a person nothing: no second line, and the row says it is an app,
+/// in the language it is shown in (`results::subtitle`).
 fn subtitle(parsing_name: &str) -> String {
     let location = parsing_name.contains(":\\") || parsing_name.contains("://");
     match location {
         true => parsing_name.to_string(),
-        false => "App".to_string(),
+        false => String::new(),
     }
 }
 
@@ -203,7 +204,7 @@ mod tests {
             Some(Item {
                 id: ItemId(calculator.to_string()),
                 title: "Calculator".to_string(),
-                subtitle: "App".to_string(),
+                subtitle: String::new(),
                 kind: Kind::App,
                 action: Action::Open(format!("shell:AppsFolder\\{calculator}")),
             })

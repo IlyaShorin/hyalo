@@ -26,6 +26,11 @@ pub const DEFAULT: &str = r#"# hyalo's settings. Saved changes apply at once; a 
 # joined by +, such as "Ctrl+Shift+K" or "Win+F1".
 hotkey = "Alt+Space"
 
+# What the settings window, the tray menu and the launcher's rows say:
+# "en" for English or "ru" for Russian. Left out, the language Windows
+# is shown in.
+language = "en"
+
 [folders]
 # Left out of the file index with everything in them: full paths.
 # WinSxS keeps a copy of every system file each update brought, hundreds
@@ -42,11 +47,20 @@ rank_lower = ['target']
 rank_higher = []
 "#;
 
+/// The file written the first time, in `language`: the defaults, with the
+/// language Windows is shown in.
+pub fn default_file(language: Language) -> String {
+    let named = format!("language = \"{}\"", language.code());
+    DEFAULT.replacen("language = \"en\"", &named, 1)
+}
+
 /// The settings.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Config {
     /// Shows and hides the launcher.
     pub hotkey: Hotkey,
+    /// What hyalo says things in; `None` follows Windows.
+    pub language: Option<Language>,
     /// Full paths the walk leaves out, with everything under them: with
     /// backslashes, without one at the end.
     pub exclude: Vec<String>,
@@ -63,6 +77,7 @@ impl Default for Config {
         let places = |list: List| list.defaults().iter().map(place).collect();
         Config {
             hotkey: Hotkey::default(),
+            language: None,
             exclude: strings(List::Exclude).collect(),
             rank_lower: places(List::RankLower),
             rank_higher: places(List::RankHigher),
@@ -110,6 +125,7 @@ impl List {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Written {
     pub hotkey: Hotkey,
+    pub language: Option<Language>,
     lists: [Vec<String>; 3],
 }
 
@@ -125,6 +141,7 @@ pub fn written(text: &str) -> Result<Written, Problem> {
     let (config, lists) = read(text)?;
     Ok(Written {
         hotkey: config.hotkey,
+        language: config.language,
         lists,
     })
 }
@@ -235,6 +252,10 @@ fn read(text: &str) -> Result<(Config, [Vec<String>; 3]), Problem> {
         hotkey: at.one(file.hotkey, defaults.hotkey, |text| {
             Hotkey::parse(text).map_err(Why::Hotkey)
         })?,
+        language: file
+            .language
+            .map(|value| at.read(value, &language))
+            .transpose()?,
         exclude: at.each(folders.exclude, defaults.exclude, excluded)?,
         rank_lower: at.each(folders.rank_lower, defaults.rank_lower, place)?,
         rank_higher: at.each(folders.rank_higher, defaults.rank_higher, place)?,
@@ -260,6 +281,7 @@ fn as_written(values: Option<&[Spanned<String>]>, list: List) -> Vec<String> {
 #[serde(deny_unknown_fields)]
 struct File {
     hotkey: Option<Spanned<String>>,
+    language: Option<Spanned<String>>,
     folders: Option<Folders>,
 }
 
@@ -349,6 +371,10 @@ fn excluded(text: &str) -> Result<String, Why> {
     }
 }
 
+fn language(text: &str) -> Result<Language, Why> {
+    Language::parse(text).ok_or_else(|| Why::Value(Wanted::Language, text.to_string()))
+}
+
 fn place(text: &str) -> Result<Place, Why> {
     Place::parse(text).ok_or_else(|| Why::Value(Wanted::Place, text.to_string()))
 }
@@ -368,7 +394,14 @@ mod tests {
     #[test]
     fn the_file_written_at_first_reads_as_the_defaults() {
         let config = parse(DEFAULT).expect("the default file");
-        assert_eq!(config, Config::default());
+        let english = Some(Language::English);
+        assert_eq!(
+            config,
+            Config {
+                language: english,
+                ..Config::default()
+            }
+        );
         assert_eq!(config.hotkey, Hotkey::default());
         assert_eq!(config.exclude, [r"C:\Windows\WinSxS"]);
         assert_eq!(config.rank_lower, [place("target")]);
@@ -493,6 +526,31 @@ rank_higher = ['notes']
             found.said(Language::Russian),
             "строка 3: hyalo не знает клавишу `Kay`"
         );
+    }
+
+    #[test]
+    fn the_file_written_at_first_names_the_language_windows_speaks() {
+        assert_eq!(default_file(Language::English), DEFAULT);
+        let russian = default_file(Language::Russian);
+        assert!(russian.contains("\nlanguage = \"ru\"\n"), "{russian}");
+        let config = parse(&russian).expect("the default file");
+        let expected = Config {
+            language: Some(Language::Russian),
+            ..Config::default()
+        };
+        assert_eq!(config, expected);
+    }
+
+    #[test]
+    fn a_language_is_read_by_its_code_and_left_out_follows_windows() {
+        let russian = parse("language = 'RU'\n").expect("a config");
+        assert_eq!(russian.language, Some(Language::Russian));
+        assert_eq!(parse("").expect("a config").language, None);
+        let written = written("language = \"en\"\n").expect("good settings");
+        assert_eq!(written.language, Some(Language::English));
+        let found = problem("hotkey = 'F4'\nlanguage = 'de'\n");
+        assert_eq!(found.line, 2);
+        assert_eq!(found.why, Why::Value(Wanted::Language, "de".to_string()));
     }
 
     fn entries(written: &Written, list: List) -> Vec<&str> {

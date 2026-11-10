@@ -22,7 +22,9 @@ use hyalo_core::hotkey::Hotkey;
 use hyalo_core::item::{Action, Item, ItemId, Kind};
 use hyalo_core::places::Places;
 use hyalo_core::rank::Ranked;
+use hyalo_core::text::{Language, Text};
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+use windows::Win32::Globalization::GetUserDefaultUILanguage;
 use windows::Win32::Graphics::Dwm::{
     DWMSBT_TRANSIENTWINDOW, DWMWA_BORDER_COLOR, DWMWA_COLOR_NONE, DWMWA_SYSTEMBACKDROP_TYPE,
     DWMWA_USE_IMMERSIVE_DARK_MODE, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND,
@@ -143,6 +145,9 @@ pub struct Services {
     /// Where the place the launcher was dragged to is kept; `None` keeps
     /// it in memory.
     pub position: Option<PathBuf>,
+    /// The language Windows is shown in: hyalo's own, unless the config
+    /// names another.
+    pub windows_language: Language,
 }
 
 impl Services {
@@ -188,6 +193,8 @@ impl Services {
             autostart: Autostart::real(),
             picker: Rc::new(picker::System),
             position: store::ours("LOCALAPPDATA", "position.txt"),
+            // SAFETY: a plain call.
+            windows_language: Language::of_windows(unsafe { GetUserDefaultUILanguage() }),
         }
     }
 }
@@ -281,9 +288,16 @@ impl App {
         self.hotkey.map(|(_, hotkey)| hotkey)
     }
 
+    /// What hyalo says things in: the config's language, or Windows'.
+    fn language(&self) -> Language {
+        self.config
+            .language
+            .unwrap_or(self.services.windows_language)
+    }
+
     /// Shows hyalo's icon in the tray with what it should say.
     fn show_tray(&mut self) {
-        let said = self.notice().map(|notice| notice.said());
+        let said = self.notice().map(|notice| notice.said(self.language()));
         let tip = tray::tip(self.hotkey(), said.as_deref());
         // Without a taskbar yet, TaskbarCreated brings the icon later.
         let _ = self.services.tray.show(self.hwnd, &tip);
@@ -354,7 +368,7 @@ impl App {
 
     /// What the tray's menu holds now.
     fn menu(&self) -> Vec<tray::Line> {
-        tray::menu(self.hotkey(), self.starts())
+        tray::menu(self.hotkey(), self.starts(), self.language())
     }
 
     /// Starts with Windows if it does not, and stops if it does.
@@ -460,7 +474,12 @@ impl App {
     }
 
     fn redraw(&mut self) -> Result<()> {
-        let scene = scene(&self.query, &self.results, &self.catalog.icons);
+        let scene = scene(
+            &self.query,
+            &self.results,
+            &self.catalog.icons,
+            self.language(),
+        );
         self.renderer
             .as_mut()
             .map_or(Ok(()), |renderer| renderer.draw(&scene))
@@ -710,7 +729,7 @@ impl App {
         let found = Results::search(query, items, self.file_hits(), frecency, places, now());
         let answer = match query.is_empty() {
             true => self.notice_row(),
-            false => results::answer(query, self.catalog.rates.as_ref()),
+            false => results::answer(query, self.catalog.rates.as_ref(), self.language()),
         };
         found.answered(answer)
     }
@@ -719,7 +738,7 @@ impl App {
     /// change.
     fn notice_row(&self) -> Option<Item> {
         self.services.config.as_ref()?;
-        Some(self.notice()?.item())
+        Some(self.notice()?.item(self.language()))
     }
 
     /// The files and folders the index finds for the query: enough to
@@ -820,16 +839,18 @@ fn scene<'a>(
     query: &'a Field,
     results: &'a Results,
     icons: &'a HashMap<ItemId, Icon>,
+    language: Language,
 ) -> Scene<'a> {
     let row = |listed: &'a Listed| Row {
         id: &listed.item.id,
         title: &listed.item.title,
-        subtitle: &listed.item.subtitle,
+        subtitle: results::subtitle(&listed.item, language),
         highlights: utf16_ranges(&listed.item.title, &listed.matched),
         icon: icons.get(&listed.item.id),
     };
     Scene {
         query: query.text(),
+        placeholder: language.say(Text::Placeholder),
         caret: query.caret_utf16(),
         selection: query.selection_utf16(),
         rows: results.rows().iter().map(row).collect(),
@@ -879,7 +900,11 @@ fn open(services: Services, shown: bool) -> Result<HWND> {
         .unwrap_or_default();
     let sources = services.sources.len();
     let places = services.places.clone();
-    let seen = services.config.as_deref().and_then(settings::contents);
+    let language = services.windows_language;
+    let seen = services
+        .config
+        .as_deref()
+        .and_then(|path| settings::contents(path, language));
     let position = services.position.as_deref().and_then(read_position);
     APP.with_borrow_mut(|app| {
         let mut opened = App {
@@ -1647,6 +1672,7 @@ mod tests {
             autostart: None,
             picker: Rc::new(Chooser::default()),
             position: None,
+            windows_language: Language::English,
         };
         (services, ran)
     }
@@ -2152,7 +2178,10 @@ mod tests {
             launcher.tray(WM_CONTEXTMENU, (1500, 1040));
             let menus = taskbar.menus.borrow();
             let (lines, at) = &menus[0];
-            assert_eq!(*lines, tray::menu(Some(Hotkey::default()), None));
+            assert_eq!(
+                *lines,
+                tray::menu(Some(Hotkey::default()), None, Language::English)
+            );
             assert_eq!((at.x, at.y), (1500, 1040));
             assert!(launcher.visible(), "nothing picked");
         });
@@ -2229,7 +2258,10 @@ mod tests {
             launcher.tray(WM_CONTEXTMENU, (0, 0));
             let menus = taskbar.menus.borrow();
             let lines = &menus.last().expect("a menu").0;
-            assert_eq!(*lines, tray::menu(Some(Hotkey::default()), Some(true)));
+            assert_eq!(
+                *lines,
+                tray::menu(Some(Hotkey::default()), Some(true), Language::English)
+            );
         });
     }
 
@@ -2300,7 +2332,10 @@ mod tests {
             assert_eq!(*taskbar.tips.borrow(), ["hyalo · Ctrl+Shift+K"]);
             launcher.tray(WM_CONTEXTMENU, (0, 0));
             let menus = taskbar.menus.borrow();
-            assert_eq!(menus[0].0, tray::menu(Some(hotkey("Ctrl+Shift+K")), None));
+            assert_eq!(
+                menus[0].0,
+                tray::menu(Some(hotkey("Ctrl+Shift+K")), None, Language::English)
+            );
         });
     }
 
@@ -3280,6 +3315,92 @@ mod tests {
     fn first_row() -> (String, String) {
         let first = with_app(|app| app.results.rows()[0].item.clone()).expect("app state");
         (first.title, first.subtitle)
+    }
+
+    /// The labels of the menu the tray opened last.
+    fn menu_labels(taskbar: &Taskbar) -> Vec<String> {
+        let menus = taskbar.menus.borrow();
+        let (lines, _) = menus.last().expect("a menu");
+        let entries = lines.iter().filter_map(|line| match line {
+            tray::Line::Entry(entry) => Some(entry.label.clone()),
+            tray::Line::Separator => None,
+        });
+        entries.collect()
+    }
+
+    const RUSSIAN_MENU: [&str; 4] = [
+        "Показать hyalo\tAlt+Space",
+        "Параметры",
+        "Запускать вместе с Windows",
+        "Выход",
+    ];
+
+    #[test]
+    fn a_config_in_russian_speaks_russian_in_the_tray_and_the_rows() {
+        on_hidden_desktop(|| {
+            let (_scratch, path) = config_file("window-config-russian", "language = 'ru'\n");
+            let keyboard = Rc::new(Keyboard::default());
+            let (launcher, taskbar, _) = configured(&path, &keyboard);
+            launcher.tray(WM_CONTEXTMENU, (0, 0));
+            assert_eq!(menu_labels(&taskbar), RUSSIAN_MENU);
+            launcher.search_for("2+2", 1);
+            let calculator = "Калькулятор · Enter — скопировать".to_string();
+            assert_eq!(first_row(), ("4".to_string(), calculator));
+        });
+    }
+
+    #[test]
+    fn a_config_without_a_language_speaks_the_one_windows_is_shown_in() {
+        on_hidden_desktop(|| {
+            let text = "hotkey = 'Alt+Space'\n";
+            let (_scratch, path) = config_file("window-config-windows-language", text);
+            let taskbar = Rc::new(Taskbar::default());
+            let (mut services, _) = services(listing(&[]).0, None);
+            services.tray = taskbar.clone();
+            services.config = Some(path);
+            services.windows_language = Language::Russian;
+            let launcher = Launcher::serving(services);
+            launcher.tray(WM_CONTEXTMENU, (0, 0));
+            assert_eq!(menu_labels(&taskbar), RUSSIAN_MENU);
+        });
+    }
+
+    #[test]
+    fn a_language_saved_applies_at_once_and_a_broken_file_keeps_it() {
+        on_hidden_desktop(|| {
+            let (_scratch, path) = config_file("window-config-language-saved", "language = 'ru'\n");
+            let keyboard = Rc::new(Keyboard::default());
+            let (launcher, taskbar, _) = configured(&path, &keyboard);
+            std::fs::write(&path, "language = 'en'\n").expect("save");
+            launcher.pump_until(|app| app.language() == Language::English);
+            launcher.tray(WM_CONTEXTMENU, (0, 0));
+            assert_eq!(menu_labels(&taskbar)[3], "Exit");
+            std::fs::write(&path, "language = 'ru'\n").expect("save");
+            launcher.pump_until(|app| app.language() == Language::Russian);
+            std::fs::write(&path, "\nhotkye = 1\n").expect("save");
+            launcher.pump_until(|app| app.results.rows().len() == 1);
+            let (title, subtitle) = first_row();
+            assert!(title.starts_with("config.toml, строка 2: "), "{title}");
+            let advice = "Действуют последние исправные настройки · Enter — открыть параметры";
+            assert_eq!(subtitle, advice);
+            let tips = taskbar.tips.borrow();
+            let tip = tips.last().expect("a tip");
+            assert!(tip.starts_with("hyalo · config.toml, строка 2: "), "{tip}");
+        });
+    }
+
+    #[test]
+    fn a_missing_config_is_written_in_the_language_windows_is_shown_in() {
+        on_hidden_desktop(|| {
+            let scratch = Scratch::new("window-config-missing-russian");
+            let path = scratch.0.join("hyalo").join("config.toml");
+            let (mut services, _) = services(listing(&[]).0, None);
+            services.config = Some(path.clone());
+            services.windows_language = Language::Russian;
+            let _launcher = Launcher::serving(services);
+            let written = std::fs::read_to_string(&path).expect("written");
+            assert_eq!(written, hyalo_core::config::default_file(Language::Russian));
+        });
     }
 
     #[test]

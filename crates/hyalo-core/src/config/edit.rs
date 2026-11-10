@@ -6,12 +6,15 @@ use toml_edit::{Array, DocumentMut, Item, Table, Value};
 
 use super::{List, Problem, Why, Written, written};
 use crate::hotkey::Hotkey;
+use crate::text::Language;
 
 /// One change to the settings.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Change {
     /// The hotkey becomes this one.
     Hotkey(Hotkey),
+    /// hyalo speaks this language.
+    Language(Language),
     /// An entry is added at the end of a list, unless it is there.
     Add(List, String),
     /// An entry, as written, leaves a list; one not there is gone already.
@@ -37,17 +40,29 @@ pub fn edit(text: &str, change: &Change) -> Result<String, Refusal> {
     let mut document: DocumentMut = text
         .parse()
         .map_err(|error: toml_edit::TomlError| Refusal::Wrong(Why::Toml(error.to_string())))?;
-    let changed = match change {
-        Change::Hotkey(hotkey) => set_hotkey(&mut document, *hotkey, before.hotkey),
-        Change::Add(list, entry) => add(&mut document, &before, *list, entry),
-        Change::Remove(list, entry) => remove(&mut document, &before, *list, entry),
-    };
-    if !changed {
+    if !make(&mut document, &before, change) {
         return Ok(text.to_string());
     }
     let after = line_endings(text, document.to_string());
     written(&after).map_err(|problem| Refusal::Wrong(problem.why))?;
     Ok(after)
+}
+
+/// Makes `change` in `document`, whose settings are `before`; whether it
+/// changed anything.
+fn make(document: &mut DocumentMut, before: &Written, change: &Change) -> bool {
+    match change {
+        Change::Hotkey(hotkey) => {
+            let differs = *hotkey != before.hotkey;
+            differs && set(document, "hotkey", hotkey.to_string())
+        }
+        Change::Language(language) => {
+            let differs = Some(*language) != before.language;
+            differs && set(document, "language", language.code().to_string())
+        }
+        Change::Add(list, entry) => add(document, before, *list, entry),
+        Change::Remove(list, entry) => remove(document, before, *list, entry),
+    }
 }
 
 /// `after` with the line endings of `before`: toml_edit ends every line
@@ -60,20 +75,18 @@ fn line_endings(before: &str, after: String) -> String {
     }
 }
 
-/// Puts `hotkey` in the place of the one written, keeping what is
-/// around it; adds the setting when the file leaves it out.
-fn set_hotkey(document: &mut DocumentMut, hotkey: Hotkey, before: Hotkey) -> bool {
-    if hotkey == before {
-        return false;
-    }
-    let mut value = Value::from(hotkey.to_string());
-    match document.get_mut("hotkey").and_then(Item::as_value_mut) {
+/// Puts `value` as the setting `key` at the file's top in the place of
+/// the one written, keeping what is around it; adds the setting when the
+/// file leaves it out. Always a change.
+fn set(document: &mut DocumentMut, key: &str, value: String) -> bool {
+    let mut value = Value::from(value);
+    match document.get_mut(key).and_then(Item::as_value_mut) {
         Some(old) => {
             *value.decor_mut() = old.decor().clone();
             *old = value;
         }
         None => {
-            document.insert("hotkey", Item::Value(value));
+            document.insert(key, Item::Value(value));
         }
     }
     true
@@ -389,6 +402,27 @@ mod tests {
             refused,
             Err(Refusal::Broken(Problem { line: 2, .. }))
         ));
+    }
+
+    #[test]
+    fn a_language_takes_the_place_of_the_one_written_and_keeps_its_comment() {
+        let after = edited(DEFAULT, Change::Language(Language::Russian));
+        assert_eq!(after, crate::config::default_file(Language::Russian));
+        assert_eq!(edited(&after, Change::Language(Language::Russian)), after);
+    }
+
+    #[test]
+    fn a_language_left_out_is_added_among_the_settings_at_the_top() {
+        let text = "hotkey = 'F4'\n\n[folders]\nexclude = []\n";
+        let after = edited(text, Change::Language(Language::Russian));
+        assert_eq!(
+            after,
+            "hotkey = 'F4'\nlanguage = \"ru\"\n\n[folders]\nexclude = []\n"
+        );
+        assert_eq!(
+            edited("", Change::Language(Language::English)),
+            "language = \"en\"\n"
+        );
     }
 
     #[test]
