@@ -85,8 +85,8 @@ fn kind_weight(kind: Kind) -> f64 {
         // under files.
         Kind::App | Kind::Setting | Kind::Command => 2,
         // A notice or a web search is never ranked; it goes first, as an
-        // answer does.
-        Kind::Calculator | Kind::Web | Kind::Notice => 3,
+        // answer does. Windows are ranked only among themselves.
+        Kind::Calculator | Kind::Web | Kind::Window | Kind::Notice => 3,
     };
     f64::from(step) * KIND_STEP
 }

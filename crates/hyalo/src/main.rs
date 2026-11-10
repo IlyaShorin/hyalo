@@ -27,6 +27,7 @@ mod results;
 mod settings;
 mod store;
 mod surface;
+mod switcher;
 mod system;
 mod tray;
 mod update;

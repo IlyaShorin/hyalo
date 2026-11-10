@@ -11,7 +11,7 @@ use hyalo_core::rates::Rates;
 use hyalo_core::system_commands::Command;
 use hyalo_core::text::{Language, Text};
 use hyalo_core::web::{self, Engine};
-use hyalo_core::{calculator, currency};
+use hyalo_core::{calculator, currency, switcher};
 
 /// The most rows the window lists.
 pub const MAX_ROWS: usize = 8;
@@ -140,6 +140,18 @@ impl Results {
         let rows = ranked.take(MAX_ROWS).collect();
         Self {
             rows,
+            selected: 0,
+            asking: false,
+        }
+    }
+
+    /// The open `windows` the switcher's `filter` finds, best first, at
+    /// most `MAX_ROWS`, the first one selected.
+    pub fn windows(filter: &str, windows: &[Item]) -> Self {
+        let ranked = switcher::ranked(filter, windows).into_iter();
+        let rows = ranked.map(|(item, matched)| Listed { item, matched });
+        Self {
+            rows: rows.take(MAX_ROWS).collect(),
             selected: 0,
             asking: false,
         }
@@ -414,6 +426,20 @@ mod tests {
             titles(&results),
             ["Search Wikipedia for “notes”", "w notes app"]
         );
+    }
+
+    #[test]
+    fn the_switcher_lists_at_most_eight_windows_marking_what_the_filter_matched() {
+        let windows: Vec<Item> = (1..=10)
+            .map(|n| switcher::item(n, &format!("Window {n:02}"), "App"))
+            .collect();
+        let all = Results::windows("", &windows);
+        assert_eq!(titles(&all).len(), MAX_ROWS);
+        assert_eq!(titles(&all)[0], "Window 01", "front first");
+        let found = Results::windows("10", &windows);
+        assert_eq!(titles(&found), ["Window 10"]);
+        assert_eq!(found.rows()[0].matched, [7, 8]);
+        assert_eq!(picked(&found), Some("Window 10"));
     }
 
     #[test]

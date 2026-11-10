@@ -32,7 +32,16 @@ pub fn run(action: &Action, as_admin: bool) -> Result<()> {
         Action::Edit(path) => edit(path),
         // The launcher opens its own window; there is nothing to run.
         Action::Settings => Ok(()),
+        Action::Switch(window) => crate::switcher::switch_to(*window),
     }
+}
+
+/// Whether `action` must be carried out at once, on the launcher's
+/// thread, rather than on a thread of its own: switching to a window
+/// must happen while the launcher is still in front, since Windows lets
+/// only the foreground hand the foreground on, and it hides next.
+pub fn at_once(action: &Action) -> bool {
+    matches!(action, Action::Switch(_))
 }
 
 /// Opens the text file `path` with the app Windows opens its kind of
@@ -155,6 +164,31 @@ mod tests {
     #[test]
     fn the_settings_window_is_the_launchers_to_open() {
         assert_eq!(run(&Action::Settings, false), Ok(()));
+    }
+
+    #[test]
+    fn switching_happens_at_once_and_everything_else_on_a_thread() {
+        assert!(at_once(&Action::Switch(0x1234)));
+        for action in [
+            Action::Open(r"C:\a.txt".to_string()),
+            Action::Launch {
+                program: "a.exe".to_string(),
+                arguments: String::new(),
+            },
+            Action::Reveal(r"C:\a.txt".to_string()),
+            Action::CopyText("4".to_string()),
+            Action::Settings,
+            Action::Edit(r"C:\a.toml".to_string()),
+        ] {
+            assert!(!at_once(&action), "{action:?}");
+        }
+    }
+
+    #[test]
+    fn a_window_that_is_gone_is_not_switched_to() {
+        let gone = run(&Action::Switch(0x7FFF_FFF0), false).expect_err("no such window");
+        let invalid = windows::Win32::Foundation::ERROR_INVALID_WINDOW_HANDLE;
+        assert_eq!(gone.code(), invalid.to_hresult());
     }
 
     #[test]

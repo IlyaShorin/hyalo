@@ -26,6 +26,8 @@ pub enum Found {
     Picked(Vec<Item>),
     /// The newest exchange rates.
     Rates(Rates),
+    /// The open windows, front first, in place of those found before.
+    Windows(Vec<Item>),
     /// What the config file holds since it was saved, as bytes: the
     /// launcher reads the settings from them, the settings window what
     /// they write.
@@ -67,6 +69,8 @@ pub struct Catalog {
     pub picked: Vec<Item>,
     /// What currency answers convert with; `None` until found.
     pub rates: Option<Rates>,
+    /// The open windows the switcher lists, front first.
+    pub windows: Vec<Item>,
 }
 
 impl Catalog {
@@ -80,10 +84,26 @@ impl Catalog {
             Found::Files => {}
             Found::Picked(items) => items.into_iter().for_each(|item| self.pick(item)),
             Found::Rates(rates) => self.rates = Some(rates),
+            Found::Windows(windows) => self.open(windows),
             // The window puts settings in force and updates hyalo; there
             // is nothing to list.
             Found::Config(_) | Found::Latest(_) | Found::Installed(_) => {}
         }
+    }
+
+    /// Takes in the open windows; the icons of those closed since go, so
+    /// that windows coming and going leave none behind.
+    fn open(&mut self, windows: Vec<Item>) {
+        let closed: Vec<ItemId> = self
+            .windows
+            .iter()
+            .filter(|old| !windows.iter().any(|open| open.id == old.id))
+            .map(|old| old.id.clone())
+            .collect();
+        for id in closed {
+            self.icons.remove(&id);
+        }
+        self.windows = windows;
     }
 
     /// Remembers a picked file or folder, once.
@@ -222,6 +242,24 @@ mod tests {
         catalog.take(Found::Rates(crate::rates::tests::dated("09.11.2026")));
         catalog.take(Found::Rates(crate::rates::tests::fixture()));
         assert_eq!(catalog.rates, Some(crate::rates::tests::fixture()));
+    }
+
+    #[test]
+    fn open_windows_replace_those_before_and_the_closed_ones_lose_their_icons() {
+        let mut catalog = Catalog::default();
+        let one = hyalo_core::switcher::item(1, "One", "App");
+        let two = hyalo_core::switcher::item(2, "Two", "App");
+        catalog.take(Found::Items(vec![app("Paint")]));
+        catalog.take(Found::Windows(vec![one.clone(), two.clone()]));
+        for id in [&one.id, &two.id, &app("Paint").id] {
+            catalog.take(Found::Icon(id.clone(), dot()));
+        }
+        catalog.take(Found::Windows(vec![two.clone()]));
+        assert_eq!(catalog.windows, std::slice::from_ref(&two));
+        assert!(!catalog.icons.contains_key(&one.id), "closed");
+        assert!(catalog.icons.contains_key(&two.id), "still open");
+        assert!(catalog.icons.contains_key(&app("Paint").id), "not a window");
+        assert_eq!(catalog.items, [app("Paint")]);
     }
 
     #[test]

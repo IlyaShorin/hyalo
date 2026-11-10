@@ -46,6 +46,9 @@ pub enum Kind {
     /// A web search for what was typed after a prefix: never ranked,
     /// never remembered as a pick.
     Web,
+    /// An open window: listed after `>`, never remembered as a pick (its
+    /// handle is gone once it closes).
+    Window,
     /// What hyalo tells the user, such as a mistake in the config: never
     /// ranked, never remembered as a pick.
     Notice,
@@ -67,6 +70,8 @@ pub enum Action {
     CopyText(String),
     /// Open hyalo's settings window: the launcher does it itself.
     Settings,
+    /// Bring the open window with this handle, as a number, to the front.
+    Switch(isize),
     /// Open a text file, such as the config, in the app Windows has for
     /// its kind, or in Notepad when there is none.
     Edit(String),
