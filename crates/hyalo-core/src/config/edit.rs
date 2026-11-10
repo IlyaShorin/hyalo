@@ -15,6 +15,8 @@ pub enum Change {
     Hotkey(Hotkey),
     /// hyalo speaks this language.
     Language(Language),
+    /// hyalo looks for a newer release, or stops looking.
+    CheckForUpdates(bool),
     /// An entry is added at the end of a list, unless it is there.
     Add(List, String),
     /// An entry, as written, leaves a list; one not there is gone already.
@@ -54,11 +56,15 @@ fn make(document: &mut DocumentMut, before: &Written, change: &Change) -> bool {
     match change {
         Change::Hotkey(hotkey) => {
             let differs = *hotkey != before.hotkey;
-            differs && set(document, "hotkey", hotkey.to_string())
+            differs && set(document, "hotkey", hotkey.to_string().into())
         }
         Change::Language(language) => {
             let differs = Some(*language) != before.language;
-            differs && set(document, "language", language.code().to_string())
+            differs && set(document, "language", language.code().into())
+        }
+        Change::CheckForUpdates(on) => {
+            let differs = *on != before.check_for_updates;
+            differs && set(document, "check_for_updates", (*on).into())
         }
         Change::Add(list, entry) => add(document, before, *list, entry),
         Change::Remove(list, entry) => remove(document, before, *list, entry),
@@ -78,8 +84,7 @@ fn line_endings(before: &str, after: String) -> String {
 /// Puts `value` as the setting `key` at the file's top in the place of
 /// the one written, keeping what is around it; adds the setting when the
 /// file leaves it out. Always a change.
-fn set(document: &mut DocumentMut, key: &str, value: String) -> bool {
-    let mut value = Value::from(value);
+fn set(document: &mut DocumentMut, key: &str, mut value: Value) -> bool {
     match document.get_mut(key).and_then(Item::as_value_mut) {
         Some(old) => {
             *value.decor_mut() = old.decor().clone();
@@ -422,6 +427,35 @@ mod tests {
         assert_eq!(
             edited("", Change::Language(Language::English)),
             "language = \"en\"\n"
+        );
+    }
+
+    #[test]
+    fn checking_for_updates_turned_off_is_written_in_its_place_and_on_again() {
+        let off = edited(DEFAULT, Change::CheckForUpdates(false));
+        let expected = DEFAULT.replace("check_for_updates = true", "check_for_updates = false");
+        assert_ne!(expected, DEFAULT);
+        assert_eq!(off, expected);
+        assert_eq!(edited(&off, Change::CheckForUpdates(false)), off);
+        assert_eq!(edited(&off, Change::CheckForUpdates(true)), DEFAULT);
+    }
+
+    #[test]
+    fn checking_for_updates_left_out_is_on_and_turned_off_among_the_settings_at_the_top() {
+        let text = "hotkey = 'F4'
+
+[folders]
+exclude = []
+";
+        assert_eq!(edited(text, Change::CheckForUpdates(true)), text);
+        assert_eq!(
+            edited(text, Change::CheckForUpdates(false)),
+            "hotkey = 'F4'
+check_for_updates = false
+
+[folders]
+exclude = []
+"
         );
     }
 

@@ -31,6 +31,11 @@ hotkey = "Alt+Space"
 # is shown in.
 language = "en"
 
+# Looks for a new version of hyalo on GitHub once a day and tells you of
+# it under the search bar and in the tray menu; nothing is installed
+# until you click Install. false stops looking.
+check_for_updates = true
+
 [folders]
 # Left out of the file index with everything in them: full paths.
 # WinSxS keeps a copy of every system file each update brought, hundreds
@@ -61,6 +66,8 @@ pub struct Config {
     pub hotkey: Hotkey,
     /// What hyalo says things in; `None` follows Windows.
     pub language: Option<Language>,
+    /// Whether to look for a newer release.
+    pub check_for_updates: bool,
     /// Full paths the walk leaves out, with everything under them: with
     /// backslashes, without one at the end.
     pub exclude: Vec<String>,
@@ -78,6 +85,7 @@ impl Default for Config {
         Config {
             hotkey: Hotkey::default(),
             language: None,
+            check_for_updates: true,
             exclude: strings(List::Exclude).collect(),
             rank_lower: places(List::RankLower),
             rank_higher: places(List::RankHigher),
@@ -126,6 +134,7 @@ impl List {
 pub struct Written {
     pub hotkey: Hotkey,
     pub language: Option<Language>,
+    pub check_for_updates: bool,
     lists: [Vec<String>; 3],
 }
 
@@ -142,6 +151,7 @@ pub fn written(text: &str) -> Result<Written, Problem> {
     Ok(Written {
         hotkey: config.hotkey,
         language: config.language,
+        check_for_updates: config.check_for_updates,
         lists,
     })
 }
@@ -256,6 +266,7 @@ fn read(text: &str) -> Result<(Config, [Vec<String>; 3]), Problem> {
             .language
             .map(|value| at.read(value, &language))
             .transpose()?,
+        check_for_updates: file.check_for_updates.unwrap_or(defaults.check_for_updates),
         exclude: at.each(folders.exclude, defaults.exclude, excluded)?,
         rank_lower: at.each(folders.rank_lower, defaults.rank_lower, place)?,
         rank_higher: at.each(folders.rank_higher, defaults.rank_higher, place)?,
@@ -282,6 +293,7 @@ fn as_written(values: Option<&[Spanned<String>]>, list: List) -> Vec<String> {
 struct File {
     hotkey: Option<Spanned<String>>,
     language: Option<Spanned<String>>,
+    check_for_updates: Option<bool>,
     folders: Option<Folders>,
 }
 
@@ -406,6 +418,33 @@ mod tests {
         assert_eq!(config.exclude, [r"C:\Windows\WinSxS"]);
         assert_eq!(config.rank_lower, [place("target")]);
         assert_eq!(config.rank_higher, []);
+    }
+
+    #[test]
+    fn checking_for_updates_is_on_unless_the_file_turns_it_off() {
+        assert!(parse(DEFAULT).expect("the default file").check_for_updates);
+        assert!(parse("").expect("a config").check_for_updates);
+        let off = parse(
+            "check_for_updates = false
+",
+        )
+        .expect("a config");
+        assert!(!off.check_for_updates);
+        assert!(
+            !written(
+                "check_for_updates = false
+"
+            )
+            .expect("written")
+            .check_for_updates
+        );
+        assert!(written("").expect("written").check_for_updates);
+        let wrong = problem(
+            "
+check_for_updates = 'no'
+",
+        );
+        assert_eq!(wrong.line, 2);
     }
 
     #[test]

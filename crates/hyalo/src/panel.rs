@@ -57,6 +57,7 @@ enum Spot {
     Hotkey,
     Language,
     List(List),
+    Updates,
 }
 
 /// The page's sections, top to bottom; each is left out when it has
@@ -195,6 +196,7 @@ impl Panel {
         let spot = match change {
             Change::Hotkey(_) => Spot::Hotkey,
             Change::Language(_) => Spot::Language,
+            Change::CheckForUpdates(_) => Spot::Updates,
             Change::Add(list, _) | Change::Remove(list, _) => Spot::List(*list),
         };
         self.note = Some((spot, why));
@@ -817,7 +819,7 @@ mod tests {
             shown[2..4],
             [
                 "Line 2: unknown field `hotkye`, expected one of `hotkey`, `language`,",
-                "`folders`"
+                "`check_for_updates`, `folders`"
             ]
         );
         assert!(
