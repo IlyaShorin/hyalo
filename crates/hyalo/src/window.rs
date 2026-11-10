@@ -54,15 +54,21 @@ use crate::catalog::{self, Catalog, FileIcons, Found, Provider, Request};
 use crate::files::{self, Excluded, Files, Roots};
 use crate::highlight::utf16_ranges;
 use crate::hotkeys::{self, Hotkeys};
+use crate::instance::Start;
 use crate::keys::{self, Command, Held};
 use crate::layout::{self, Rect};
 use crate::notice::Notice;
+use crate::picker::{self, Picker};
 use crate::query::Query;
 use crate::render::{Renderer, Row, Scene};
 use crate::results::{self, Listed, MAX_ROWS, Results};
 use crate::settings::{self, Loaded};
 use crate::tray::{self, Tray};
 use crate::{http, launch, rates, store};
+
+mod settings_window;
+
+use settings_window::{SettingsWindow, open_settings};
 
 /// The id the hotkey is registered with; a new hotkey takes the other
 /// one, so the old one is freed only once Windows took the new one.
@@ -74,6 +80,10 @@ const WM_FOUND: u32 = WM_APP + 1;
 
 /// Posted by a second start of hyalo: show the launcher.
 const WM_SHOW: u32 = WM_APP + 2;
+
+/// Posted by a second start with `--settings`, and by the launcher itself
+/// for a notice: open the settings window.
+const WM_SETTINGS: u32 = WM_APP + 4;
 
 /// Where the launcher shows: its monitor's work area and DPI.
 #[derive(Debug, Clone, Copy)]
@@ -122,6 +132,8 @@ pub struct Services {
     pub config: Option<PathBuf>,
     /// Starts the launcher with Windows; `None` where it may not.
     pub autostart: Option<Autostart>,
+    /// Asks the user for a folder, for the settings window.
+    pub picker: Rc<dyn Picker>,
 }
 
 impl Services {
@@ -165,6 +177,7 @@ impl Services {
             tray: Rc::new(tray::Shell),
             config: settings::default_path(),
             autostart: Autostart::real(),
+            picker: Rc::new(picker::System),
         }
     }
 }
@@ -212,6 +225,8 @@ struct App {
     /// Where files rank higher or lower: the user's folders and the
     /// config's.
     places: Places,
+    /// The settings window, while it is open.
+    settings: Option<SettingsWindow>,
 }
 
 impl App {
@@ -304,14 +319,13 @@ impl App {
         let (sender, window) = (self.found.0.clone(), self.hwnd.0 as isize);
         // SAFETY: IsWindow takes any handle, even one gone since.
         let listening = move || unsafe { IsWindow(Some(HWND(window as *mut _))) }.as_bool();
-        let report = move |loaded| hand_over(&sender, window, Found::Config(loaded));
+        let report = move |bytes| hand_over(&sender, window, Found::Config(bytes));
         settings::watch(path, seen, listening, report);
     }
 
     /// What the tray's menu holds now.
     fn menu(&self) -> Vec<tray::Line> {
-        let starts = self.services.autostart.as_ref().map(Autostart::starts);
-        tray::menu(self.hotkey(), starts)
+        tray::menu(self.hotkey(), self.starts())
     }
 
     /// Starts with Windows if it does not, and stops if it does.
@@ -324,17 +338,18 @@ impl App {
     }
 
     /// Opens the config in the editor Windows has for it, or Notepad.
-    fn open_settings(&mut self) {
+    fn open_config(&mut self) {
         if let Some(path) = &self.services.config {
             let path = path.to_string_lossy().into_owned();
             (self.services.run)(&Action::Edit(path), false);
         }
     }
 
-    /// Before the window goes: the tray icon goes too, and the picks are
-    /// saved.
+    /// Before the window goes: the tray icon and the settings window go
+    /// too, and the picks are saved.
     fn close(&mut self) {
         self.services.tray.remove(self.hwnd);
+        self.close_settings();
         self.save_picks();
     }
 
@@ -414,7 +429,12 @@ impl App {
         let Some((action, as_admin)) = keys::action(command, &item) else {
             return false;
         };
-        (self.services.run)(&action, as_admin);
+        match action {
+            // Later, from the message loop: opening a window here, with
+            // the app state borrowed, would lose its first messages.
+            Action::Settings => post(self.hwnd, WM_SETTINGS),
+            action => (self.services.run)(&action, as_admin),
+        }
         self.note(item);
         true
     }
@@ -463,10 +483,11 @@ impl App {
         found.answered(answer)
     }
 
-    /// The notice's row, when there is a config for it to open.
+    /// The notice's row, when there is a config the settings window can
+    /// change.
     fn notice_row(&self) -> Option<Item> {
-        let config = self.services.config.as_deref()?;
-        Some(self.notice()?.item(config))
+        self.services.config.as_ref()?;
+        Some(self.notice()?.item())
     }
 
     /// The files and folders the index finds for the query: enough to
@@ -536,7 +557,10 @@ impl App {
         let found: Vec<Found> = self.found.1.try_iter().collect();
         for found in found {
             match found {
-                Found::Config(loaded) => self.configure(loaded),
+                Found::Config(bytes) => {
+                    self.configure(settings::read(bytes.clone()));
+                    self.show_written(bytes);
+                }
                 found => self.catalog.take(found),
             }
         }
@@ -589,10 +613,13 @@ thread_local! {
     static APP: RefCell<Option<App>> = const { RefCell::new(None) };
 }
 
-/// Opens the launcher, shown or in the tray, and runs until the window
-/// closes.
-pub fn run(shown: bool) -> Result<()> {
-    open(Services::real(), shown)?;
+/// Opens the launcher, shown, in the tray, or with its settings window
+/// open, and runs until the window closes.
+pub fn run(start: Start) -> Result<()> {
+    let hwnd = open(Services::real(), false)?;
+    // Through the message loop, as a second start asks: showing, or
+    // opening the settings, then has every message it needs.
+    ask(hwnd, start);
     message_loop();
     Ok(())
 }
@@ -632,6 +659,7 @@ fn open(services: Services, shown: bool) -> Result<HWND> {
             problem: None,
             refused: None,
             places,
+            settings: None,
         };
         opened.find_picked();
         let loaded = seen.clone().map_or(Ok(Config::default()), settings::read);
@@ -750,7 +778,7 @@ extern "system" fn wndproc(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPA
 /// to Windows.
 fn on_message(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> Option<Result<()>> {
     match message {
-        WM_HOTKEY => Some(toggle(hwnd)),
+        WM_HOTKEY => Some(on_hotkey(hwnd)),
         WM_ACTIVATE if (wparam.0 & 0xFFFF) as u32 == WA_INACTIVE => {
             on_focus_lost(hwnd);
             Some(Ok(()))
@@ -769,6 +797,7 @@ fn on_app_message(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> O
     match message {
         WM_FOUND => Some(with_app(App::take_found).unwrap_or(Ok(()))),
         WM_SHOW => Some(show(hwnd)),
+        WM_SETTINGS => Some(open_settings()),
         tray::WM_TRAY => Some(on_tray(hwnd, wparam, lparam)),
         _ if message == tray::taskbar_created() => {
             with_app(App::show_tray);
@@ -838,10 +867,7 @@ fn on_tray_menu(hwnd: HWND, at: POINT) -> Result<()> {
 fn on_command(hwnd: HWND, command: tray::Command) -> Result<()> {
     match command {
         tray::Command::Show => show(hwnd),
-        tray::Command::Settings => {
-            with_app(App::open_settings);
-            Ok(())
-        }
+        tray::Command::Settings => open_settings(),
         tray::Command::StartWithWindows => {
             with_app(App::toggle_start);
             Ok(())
@@ -850,26 +876,41 @@ fn on_command(hwnd: HWND, command: tray::Command) -> Result<()> {
     }
 }
 
-/// From a second start: shows the launcher that runs already.
-pub fn show_running() {
+/// From a second start: asks the launcher that runs already to show, or
+/// to open its settings.
+pub fn ask_running(start: Start) {
     // SAFETY: a plain call.
     if let Ok(hwnd) = unsafe { FindWindowW(WINDOW_CLASS, PCWSTR::null()) } {
-        ask_to_show(hwnd);
+        ask(hwnd, start);
     }
 }
 
-/// Asks the launcher `hwnd`, in another process, to show. The second
-/// start was the user's, so it may hand the foreground on; the launcher,
-/// in the background, could not take it on its own.
-fn ask_to_show(hwnd: HWND) {
+/// Asks the launcher `hwnd`, perhaps in another process, to show, or to
+/// open its settings. The start was the user's, so it may hand the
+/// foreground on; the launcher, in the background, could not take it on
+/// its own.
+fn ask(hwnd: HWND, start: Start) {
+    let message = match start {
+        Start::Shown => WM_SHOW,
+        Start::Settings => WM_SETTINGS,
+        // Started with Windows: the tray icon is all there is to see.
+        Start::Hidden => return,
+    };
     // SAFETY: plain calls; the window may be gone by the time a call
     // reaches it, and then the call fails and nothing waits.
     unsafe {
         let mut process = u32::default();
         GetWindowThreadProcessId(hwnd, Some(&mut process));
         let _ = AllowSetForegroundWindow(process);
-        let _ = PostMessageW(Some(hwnd), WM_SHOW, WPARAM::default(), LPARAM::default());
     }
+    post(hwnd, message);
+}
+
+/// Posts `message`, which carries nothing, to `hwnd`.
+fn post(hwnd: HWND, message: u32) {
+    // SAFETY: a plain call; posting to a window that is gone fails, and
+    // nothing waits.
+    let _ = unsafe { PostMessageW(Some(hwnd), message, WPARAM::default(), LPARAM::default()) };
 }
 
 /// The point a mouse message carries: x in the low word of `lparam`, y in
@@ -897,6 +938,19 @@ fn handled(result: Result<()>) -> LRESULT {
         eprintln!("hyalo: {error}");
     }
     LRESULT(0)
+}
+
+/// The hotkey: taken by the settings window's recorder while it listens,
+/// else it shows or hides the launcher.
+fn on_hotkey(hwnd: HWND) -> Result<()> {
+    let taken = with_app(|app| {
+        let window = app.settings.as_mut();
+        window.is_some_and(SettingsWindow::hotkey_pressed)
+    });
+    match taken {
+        Some(true) => Ok(()),
+        _ => toggle(hwnd),
+    }
 }
 
 fn toggle(hwnd: HWND) -> Result<()> {
@@ -963,9 +1017,14 @@ fn on_key(hwnd: HWND, key: VIRTUAL_KEY) -> Result<()> {
     moved.unwrap_or(Ok(()))
 }
 
+/// Whether `key` is down, as of the key message being handled.
+fn down(key: VIRTUAL_KEY) -> bool {
+    // SAFETY: a plain call.
+    unsafe { GetKeyState(i32::from(key.0)) < 0 }
+}
+
 /// Which modifiers are down, as of the key message being handled.
 fn held() -> Held {
-    let down = |key: VIRTUAL_KEY| unsafe { GetKeyState(i32::from(key.0)) } < 0;
     Held {
         ctrl: down(VK_CONTROL),
         shift: down(VK_SHIFT),
@@ -1097,7 +1156,7 @@ mod tests {
 
     /// A provider that lists apps with these titles, each with a red icon,
     /// and counts how often it runs.
-    fn listing(titles: &[&str]) -> (Provider, Arc<AtomicUsize>) {
+    pub(super) fn listing(titles: &[&str]) -> (Provider, Arc<AtomicUsize>) {
         let items: Vec<Item> = titles.iter().map(|title| app(title)).collect();
         let runs = Arc::new(AtomicUsize::new(0));
         let counted = runs.clone();
@@ -1111,15 +1170,30 @@ mod tests {
         (provider, runs)
     }
 
+    /// Folders as a test picks them: what the next pick gives, and the
+    /// titles of the pickers opened.
+    #[derive(Default)]
+    pub(super) struct Chooser {
+        pub(super) next: RefCell<Option<String>>,
+        pub(super) asked: RefCell<Vec<String>>,
+    }
+
+    impl Picker for Chooser {
+        fn pick(&self, _: HWND, title: &str) -> Option<String> {
+            self.asked.borrow_mut().push(title.to_string());
+            self.next.borrow_mut().take()
+        }
+    }
+
     /// What the launcher was asked to run, and whether as administrator.
-    type Ran = Rc<RefCell<Vec<(Action, bool)>>>;
+    pub(super) type Ran = Rc<RefCell<Vec<(Action, bool)>>>;
 
     /// Hotkeys as a test keeps them: what the launcher holds, by id, and
     /// the keys other apps hold.
     #[derive(Default)]
-    struct Keyboard {
-        held: RefCell<Vec<(i32, Hotkey)>>,
-        taken: RefCell<Vec<Hotkey>>,
+    pub(super) struct Keyboard {
+        pub(super) held: RefCell<Vec<(i32, Hotkey)>>,
+        pub(super) taken: RefCell<Vec<Hotkey>>,
     }
 
     impl Hotkeys for Rc<Keyboard> {
@@ -1143,11 +1217,11 @@ mod tests {
     /// often the icon was taken away, the menus opened and where, and
     /// what the user will pick from the next menu.
     #[derive(Default)]
-    struct Taskbar {
-        tips: RefCell<Vec<String>>,
-        removed: RefCell<usize>,
-        menus: RefCell<Vec<(Vec<tray::Line>, POINT)>>,
-        pick: RefCell<Option<tray::Command>>,
+    pub(super) struct Taskbar {
+        pub(super) tips: RefCell<Vec<String>>,
+        pub(super) removed: RefCell<usize>,
+        pub(super) menus: RefCell<Vec<(Vec<tray::Line>, POINT)>>,
+        pub(super) pick: RefCell<Option<tray::Command>>,
     }
 
     impl Tray for Taskbar {
@@ -1168,7 +1242,7 @@ mod tests {
 
     impl Keyboard {
         /// The hotkeys the launcher holds now.
-        fn held(&self) -> Vec<String> {
+        pub(super) fn held(&self) -> Vec<String> {
             let held = self.held.borrow();
             held.iter().map(|(_, hotkey)| hotkey.to_string()).collect()
         }
@@ -1177,7 +1251,7 @@ mod tests {
     /// Services for a test: `provider`, no files, red icons for files, a
     /// runner that only notes what it is asked to run, and `picks` as the
     /// picks file.
-    fn services(provider: Provider, picks: Option<PathBuf>) -> (Services, Ran) {
+    pub(super) fn services(provider: Provider, picks: Option<PathBuf>) -> (Services, Ran) {
         let ran = Ran::default();
         let noted = ran.clone();
         let icons: FileIcons = Arc::new(|ids: &[ItemId], size, report: &dyn Fn(Found)| {
@@ -1202,12 +1276,13 @@ mod tests {
             tray: Rc::new(Taskbar::default()),
             config: None,
             autostart: None,
+            picker: Rc::new(Chooser::default()),
         };
         (services, ran)
     }
 
     /// The same, finding files by walking what `roots` gives.
-    fn walking(roots: Roots, picks: Option<PathBuf>) -> (Services, Ran) {
+    pub(super) fn walking(roots: Roots, picks: Option<PathBuf>) -> (Services, Ran) {
         let (mut services, ran) = services(listing(&[]).0, picks);
         let (files, writer) = Files::new();
         services.files = files;
@@ -1221,7 +1296,7 @@ mod tests {
     }
 
     /// Roots that are just `folder`.
-    fn just(folder: &Path) -> Roots {
+    pub(super) fn just(folder: &Path) -> Roots {
         let folder = folder.to_path_buf();
         Arc::new(move || vec![folder.clone()])
     }
@@ -1236,7 +1311,7 @@ mod tests {
     }
 
     /// Holds these keys down for the messages this thread handles next.
-    fn hold(keys: &[VIRTUAL_KEY]) {
+    pub(super) fn hold(keys: &[VIRTUAL_KEY]) {
         let mut state = [0_u8; 256];
         for key in keys {
             state[usize::from(key.0)] = 0x80;
@@ -1279,47 +1354,47 @@ mod tests {
 
     /// The launcher as a test drives it: through the messages Windows
     /// would send. Destroyed while the thread's app state is still alive.
-    struct Launcher(HWND);
+    pub(super) struct Launcher(pub(super) HWND);
 
     impl Launcher {
         /// A launcher that finds nothing to list.
-        fn open() -> Self {
+        pub(super) fn open() -> Self {
             Self::with(listing(&[]).0)
         }
 
-        fn with(provider: Provider) -> Self {
+        pub(super) fn with(provider: Provider) -> Self {
             Self::serving(services(provider, None).0)
         }
 
         /// Starts with no key held or toggled: a fresh thread may inherit
         /// toggle bits from the user's session, and a toggled Ctrl reads
         /// as a key state that is not 0.
-        fn serving(services: Services) -> Self {
+        pub(super) fn serving(services: Services) -> Self {
             hold(&[]);
             Self(open(services, true).expect("open the launcher"))
         }
 
         /// A launcher that lists apps with these titles, once it has them
         /// all, icons too.
-        fn listing(titles: &[&str]) -> Self {
+        pub(super) fn listing(titles: &[&str]) -> Self {
             Self::listing_with(titles, None).0
         }
 
         /// A launcher that finds the files and folders in `folder`, and
         /// what it was asked to run.
-        fn finding(folder: &Path, picks: Option<PathBuf>) -> (Self, Ran) {
+        pub(super) fn finding(folder: &Path, picks: Option<PathBuf>) -> (Self, Ran) {
             let (services, ran) = walking(just(folder), picks);
             (Self::serving(services), ran)
         }
 
         /// Types `query` and waits for `rows` rows.
-        fn search_for(&self, query: &str, rows: usize) {
+        pub(super) fn search_for(&self, query: &str, rows: usize) {
             self.type_text(query);
             self.pump_until(|app| app.results.rows().len() == rows);
         }
 
         /// The same, keeping picks in `picks`; also what it was asked to run.
-        fn listing_with(titles: &[&str], picks: Option<PathBuf>) -> (Self, Ran) {
+        pub(super) fn listing_with(titles: &[&str], picks: Option<PathBuf>) -> (Self, Ran) {
             let (services, ran) = services(listing(titles).0, picks);
             let launcher = Self::serving(services);
             let all = titles.len();
@@ -1329,7 +1404,7 @@ mod tests {
 
         /// Handles queued messages until `done` holds, as the message loop
         /// would; fails after five seconds.
-        fn pump_until(&self, done: impl Fn(&App) -> bool) {
+        pub(super) fn pump_until(&self, done: impl Fn(&App) -> bool) {
             let deadline = Instant::now() + Duration::from_secs(5);
             while !with_app(|app| done(app)).expect("app state") {
                 assert!(Instant::now() < deadline, "timed out waiting");
@@ -1344,14 +1419,14 @@ mod tests {
             }
         }
 
-        fn placement(&self) -> Placement {
+        pub(super) fn placement(&self) -> Placement {
             with_app(|app| app.placement).expect("app state")
         }
 
         /// Which of `rows` rows is lit, read off the frame: the left
         /// margin, clear of icons and text, is only glass, plus the
         /// highlight where the selected row is.
-        fn lit_row(&self, rows: usize) -> usize {
+        pub(super) fn lit_row(&self, rows: usize) -> usize {
             let frame = self.frame();
             let scale = layout::scale(self.placement().dpi);
             let x = (9.0 * scale) as usize;
@@ -1360,68 +1435,68 @@ mod tests {
         }
 
         /// The pixel at (x, y) in DIPs.
-        fn pixel_at(&self, x: f32, y: f32) -> [u8; 4] {
+        pub(super) fn pixel_at(&self, x: f32, y: f32) -> [u8; 4] {
             let scale = layout::scale(self.placement().dpi);
             self.frame()
                 .pixel((x * scale) as usize, (y * scale) as usize)
         }
 
-        fn send(&self, message: u32, wparam: usize) -> LRESULT {
+        pub(super) fn send(&self, message: u32, wparam: usize) -> LRESULT {
             unsafe { SendMessageW(self.0, message, Some(WPARAM(wparam)), Some(LPARAM(0))) }
         }
 
         /// A mouse message for the point (x, y) in DIPs.
-        fn mouse(&self, message: u32, x: f32, y: f32) {
+        pub(super) fn mouse(&self, message: u32, x: f32, y: f32) {
             let scale = layout::scale(self.placement().dpi);
             let (x, y) = ((x * scale) as isize, (y * scale) as isize);
             let point = LPARAM(y << 16 | x);
             unsafe { SendMessageW(self.0, message, Some(WPARAM(0)), Some(point)) };
         }
 
-        fn post(&self, message: u32, wparam: usize) {
+        pub(super) fn post(&self, message: u32, wparam: usize) {
             unsafe { PostMessageW(Some(self.0), message, WPARAM(wparam), LPARAM(0)) }
                 .expect("post a message");
         }
 
-        fn type_text(&self, text: &str) {
+        pub(super) fn type_text(&self, text: &str) {
             for unit in text.encode_utf16() {
                 self.send(WM_CHAR, usize::from(unit));
             }
         }
 
-        fn press(&self, key: VIRTUAL_KEY) {
+        pub(super) fn press(&self, key: VIRTUAL_KEY) {
             self.send(WM_KEYDOWN, usize::from(key.0));
         }
 
-        fn hotkey(&self) {
+        pub(super) fn hotkey(&self) {
             self.send(WM_HOTKEY, HOTKEY_TOGGLE as usize);
         }
 
         /// What the tray icon tells the window: `event`, with the point
         /// (x, y) in screen pixels where a menu would open.
-        fn tray(&self, event: u32, (x, y): (i32, i32)) {
+        pub(super) fn tray(&self, event: u32, (x, y): (i32, i32)) {
             let at = WPARAM(((y as usize) << 16) | (x as usize & 0xFFFF));
             let event = LPARAM((1 << 16) | event as isize);
             unsafe { SendMessageW(self.0, tray::WM_TRAY, Some(at), Some(event)) };
         }
 
         /// Right-clicks the tray icon, and picks `command` from the menu.
-        fn pick(&self, taskbar: &Taskbar, command: tray::Command) {
+        pub(super) fn pick(&self, taskbar: &Taskbar, command: tray::Command) {
             *taskbar.pick.borrow_mut() = Some(command);
             self.tray(WM_CONTEXTMENU, (0, 0));
         }
 
-        fn visible(&self) -> bool {
+        pub(super) fn visible(&self) -> bool {
             unsafe { IsWindowVisible(self.0) }.as_bool()
         }
 
-        fn rect(&self) -> Rect {
+        pub(super) fn rect(&self) -> Rect {
             let mut rect = RECT::default();
             unsafe { GetWindowRect(self.0, &mut rect) }.expect("window rect");
             to_rect(rect)
         }
 
-        fn client_size(&self) -> (i32, i32) {
+        pub(super) fn client_size(&self) -> (i32, i32) {
             let mut rect = RECT::default();
             unsafe { GetClientRect(self.0, &mut rect) }.expect("client rect");
             (rect.right - rect.left, rect.bottom - rect.top)
@@ -1429,18 +1504,18 @@ mod tests {
 
         /// What the launcher shows now, read back from its swap chain.
         /// No repaint first: the test must see what the code put on screen.
-        fn frame(&self) -> Frame {
+        pub(super) fn frame(&self) -> Frame {
             with_app(|app| app.renderer.as_ref().expect("a renderer").read_frame())
                 .expect("app state")
                 .expect("read the frame back")
         }
 
-        fn caret_x(&self) -> usize {
+        pub(super) fn caret_x(&self) -> usize {
             caret_x(&self.frame()).expect("a caret on screen")
         }
 
         /// A window attribute as DWM holds it, read back from DWM.
-        fn dwm(&self, attribute: DWMWINDOWATTRIBUTE) -> i32 {
+        pub(super) fn dwm(&self, attribute: DWMWINDOWATTRIBUTE) -> i32 {
             let mut value = 0_i32;
             let size = size_of::<i32>() as u32;
             // SAFETY: `value` is a live i32 and `size` is its size.
@@ -1545,8 +1620,28 @@ mod tests {
         on_hidden_desktop(|| {
             let launcher = Launcher::open();
             launcher.press(VK_ESCAPE);
-            ask_to_show(launcher.0);
+            ask(launcher.0, Start::Hidden);
+            for asked in [WM_SHOW, WM_SETTINGS] {
+                let mut message = MSG::default();
+                let queued = unsafe {
+                    PeekMessageW(&mut message, Some(launcher.0), asked, asked, PM_REMOVE)
+                };
+                assert!(!queued.as_bool(), "started hidden, nothing to ask");
+            }
+            ask(launcher.0, Start::Shown);
             launcher.pump_until(|_| unsafe { IsWindowVisible(launcher.0) }.as_bool());
+        });
+    }
+
+    #[test]
+    fn a_second_start_with_settings_asks_it_to_open_them() {
+        on_hidden_desktop(|| {
+            let (_scratch, config) = config_file("window-ask-settings", "");
+            let (launcher, _, _) = in_the_tray(Some(config), None);
+            launcher.press(VK_ESCAPE);
+            ask(launcher.0, Start::Settings);
+            launcher.pump_until(|app| app.settings.is_some());
+            assert!(!launcher.visible(), "the settings, not the launcher");
         });
     }
 
@@ -1564,7 +1659,7 @@ mod tests {
 
     /// A launcher with a stand-in taskbar, the config at `config` and
     /// picks in `picks`; also the taskbar and what it was asked to run.
-    fn in_the_tray(
+    pub(super) fn in_the_tray(
         config: Option<PathBuf>,
         picks: Option<PathBuf>,
     ) -> (Launcher, Rc<Taskbar>, Ran) {
@@ -1635,13 +1730,22 @@ mod tests {
     }
 
     #[test]
-    fn settings_from_the_menu_opens_the_config() {
+    fn settings_from_the_menu_opens_the_settings_window() {
         on_hidden_desktop(|| {
             let (_scratch, config) = config_file("window-settings", "");
-            let (launcher, taskbar, ran) = in_the_tray(Some(config.clone()), None);
+            let (launcher, taskbar, ran) = in_the_tray(Some(config), None);
             launcher.pick(&taskbar, tray::Command::Settings);
-            let opened = Action::Edit(config.to_string_lossy().into_owned());
-            assert_eq!(*ran.borrow(), [(opened, false)]);
+            assert!(with_app(|app| app.settings.is_some()).expect("app state"));
+            assert!(ran.borrow().is_empty(), "no editor");
+        });
+    }
+
+    #[test]
+    fn without_a_config_there_are_no_settings_to_open() {
+        on_hidden_desktop(|| {
+            let (launcher, taskbar, _) = in_the_tray(None, None);
+            launcher.pick(&taskbar, tray::Command::Settings);
+            assert!(with_app(|app| app.settings.is_none()).expect("app state"));
         });
     }
 
@@ -1705,7 +1809,7 @@ mod tests {
     }
 
     /// A config file of its own for one test, holding `text`.
-    fn config_file(test: &str, text: &str) -> (Scratch, PathBuf) {
+    pub(super) fn config_file(test: &str, text: &str) -> (Scratch, PathBuf) {
         let scratch = Scratch::new(test).with(&["hyalo\\"]);
         let path = scratch.0.join("hyalo").join("config.toml");
         std::fs::write(&path, text).expect("write the config");
@@ -1714,7 +1818,7 @@ mod tests {
 
     /// A launcher listing Notepad, on the config at `path`, with
     /// `keyboard` and a stand-in taskbar.
-    fn configured(path: &Path, keyboard: &Rc<Keyboard>) -> (Launcher, Rc<Taskbar>, Ran) {
+    pub(super) fn configured(path: &Path, keyboard: &Rc<Keyboard>) -> (Launcher, Rc<Taskbar>, Ran) {
         let taskbar = Rc::new(Taskbar::default());
         let (mut services, ran) = services(listing(&["Notepad"]).0, None);
         services.tray = taskbar.clone();
@@ -1725,7 +1829,7 @@ mod tests {
         (launcher, taskbar, ran)
     }
 
-    fn hotkey(text: &str) -> Hotkey {
+    pub(super) fn hotkey(text: &str) -> Hotkey {
         Hotkey::parse(text).expect("a hotkey")
     }
 
@@ -1825,8 +1929,12 @@ mod tests {
                     .contains("line 2")
             );
             launcher.press(VK_RETURN);
-            let opened = Action::Edit(path.to_string_lossy().into_owned());
-            assert_eq!(*ran.borrow(), [(opened, false)]);
+            assert!(!launcher.visible());
+            launcher.pump_until(|app| app.settings.is_some());
+            assert!(
+                ran.borrow().is_empty(),
+                "the settings window, not an editor"
+            );
             assert!(!picked.exists(), "a notice is not a pick");
         });
     }

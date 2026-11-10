@@ -45,6 +45,8 @@ pub enum Action {
     Reveal(String),
     /// Put the text on the clipboard, such as a calculator answer.
     CopyText(String),
+    /// Open hyalo's settings window: the launcher does it itself.
+    Settings,
     /// Open a text file, such as the config, in the app Windows has for
     /// its kind, or in Notepad when there is none.
     Edit(String),

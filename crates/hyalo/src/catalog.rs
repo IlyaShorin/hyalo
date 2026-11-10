@@ -11,7 +11,6 @@ use windows::core::Result;
 
 use crate::apps::{self, Icon};
 use crate::com::Com;
-use crate::settings::Loaded;
 
 /// One piece of what a provider found.
 pub enum Found {
@@ -25,8 +24,10 @@ pub enum Found {
     Picked(Vec<Item>),
     /// The newest exchange rates.
     Rates(Rates),
-    /// What the config holds since it was saved.
-    Config(Loaded),
+    /// What the config file holds since it was saved, as bytes: the
+    /// launcher reads the settings from them, the settings window what
+    /// they write.
+    Config(Vec<u8>),
 }
 
 /// What the window asks a provider for.

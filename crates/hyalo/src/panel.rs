@@ -1,0 +1,1126 @@
+//! What the settings window shows and how it answers the user, apart
+//! from Win32: the settings as config.toml writes them, the recorder, the
+//! name fields, the focus and the pointer. Each input gives what the
+//! window must do about it, if anything: write a change to the file, open
+//! the folder picker, switch starting with Windows, open the file, close.
+//!
+//! The page is built from a list of sections, each from the panel, so a
+//! later section (updates) is one more entry.
+
+use std::collections::HashMap;
+
+use hyalo_core::config::{Change, List, Problem, Written};
+use windows::Win32::UI::Input::KeyboardAndMouse::{VK_ESCAPE, VK_RETURN, VK_SPACE, VK_TAB};
+
+use crate::page::{self, Button, Card, Control, Laid, Page, Section, Strip, Target};
+use crate::query::Query;
+use crate::recorder::{Heard, Mods, Recorder};
+
+/// What the window must do.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Effect {
+    /// Write the change to config.toml; a new hotkey is registered first.
+    Change(Change),
+    /// Open the folder picker, and add what is picked to the list.
+    Pick(List),
+    /// Start with Windows, or stop.
+    StartWithWindows(bool),
+    /// Open config.toml in an editor.
+    OpenConfig,
+    Close,
+}
+
+/// How a control looks now.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Look {
+    pub hovered: bool,
+    pub pressed: bool,
+    /// It has the focus: a field shows its caret.
+    pub focused: bool,
+    /// The focus came from the keyboard, so it is ringed.
+    pub ring: bool,
+    pub enabled: bool,
+}
+
+/// Where a message about a change shows: the help line of its setting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Spot {
+    Hotkey,
+    List(List),
+}
+
+/// The page's sections, top to bottom; each is left out when it has
+/// nothing to show.
+const SECTIONS: [fn(&Panel) -> Option<Section>; 4] =
+    [Panel::problem, Panel::launcher, Panel::folders, Panel::file];
+
+/// How far one notch of the mouse wheel scrolls, in DIPs.
+const WHEEL_STEP: f32 = 48.0;
+
+/// One notch, as Windows counts the wheel.
+const WHEEL_DELTA: f32 = 120.0;
+
+#[derive(Debug, Default)]
+pub struct Panel {
+    /// The last good settings the file held; `None` before it held any.
+    written: Option<Written>,
+    /// What is wrong with the file now, if anything: nothing is changed
+    /// until it is fixed.
+    problem: Option<Problem>,
+    /// Whether hyalo starts with Windows; `None` where it may not.
+    starts: Option<bool>,
+    recorder: Recorder,
+    /// What is typed in each list's name field.
+    names: HashMap<List, Query>,
+    /// What went wrong with the last change, and where it shows.
+    note: Option<(Spot, String)>,
+    focus: Option<Target>,
+    /// Whether the focus is ringed: it came from the keyboard.
+    ring: bool,
+    hover: Option<Target>,
+    pressed: Option<Target>,
+    /// How far the page is scrolled, in DIPs.
+    scroll: f32,
+}
+
+impl Panel {
+    /// The panel for a file that holds `file`, and for starting with
+    /// Windows as `starts` says.
+    pub fn new(file: Result<Written, Problem>, starts: Option<bool>) -> Panel {
+        let mut panel = Panel {
+            starts,
+            ..Panel::default()
+        };
+        panel.reload(file);
+        panel
+    }
+
+    /// What the page shows now.
+    pub fn page(&self) -> Page {
+        Page {
+            title: "Settings".to_string(),
+            sections: SECTIONS
+                .iter()
+                .filter_map(|section| section(self))
+                .collect(),
+        }
+    }
+
+    pub fn look(&self, target: Target) -> Look {
+        let focused = self.focus == Some(target);
+        Look {
+            hovered: self.hover == Some(target),
+            pressed: self.pressed == Some(target),
+            focused,
+            ring: focused && self.ring,
+            enabled: self.enabled(target),
+        }
+    }
+
+    pub fn scroll(&self) -> f32 {
+        self.scroll
+    }
+
+    pub fn listening(&self) -> bool {
+        self.recorder.listening()
+    }
+
+    /// The file holds something new: good settings, shown at once, or a
+    /// problem, shown until it is fixed. What is typed in a field stays.
+    pub fn reload(&mut self, file: Result<Written, Problem>) {
+        match file {
+            Ok(written) => {
+                self.written = Some(written);
+                self.problem = None;
+            }
+            Err(problem) => self.problem = Some(problem),
+        }
+        self.settle_focus();
+    }
+
+    /// Whether hyalo starts with Windows now.
+    pub fn set_starts(&mut self, starts: Option<bool>) {
+        self.starts = starts;
+        self.settle_focus();
+    }
+
+    /// `change` is in the file, which now holds `written`, or held it
+    /// already (`None`): a name added leaves its field.
+    pub fn done(&mut self, change: &Change, written: Option<Written>) {
+        self.note = None;
+        if let Change::Add(list, entry) = change
+            && let Some(name) = self.names.get_mut(list)
+            && name.text().trim() == entry
+        {
+            name.clear();
+        }
+        if let Some(written) = written {
+            self.reload(Ok(written));
+        }
+    }
+
+    /// `change` was not made, for the reason `why`, told by its setting.
+    pub fn refused(&mut self, change: &Change, why: String) {
+        let spot = match change {
+            Change::Hotkey(_) => Spot::Hotkey,
+            Change::Add(list, _) | Change::Remove(list, _) => Spot::List(*list),
+        };
+        self.note = Some((spot, why));
+    }
+
+    /// The pointer is over `target`, or no control; whether that changed
+    /// the look.
+    pub fn hover(&mut self, target: Option<Target>) -> bool {
+        let target = target.filter(|&target| self.enabled(target));
+        std::mem::replace(&mut self.hover, target) != target
+    }
+
+    /// The button went down over `target`: it takes the focus, without a
+    /// ring; a recorder that listens elsewhere stops.
+    pub fn press(&mut self, target: Option<Target>) {
+        let target = target.filter(|&target| self.enabled(target));
+        if target != Some(Target::Hotkey) {
+            self.recorder.stop();
+        }
+        self.pressed = target;
+        self.focus = target;
+        self.ring = false;
+    }
+
+    /// The button went up over `target`: a click, when it went down there.
+    pub fn release(&mut self, target: Option<Target>) -> Option<Effect> {
+        let pressed = self.pressed.take()?;
+        (Some(pressed) == target).then(|| self.activate(pressed))?
+    }
+
+    /// The key `key` went down with `mods` held, on the page `laid` seen
+    /// in a view `view` DIPs high.
+    pub fn key(&mut self, key: u16, mods: Mods, laid: &Laid, view: f32) -> Option<Effect> {
+        if self.recorder.listening() {
+            return self.record(key, mods);
+        }
+        match self.focus {
+            _ if key == VK_TAB.0 => {
+                self.tab(laid, view, mods.shift);
+                None
+            }
+            _ if key == VK_ESCAPE.0 => Some(Effect::Close),
+            Some(Target::Name(list)) if key == VK_RETURN.0 => self.activate(Target::AddName(list)),
+            Some(Target::Name(_)) => None,
+            Some(target) if key == VK_RETURN.0 || key == VK_SPACE.0 => self.activate(target),
+            _ => None,
+        }
+    }
+
+    /// A key went up, and `mods` are held now.
+    pub fn key_up(&mut self, mods: Mods) {
+        self.recorder.held(mods);
+    }
+
+    /// Types one UTF-16 unit into the field with the focus; whether it
+    /// changed what the field holds.
+    pub fn char(&mut self, unit: u16) -> bool {
+        match self.focus {
+            Some(Target::Name(list)) if self.enabled(Target::Name(list)) => {
+                self.names.entry(list).or_default().type_unit(unit)
+            }
+            _ => false,
+        }
+    }
+
+    /// The hotkey itself was pressed, which Windows sends hyalo instead of
+    /// the keys: while the recorder listens, that is the hotkey it has,
+    /// and nothing changes. Whether the recorder took it.
+    pub fn hotkey_pressed(&mut self) -> bool {
+        let listening = self.recorder.listening();
+        self.recorder.stop();
+        if listening {
+            self.note = None;
+        }
+        listening
+    }
+
+    /// The wheel turned by `delta`, as Windows counts it, over a page
+    /// `content` DIPs high in a view `view` high.
+    pub fn wheel(&mut self, delta: i32, content: f32, view: f32) {
+        let scroll = self.scroll - delta as f32 / WHEEL_DELTA * WHEEL_STEP;
+        self.scroll = scroll.clamp(0.0, page::max_scroll(content, view));
+    }
+
+    /// Keeps the scroll within a page `content` high in a view `view`
+    /// high, as after the window or the page changed size.
+    pub fn fit(&mut self, content: f32, view: f32) {
+        self.scroll = self.scroll.clamp(0.0, page::max_scroll(content, view));
+    }
+
+    fn record(&mut self, key: u16, mods: Mods) -> Option<Effect> {
+        let heard = self.recorder.key(key, mods);
+        self.note = None;
+        match heard {
+            Heard::Nothing | Heard::Cancelled => None,
+            Heard::Wrong(why) => {
+                self.note = Some((Spot::Hotkey, why));
+                None
+            }
+            Heard::Hotkey(hotkey) => {
+                let current = self.written.as_ref().map(|written| written.hotkey);
+                (current != Some(hotkey)).then_some(Effect::Change(Change::Hotkey(hotkey)))
+            }
+        }
+    }
+
+    /// Moves the focus to the next control that may be used, or the one
+    /// before, round the page; the ring shows and the control comes into
+    /// view.
+    fn tab(&mut self, laid: &Laid, view: f32, back: bool) {
+        let mut order: Vec<Target> = laid.targets();
+        order.retain(|&target| self.enabled(target));
+        if back {
+            order.reverse();
+        }
+        let at = self
+            .focus
+            .and_then(|focus| order.iter().position(|&target| target == focus));
+        let next = at.map_or(0, |at| (at + 1) % order.len().max(1));
+        self.focus = order.get(next).copied();
+        self.ring = true;
+        if let Some(area) = self.focus.and_then(|focus| laid.area(focus)) {
+            self.scroll = page::reveal(self.scroll, area, view);
+        }
+    }
+
+    /// What using `target` does, when it may be used.
+    fn activate(&mut self, target: Target) -> Option<Effect> {
+        if !self.enabled(target) {
+            return None;
+        }
+        self.note = None;
+        match target {
+            Target::Hotkey => self.toggle_recorder(),
+            Target::Remove(list, at) => self.removal(list, at),
+            Target::AddName(list) => self.addition(list),
+            target => self.plain(target),
+        }
+    }
+
+    /// The recorder starts listening, or, listening, stops.
+    fn toggle_recorder(&mut self) -> Option<Effect> {
+        match self.recorder.listening() {
+            true => self.recorder.stop(),
+            false => self.recorder.listen(),
+        }
+        None
+    }
+
+    /// Taking out the entry at `at` of `list`, by its text.
+    fn removal(&self, list: List, at: usize) -> Option<Effect> {
+        let entry = self.entries(list).get(at)?.clone();
+        Some(Effect::Change(Change::Remove(list, entry)))
+    }
+
+    /// Adding the name typed in `list`'s field, if there is one.
+    fn addition(&self, list: List) -> Option<Effect> {
+        let name = self.names.get(&list)?.text().trim().to_string();
+        (!name.is_empty()).then_some(Effect::Change(Change::Add(list, name)))
+    }
+
+    /// What the controls that only ask the window for something do; a
+    /// field only takes the focus.
+    fn plain(&self, target: Target) -> Option<Effect> {
+        match target {
+            Target::Fix | Target::OpenConfig => Some(Effect::OpenConfig),
+            Target::StartWithWindows => self.starts.map(|on| Effect::StartWithWindows(!on)),
+            Target::Pick(list) => Some(Effect::Pick(list)),
+            _ => None,
+        }
+    }
+
+    /// Whether `target` is on the page and may be used: only the way to
+    /// the file while the file has a problem.
+    fn enabled(&self, target: Target) -> bool {
+        let file = matches!(target, Target::Fix | Target::OpenConfig);
+        self.has(target) && (file || self.problem.is_none())
+    }
+
+    /// Whether the page has `target`.
+    fn has(&self, target: Target) -> bool {
+        match target {
+            Target::Fix => self.problem.is_some(),
+            Target::OpenConfig => true,
+            Target::StartWithWindows => self.written.is_some() && self.starts.is_some(),
+            Target::Remove(list, at) => at < self.entries(list).len(),
+            Target::Name(list) | Target::AddName(list) => {
+                list != List::Exclude && self.written.is_some()
+            }
+            Target::Hotkey | Target::Pick(_) => self.written.is_some(),
+        }
+    }
+
+    /// A focus on a control the page no longer has moves to the entry
+    /// before it in its list, or to the list's Add folder…, or goes.
+    fn settle_focus(&mut self) {
+        let Some(focus) = self.focus.filter(|&focus| !self.has(focus)) else {
+            return;
+        };
+        self.focus = match focus {
+            Target::Remove(list, at) => {
+                let entries = self.entries(list).len();
+                let before = Target::Remove(list, at.min(entries).saturating_sub(1));
+                Some(if entries > 0 {
+                    before
+                } else {
+                    Target::Pick(list)
+                })
+            }
+            _ => None,
+        }
+        .filter(|&focus| self.has(focus));
+    }
+
+    fn entries(&self, list: List) -> &[String] {
+        self.written
+            .as_ref()
+            .map_or(&[], |written| written.list(list))
+    }
+
+    /// The help line of the setting at `spot`: what went wrong there, as
+    /// a warning, or `help`.
+    fn help(&self, spot: Spot, help: &str) -> (String, bool) {
+        match &self.note {
+            Some((noted, why)) if *noted == spot => (why.clone(), true),
+            _ => (help.to_string(), false),
+        }
+    }
+
+    /// The problem in the file, with the way to fix it.
+    fn problem(&self) -> Option<Section> {
+        let problem = self.problem.as_ref()?;
+        let help = match self.written {
+            Some(_) => "hyalo keeps its last good settings until it is fixed",
+            None => "hyalo runs on its defaults until it is fixed",
+        };
+        let fix = Control::Button(button("Open config.toml", Target::Fix));
+        let title = setting(
+            "config.toml has a problem",
+            (help.to_string(), false),
+            Some(fix),
+        );
+        let text = format!("Line {}: {}", problem.line, problem.message);
+        Some(Section {
+            title: None,
+            cards: vec![card(true, false, vec![title, Strip::Text { text }])],
+        })
+    }
+
+    /// The hotkey, and starting with Windows.
+    fn launcher(&self) -> Option<Section> {
+        let written = self.written.as_ref()?;
+        let listening = self.recorder.listening();
+        let help = match listening {
+            true => "Press the new combination; Esc keeps the one you have",
+            false => "Shows and hides the launcher: click, then press the keys",
+        };
+        let keys = Control::Keys {
+            target: Target::Hotkey,
+            caps: self.recorder.caps(written.hotkey),
+            listening,
+        };
+        let muted = self.problem.is_some();
+        let hotkey = setting("Hotkey", self.help(Spot::Hotkey, help), Some(keys));
+        let mut cards = vec![card(false, muted, vec![hotkey])];
+        if let Some(on) = self.starts {
+            let toggle = Control::Toggle {
+                target: Target::StartWithWindows,
+                on,
+            };
+            let help = "Starts hyalo in the tray when you sign in".to_string();
+            let strip = setting("Start with Windows", (help, false), Some(toggle));
+            cards.push(card(false, muted, vec![strip]));
+        }
+        Some(Section {
+            title: Some("Launcher".to_string()),
+            cards,
+        })
+    }
+
+    /// The three lists of folders.
+    fn folders(&self) -> Option<Section> {
+        self.written.as_ref()?;
+        let cards = List::ALL.map(|list| self.list(list)).to_vec();
+        Some(Section {
+            title: Some("Folders".to_string()),
+            cards,
+        })
+    }
+
+    /// A list: its setting with Add folder…, its entries, and for the
+    /// lists that take a folder's name, a field for one.
+    fn list(&self, list: List) -> Card {
+        let (name, help, example) = match list {
+            List::Exclude => (
+                "Leave out of the index",
+                "Full paths: the file index leaves out these folders and all in them",
+                "",
+            ),
+            List::RankLower => (
+                "Rank lower",
+                "Files in these rank lower: a folder name, wherever it is, or a full path",
+                "target",
+            ),
+            List::RankHigher => (
+                "Rank higher",
+                "Files in these rank higher, as in Desktop, Documents and Downloads",
+                "notes",
+            ),
+        };
+        let pick = Control::Button(button("Add folder…", Target::Pick(list)));
+        let mut strips = vec![setting(name, self.help(Spot::List(list), help), Some(pick))];
+        let entries = self.entries(list).iter().enumerate();
+        strips.extend(entries.map(|(at, text)| Strip::Entry {
+            text: text.clone(),
+            remove: Target::Remove(list, at),
+        }));
+        if list != List::Exclude {
+            strips.push(Strip::Field {
+                target: Target::Name(list),
+                text: self
+                    .names
+                    .get(&list)
+                    .map(|name| name.text().to_string())
+                    .unwrap_or_default(),
+                placeholder: format!("A folder name, such as {example}"),
+                add: button("Add", Target::AddName(list)),
+            });
+        }
+        card(false, self.problem.is_some(), strips)
+    }
+
+    /// The way to the file itself.
+    fn file(&self) -> Option<Section> {
+        let open = Control::Button(button("Open config.toml", Target::OpenConfig));
+        let help = "Changes here are saved to it at once, and what you save there shows up here";
+        let strip = setting(
+            "Edit the file instead",
+            (help.to_string(), false),
+            Some(open),
+        );
+        Some(Section {
+            title: Some("config.toml".to_string()),
+            cards: vec![card(false, false, vec![strip])],
+        })
+    }
+}
+
+fn button(label: &str, target: Target) -> Button {
+    Button {
+        label: label.to_string(),
+        target,
+    }
+}
+
+fn setting(name: &str, (help, alarm): (String, bool), control: Option<Control>) -> Strip {
+    Strip::Setting {
+        name: name.to_string(),
+        help,
+        alarm,
+        control,
+    }
+}
+
+fn card(alarm: bool, muted: bool, strips: Vec<Strip>) -> Card {
+    Card {
+        alarm,
+        muted,
+        strips,
+    }
+}
+
+/// The keys of the hotkey a panel shows, as the recorder names them.
+#[cfg(test)]
+pub fn caps(text: &str) -> Vec<String> {
+    crate::recorder::caps(hyalo_core::hotkey::Hotkey::parse(text).expect("a hotkey"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hyalo_core::config::{self, DEFAULT};
+    use hyalo_core::hotkey::Hotkey;
+    use windows::Win32::UI::Input::KeyboardAndMouse::{VK_A, VK_F4, VK_K, VK_SPACE};
+
+    use crate::page::{Area, What, lay_out};
+
+    fn written(text: &str) -> Written {
+        config::written(text).expect("good settings")
+    }
+
+    fn panel() -> Panel {
+        Panel::new(Ok(written(DEFAULT)), Some(false))
+    }
+
+    fn broken() -> Problem {
+        config::written("\nhotkye = 1\n").expect_err("a problem")
+    }
+
+    /// Every letter 8 DIPs wide.
+    fn laid(panel: &Panel) -> Laid {
+        lay_out(&panel.page(), 640.0, &|text| {
+            text.chars().count() as f32 * 8.0
+        })
+    }
+
+    fn click(panel: &mut Panel, target: Target) -> Option<Effect> {
+        panel.press(Some(target));
+        panel.release(Some(target))
+    }
+
+    fn press(panel: &mut Panel, key: u16, mods: Mods) -> Option<Effect> {
+        let laid = laid(panel);
+        panel.key(key, mods, &laid, 2000.0)
+    }
+
+    fn plain(panel: &mut Panel, key: u16) -> Option<Effect> {
+        press(panel, key, Mods::default())
+    }
+
+    fn type_text(panel: &mut Panel, text: &str) {
+        for unit in text.encode_utf16() {
+            panel.char(unit);
+        }
+    }
+
+    const SHIFT: Mods = Mods {
+        ctrl: false,
+        alt: false,
+        shift: true,
+        win: false,
+    };
+
+    const CTRL_SHIFT: Mods = Mods {
+        ctrl: true,
+        alt: false,
+        shift: true,
+        win: false,
+    };
+
+    /// Each mark's text, in order, for the marks that hold text.
+    fn texts(panel: &Panel) -> Vec<String> {
+        let marks = laid(panel).marks.into_iter();
+        marks
+            .filter_map(|mark| match mark.what {
+                What::Title(text)
+                | What::Header(text)
+                | What::Name(text)
+                | What::Entry(text)
+                | What::Line(text) => Some(text),
+                What::Help { text, alarm: true } => Some(format!("! {text}")),
+                What::Field { text, .. } if !text.is_empty() => Some(format!("[{text}]")),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn keys(panel: &Panel) -> (Vec<String>, bool) {
+        let marks = laid(panel).marks.into_iter();
+        let mut keys = marks.filter_map(|mark| match mark.what {
+            What::Keys {
+                caps, listening, ..
+            } => Some((caps, listening)),
+            _ => None,
+        });
+        keys.next().expect("the recorder")
+    }
+
+    fn toggle(panel: &Panel) -> Option<bool> {
+        let marks = laid(panel).marks.into_iter();
+        let mut toggles = marks.filter_map(|mark| match mark.what {
+            What::Toggle { on, .. } => Some(on),
+            _ => None,
+        });
+        toggles.next()
+    }
+
+    #[test]
+    fn the_page_shows_every_setting_the_file_writes() {
+        let panel = panel();
+        let shown = [
+            "Settings",
+            "Launcher",
+            "Hotkey",
+            "Start with Windows",
+            "Folders",
+            "Leave out of the index",
+            r"C:\Windows\WinSxS",
+            "Rank lower",
+            "target",
+            "Rank higher",
+            "config.toml",
+            "Edit the file instead",
+        ];
+        assert_eq!(texts(&panel), shown);
+        assert_eq!(keys(&panel), (caps("Alt+Space"), false));
+        assert_eq!(toggle(&panel), Some(false));
+        let on = Panel::new(Ok(written(DEFAULT)), Some(true));
+        assert_eq!(toggle(&on), Some(true));
+    }
+
+    #[test]
+    fn where_hyalo_may_not_start_with_windows_there_is_no_switch() {
+        let panel = Panel::new(Ok(written(DEFAULT)), None);
+        assert_eq!(toggle(&panel), None);
+        assert!(!texts(&panel).contains(&"Start with Windows".to_string()));
+    }
+
+    #[test]
+    fn the_lists_that_take_a_name_have_a_field_for_one() {
+        let laid = laid(&panel());
+        let fields: Vec<Target> = laid
+            .marks
+            .iter()
+            .filter_map(|mark| match &mark.what {
+                What::Field {
+                    target,
+                    placeholder,
+                    ..
+                } => {
+                    assert!(placeholder.starts_with("A folder name, such as "));
+                    Some(*target)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            fields,
+            [
+                Target::Name(List::RankLower),
+                Target::Name(List::RankHigher)
+            ]
+        );
+    }
+
+    #[test]
+    fn a_problem_in_the_file_comes_first_and_only_the_file_may_be_opened() {
+        let mut panel = panel();
+        panel.reload(Err(broken()));
+        let shown = texts(&panel);
+        assert_eq!(shown[1], "config.toml has a problem");
+        assert_eq!(
+            shown[2],
+            "Line 2: unknown field `hotkye`, expected `hotkey` or `folders`"
+        );
+        assert!(
+            shown.contains(&"Hotkey".to_string()),
+            "the last good settings stay"
+        );
+        for target in [
+            Target::Hotkey,
+            Target::Pick(List::Exclude),
+            Target::Remove(List::Exclude, 0),
+        ] {
+            assert!(!panel.look(target).enabled, "{target:?}");
+            assert_eq!(click(&mut panel, target), None, "{target:?}");
+        }
+        assert!(!panel.listening());
+        assert_eq!(click(&mut panel, Target::Fix), Some(Effect::OpenConfig));
+        assert_eq!(
+            click(&mut panel, Target::OpenConfig),
+            Some(Effect::OpenConfig)
+        );
+        panel.reload(Ok(written(DEFAULT)));
+        assert_eq!(texts(&panel)[1], "Launcher", "fixed");
+        assert_eq!(laid(&panel).area(Target::Fix), None);
+    }
+
+    #[test]
+    fn while_the_file_has_a_problem_the_settings_are_muted() {
+        let muted = |panel: &Panel| {
+            let marks = laid(panel).marks.into_iter();
+            let cards = marks.filter_map(|mark| match mark.what {
+                What::Card { alarm, muted } => Some((alarm, muted)),
+                _ => None,
+            });
+            cards.collect::<Vec<_>>()
+        };
+        let mut panel = panel();
+        assert!(muted(&panel).iter().all(|&card| card == (false, false)));
+        panel.reload(Err(broken()));
+        let cards = [
+            (true, false),
+            (false, true),
+            (false, true),
+            (false, true),
+            (false, true),
+            (false, true),
+            (false, false),
+        ];
+        assert_eq!(muted(&panel), cards);
+    }
+
+    #[test]
+    fn a_file_broken_from_the_start_shows_its_problem_and_the_way_to_it() {
+        let panel = Panel::new(Err(broken()), Some(true));
+        let shown = texts(&panel);
+        assert_eq!(shown.len(), 5, "{shown:?}");
+        assert!(shown[2].starts_with("Line 2: "));
+        assert_eq!(laid(&panel).targets(), [Target::Fix, Target::OpenConfig]);
+        let help = laid(&panel)
+            .marks
+            .into_iter()
+            .find_map(|mark| match mark.what {
+                What::Help { text, .. } => Some(text),
+                _ => None,
+            });
+        assert!(help.expect("help").contains("runs on its defaults"));
+    }
+
+    #[test]
+    fn a_click_on_the_hotkey_listens_and_a_new_combination_is_the_change() {
+        let mut panel = panel();
+        assert_eq!(click(&mut panel, Target::Hotkey), None);
+        assert!(panel.listening());
+        assert_eq!(keys(&panel), (Vec::new(), true));
+        assert!(texts(&panel).iter().all(|text| !text.starts_with('!')));
+        let shown = laid(&panel).marks.into_iter().any(|mark| {
+            mark.what
+                == What::Help {
+                    text: "Press the new combination; Esc keeps the one you have".to_string(),
+                    alarm: false,
+                }
+        });
+        assert!(shown);
+        panel.key_up(CTRL_SHIFT);
+        assert_eq!(keys(&panel).0, ["Ctrl", "Shift"]);
+        let hotkey = Hotkey::parse("Ctrl+Shift+K").expect("a hotkey");
+        let heard = press(&mut panel, VK_K.0, CTRL_SHIFT);
+        assert_eq!(heard, Some(Effect::Change(Change::Hotkey(hotkey))));
+        assert!(!panel.listening());
+    }
+
+    #[test]
+    fn the_hotkey_it_has_changes_nothing() {
+        let mut panel = Panel::new(Ok(written("hotkey = 'F4'\n")), None);
+        click(&mut panel, Target::Hotkey);
+        assert_eq!(plain(&mut panel, VK_F4.0), None);
+        assert!(!panel.listening());
+        click(&mut panel, Target::Hotkey);
+        assert!(panel.hotkey_pressed(), "the hotkey itself, as WM_HOTKEY");
+        assert!(!panel.listening());
+        assert!(!panel.hotkey_pressed(), "not listening: the launcher's");
+    }
+
+    #[test]
+    fn esc_while_listening_keeps_the_hotkey_and_the_window() {
+        let mut panel = panel();
+        click(&mut panel, Target::Hotkey);
+        assert_eq!(plain(&mut panel, VK_ESCAPE.0), None);
+        assert!(!panel.listening());
+        assert_eq!(keys(&panel), (caps("Alt+Space"), false));
+        assert_eq!(plain(&mut panel, VK_ESCAPE.0), Some(Effect::Close));
+    }
+
+    #[test]
+    fn a_combination_that_may_not_be_a_hotkey_is_told_and_it_listens_on() {
+        let mut panel = panel();
+        click(&mut panel, Target::Hotkey);
+        assert_eq!(plain(&mut panel, VK_SPACE.0), None);
+        let warning = texts(&panel).into_iter().find(|text| text.starts_with('!'));
+        assert!(
+            warning
+                .expect("a warning")
+                .contains("needs Ctrl, Alt or Win")
+        );
+        assert!(panel.listening());
+        panel.key_up(Mods::default());
+        assert_eq!(
+            plain(&mut panel, VK_F4.0),
+            Some(Effect::Change(Change::Hotkey(
+                Hotkey::parse("F4").expect("F4")
+            )))
+        );
+        assert!(texts(&panel).iter().all(|text| !text.starts_with('!')));
+    }
+
+    #[test]
+    fn a_click_elsewhere_or_on_the_field_again_stops_listening() {
+        let mut panel = panel();
+        click(&mut panel, Target::Hotkey);
+        panel.press(None);
+        assert!(!panel.listening());
+        click(&mut panel, Target::Hotkey);
+        click(&mut panel, Target::Hotkey);
+        assert!(!panel.listening());
+    }
+
+    #[test]
+    fn a_hotkey_windows_refused_is_told_by_the_hotkey() {
+        let mut panel = panel();
+        let change = Change::Hotkey(Hotkey::parse("Ctrl+K").expect("a hotkey"));
+        panel.refused(&change, "Ctrl+K is taken by another app".to_string());
+        assert!(texts(&panel).contains(&"! Ctrl+K is taken by another app".to_string()));
+        assert_eq!(keys(&panel).0, caps("Alt+Space"));
+        click(&mut panel, Target::Hotkey);
+        assert!(
+            texts(&panel).iter().all(|text| !text.starts_with('!')),
+            "a new try"
+        );
+    }
+
+    #[test]
+    fn the_switch_turns_starting_with_windows_the_other_way() {
+        let mut panel = panel();
+        assert_eq!(
+            click(&mut panel, Target::StartWithWindows),
+            Some(Effect::StartWithWindows(true))
+        );
+        panel.set_starts(Some(true));
+        assert_eq!(
+            click(&mut panel, Target::StartWithWindows),
+            Some(Effect::StartWithWindows(false))
+        );
+    }
+
+    #[test]
+    fn add_folder_picks_one_and_the_cross_removes_its_entry_by_its_text() {
+        let mut panel = panel();
+        assert_eq!(
+            click(&mut panel, Target::Pick(List::Exclude)),
+            Some(Effect::Pick(List::Exclude))
+        );
+        let remove = Change::Remove(List::Exclude, r"C:\Windows\WinSxS".to_string());
+        assert_eq!(
+            click(&mut panel, Target::Remove(List::Exclude, 0)),
+            Some(Effect::Change(remove))
+        );
+        assert_eq!(
+            click(&mut panel, Target::Remove(List::Exclude, 1)),
+            None,
+            "no such entry"
+        );
+    }
+
+    #[test]
+    fn a_name_typed_is_added_with_enter_or_its_button_and_leaves_the_field_once_written() {
+        let mut panel = panel();
+        click(&mut panel, Target::Name(List::RankLower));
+        type_text(&mut panel, "  vendor ");
+        assert!(texts(&panel).contains(&"[  vendor ]".to_string()));
+        let add = Some(Effect::Change(Change::Add(
+            List::RankLower,
+            "vendor".to_string(),
+        )));
+        assert_eq!(plain(&mut panel, VK_RETURN.0), add);
+        assert_eq!(click(&mut panel, Target::AddName(List::RankLower)), add);
+        let change = Change::Add(List::RankLower, "vendor".to_string());
+        let after = config::edit(DEFAULT, &change).expect("edited");
+        panel.done(&change, Some(written(&after)));
+        assert!(texts(&panel).contains(&"vendor".to_string()));
+        assert!(!texts(&panel).contains(&"[  vendor ]".to_string()));
+        assert_eq!(
+            click(&mut panel, Target::AddName(List::RankLower)),
+            None,
+            "nothing to add"
+        );
+        assert_eq!(
+            click(&mut panel, Target::AddName(List::RankHigher)),
+            None,
+            "never typed in"
+        );
+    }
+
+    #[test]
+    fn a_name_refused_stays_in_its_field_and_says_why() {
+        let mut panel = panel();
+        click(&mut panel, Target::Name(List::RankHigher));
+        type_text(&mut panel, r"old\stuff");
+        let change = Change::Add(List::RankHigher, r"old\stuff".to_string());
+        panel.refused(
+            &change,
+            "`old\\stuff` is neither a folder name nor a full path".to_string(),
+        );
+        let shown = texts(&panel);
+        assert!(shown.contains(&r"[old\stuff]".to_string()), "{shown:?}");
+        assert!(shown.iter().any(|text| text.starts_with("! `old")));
+        let other = Change::Add(List::RankLower, "x".to_string());
+        panel.done(&other, None);
+        assert!(
+            texts(&panel).contains(&r"[old\stuff]".to_string()),
+            "another field's change"
+        );
+    }
+
+    #[test]
+    fn typing_goes_to_the_field_with_the_focus_and_nowhere_else() {
+        let mut panel = panel();
+        assert!(!panel.char(u16::from(b'x')));
+        click(&mut panel, Target::Pick(List::RankLower));
+        assert!(!panel.char(u16::from(b'x')));
+        click(&mut panel, Target::Name(List::RankHigher));
+        assert!(panel.char(u16::from(b'x')));
+        assert_eq!(
+            plain(&mut panel, VK_SPACE.0),
+            None,
+            "a space is typed, not a click"
+        );
+        assert!(panel.char(u16::from(b' ')));
+        assert!(texts(&panel).contains(&"[x ]".to_string()));
+        panel.reload(Err(broken()));
+        assert!(!panel.char(u16::from(b'y')), "not while the file is broken");
+    }
+
+    #[test]
+    fn what_is_typed_stays_while_the_file_changes_under_it() {
+        let mut panel = panel();
+        click(&mut panel, Target::Name(List::RankLower));
+        type_text(&mut panel, "ven");
+        panel.reload(Ok(written("hotkey = 'F4'\n")));
+        assert!(texts(&panel).contains(&"[ven]".to_string()));
+        assert_eq!(keys(&panel).0, ["F4"]);
+        assert!(panel.char(u16::from(b'd')));
+        assert!(panel.look(Target::Name(List::RankLower)).focused);
+    }
+
+    #[test]
+    fn tab_rings_each_control_in_turn_and_shift_tab_goes_back() {
+        let mut panel = panel();
+        let order = laid(&panel).targets();
+        assert_eq!(order[0], Target::Hotkey);
+        for &target in order.iter().chain(&order[..1]) {
+            plain(&mut panel, VK_TAB.0);
+            let look = panel.look(target);
+            assert!(look.focused && look.ring, "{target:?}");
+        }
+        press(&mut panel, VK_TAB.0, SHIFT);
+        assert!(panel.look(*order.last().expect("controls")).ring);
+        let mut fresh = Panel::new(Ok(written(DEFAULT)), Some(false));
+        press(&mut fresh, VK_TAB.0, SHIFT);
+        assert!(
+            fresh.look(*order.last().expect("controls")).ring,
+            "from nothing, the last"
+        );
+    }
+
+    #[test]
+    fn a_click_takes_the_focus_without_a_ring() {
+        let mut panel = panel();
+        plain(&mut panel, VK_TAB.0);
+        click(&mut panel, Target::Pick(List::RankHigher));
+        let look = panel.look(Target::Pick(List::RankHigher));
+        assert!(look.focused && !look.ring);
+        assert!(!panel.look(Target::Hotkey).focused);
+    }
+
+    #[test]
+    fn space_and_enter_use_the_control_with_the_focus() {
+        let mut panel = panel();
+        plain(&mut panel, VK_TAB.0);
+        plain(&mut panel, VK_TAB.0);
+        assert!(panel.look(Target::StartWithWindows).focused);
+        assert_eq!(
+            plain(&mut panel, VK_SPACE.0),
+            Some(Effect::StartWithWindows(true))
+        );
+        assert_eq!(
+            plain(&mut panel, VK_RETURN.0),
+            Some(Effect::StartWithWindows(true))
+        );
+        assert_eq!(plain(&mut panel, VK_A.0), None);
+        assert_eq!(
+            plain(&mut Panel::new(Ok(written(DEFAULT)), None), VK_SPACE.0),
+            None,
+            "no focus"
+        );
+    }
+
+    #[test]
+    fn tab_passes_over_what_may_not_be_used() {
+        let mut panel = panel();
+        panel.reload(Err(broken()));
+        plain(&mut panel, VK_TAB.0);
+        assert!(panel.look(Target::Fix).ring);
+        plain(&mut panel, VK_TAB.0);
+        assert!(panel.look(Target::OpenConfig).ring);
+        plain(&mut panel, VK_TAB.0);
+        assert!(panel.look(Target::Fix).ring);
+    }
+
+    #[test]
+    fn removing_the_entry_with_the_focus_hands_it_to_the_one_before() {
+        let text = "[folders]\nrank_lower = ['a', 'b']\n";
+        let mut panel = Panel::new(Ok(written(text)), None);
+        click(&mut panel, Target::Remove(List::RankLower, 1));
+        panel.reload(Ok(written("[folders]\nrank_lower = ['a']\n")));
+        assert!(panel.look(Target::Remove(List::RankLower, 0)).focused);
+        panel.reload(Ok(written("[folders]\nrank_lower = []\n")));
+        assert!(panel.look(Target::Pick(List::RankLower)).focused);
+        click(&mut panel, Target::StartWithWindows);
+        assert!(!panel.look(Target::StartWithWindows).focused, "none here");
+        let mut starting = Panel::new(Ok(written(text)), Some(true));
+        click(&mut starting, Target::StartWithWindows);
+        starting.set_starts(None);
+        assert_eq!(
+            (0..4)
+                .filter(|&at| starting.look(Target::Remove(List::RankLower, at)).focused)
+                .count(),
+            0
+        );
+        assert!(!starting.look(Target::StartWithWindows).focused);
+    }
+
+    #[test]
+    fn a_click_is_a_press_and_a_release_on_the_same_control() {
+        let mut panel = panel();
+        panel.press(Some(Target::Pick(List::Exclude)));
+        assert!(panel.look(Target::Pick(List::Exclude)).pressed);
+        assert_eq!(panel.release(Some(Target::Pick(List::RankLower))), None);
+        assert!(!panel.look(Target::Pick(List::Exclude)).pressed);
+        assert_eq!(
+            panel.release(Some(Target::Pick(List::Exclude))),
+            None,
+            "released already"
+        );
+        panel.press(None);
+        assert_eq!(panel.release(None), None);
+    }
+
+    #[test]
+    fn the_pointer_lights_what_it_is_over_and_says_when_that_changes() {
+        let mut panel = panel();
+        assert!(panel.hover(Some(Target::Hotkey)));
+        assert!(panel.look(Target::Hotkey).hovered);
+        assert!(!panel.hover(Some(Target::Hotkey)));
+        assert!(panel.hover(None));
+        assert!(!panel.look(Target::Hotkey).hovered);
+        panel.reload(Err(broken()));
+        assert!(
+            !panel.hover(Some(Target::Hotkey)),
+            "not what may not be used"
+        );
+    }
+
+    #[test]
+    fn the_wheel_scrolls_within_the_page() {
+        let mut panel = panel();
+        panel.wheel(-120, 1000.0, 600.0);
+        assert_eq!(panel.scroll(), 48.0);
+        panel.wheel(-1200, 1000.0, 600.0);
+        assert_eq!(panel.scroll(), 400.0);
+        panel.wheel(240, 1000.0, 600.0);
+        assert_eq!(panel.scroll(), 304.0);
+        panel.fit(800.0, 600.0);
+        assert_eq!(panel.scroll(), 200.0);
+        panel.wheel(1200, 1000.0, 600.0);
+        assert_eq!(panel.scroll(), 0.0);
+    }
+
+    #[test]
+    fn tab_brings_the_control_it_rings_into_view() {
+        let mut panel = panel();
+        let laid = laid(&panel);
+        let last = *laid.targets().last().expect("controls");
+        let area: Area = laid.area(last).expect("placed");
+        panel.key(VK_TAB.0, SHIFT, &laid, 300.0);
+        assert_eq!(panel.scroll(), area.bottom() + 12.0 - 300.0);
+        panel.key(VK_TAB.0, Mods::default(), &laid, 300.0);
+        assert_eq!(panel.scroll(), 0.0, "round to the first");
+    }
+}

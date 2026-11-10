@@ -11,6 +11,8 @@ use windows::Win32::Foundation::{CloseHandle, ERROR_ALREADY_EXISTS, GetLastError
 use windows::Win32::System::Threading::{CreateMutexW, ReleaseMutex};
 use windows::core::{HSTRING, Result};
 
+use crate::autostart;
+
 /// The launcher's mutex.
 pub const NAME: &str = r"Local\hyalo.launcher";
 
@@ -28,21 +30,50 @@ pub struct Instance(HANDLE);
 /// The mutex another process holds.
 pub struct Taken(HANDLE);
 
-/// Runs the launcher if this is the first start: `run`, told whether to
-/// show it, holds the mutex `name` until it returns. A later start calls
-/// `show` instead, unless it was to start hidden: a start with Windows
-/// has nothing to show.
+/// How hyalo was asked to start.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Start {
+    /// Show the launcher.
+    Shown,
+    /// Only the tray icon, as Windows starts it at logon.
+    Hidden,
+    /// Open the settings window, as a Start menu entry would.
+    Settings,
+}
+
+impl Start {
+    /// How the command line's arguments ask hyalo to start: `--settings`,
+    /// `--hidden` (as the Run value has it), or shown.
+    pub fn from_args(arguments: impl IntoIterator<Item = String>) -> Start {
+        let arguments: Vec<String> = arguments.into_iter().collect();
+        let given = |flag: &str| arguments.iter().any(|argument| argument == flag);
+        match (given(SETTINGS), given(autostart::HIDDEN)) {
+            (true, _) => Start::Settings,
+            (false, true) => Start::Hidden,
+            (false, false) => Start::Shown,
+        }
+    }
+}
+
+/// The argument that opens the settings window.
+pub const SETTINGS: &str = "--settings";
+
+/// Runs the launcher if this is the first start: `run`, told how to
+/// start, holds the mutex `name` until it returns. A later start calls
+/// `ask` instead, to have the running launcher show or open its
+/// settings, unless it was to start hidden: a start with Windows has
+/// nothing to ask.
 pub fn first(
     name: &str,
-    shown: bool,
-    run: impl FnOnce(bool) -> Result<()>,
-    show: impl FnOnce(),
+    start: Start,
+    run: impl FnOnce(Start) -> Result<()>,
+    ask: impl FnOnce(Start),
 ) -> Result<()> {
     match claim(name)? {
-        Claim::Ours(_launcher) => run(shown),
+        Claim::Ours(_launcher) => run(start),
         // A build replacing the running one would wait on it here.
-        Claim::Taken(_running) if shown => {
-            show();
+        Claim::Taken(_running) if start != Start::Hidden => {
+            ask(start);
             Ok(())
         }
         Claim::Taken(_running) => Ok(()),
@@ -109,31 +140,59 @@ mod tests {
         assert!(ours(&claim(&name).expect("claim again")));
     }
 
-    /// What `first` did: ran the launcher (and whether shown), or showed
-    /// the one running.
-    fn started(name: &str, shown: bool) -> (Option<bool>, bool) {
+    /// What `first` did: ran the launcher (and how it started), or asked
+    /// the one running (and what).
+    fn started(name: &str, start: Start) -> (Option<Start>, Option<Start>) {
         let ran = std::cell::Cell::new(None);
-        let showed = std::cell::Cell::new(false);
-        let run = |shown| {
-            ran.set(Some(shown));
+        let asked = std::cell::Cell::new(None);
+        let run = |start| {
+            ran.set(Some(start));
             Ok(())
         };
-        first(name, shown, run, || showed.set(true)).expect("started");
-        (ran.get(), showed.get())
+        first(name, start, run, |start| asked.set(Some(start))).expect("started");
+        (ran.get(), asked.get())
     }
 
     #[test]
-    fn the_first_start_runs_the_launcher_shown_or_hidden() {
-        assert_eq!(started(&name("first-shown"), true), (Some(true), false));
-        assert_eq!(started(&name("first-hidden"), false), (Some(false), false));
+    fn the_first_start_runs_the_launcher_as_it_was_asked_to_start() {
+        for start in [Start::Shown, Start::Hidden, Start::Settings] {
+            assert_eq!(started(&name("first"), start), (Some(start), None));
+        }
     }
 
     #[test]
-    fn a_later_start_shows_the_running_launcher_unless_it_starts_hidden() {
+    fn a_later_start_asks_the_running_launcher_unless_it_starts_hidden() {
         let name = name("later");
         let _running = claim(&name).expect("claim");
-        assert_eq!(started(&name, true), (None, true));
-        assert_eq!(started(&name, false), (None, false));
+        assert_eq!(started(&name, Start::Shown), (None, Some(Start::Shown)));
+        assert_eq!(
+            started(&name, Start::Settings),
+            (None, Some(Start::Settings))
+        );
+        assert_eq!(started(&name, Start::Hidden), (None, None));
+    }
+
+    fn arguments(list: &[&str]) -> Vec<String> {
+        list.iter().map(|text| text.to_string()).collect()
+    }
+
+    #[test]
+    fn the_command_line_says_how_to_start() {
+        assert_eq!(Start::from_args(arguments(&["hyalo.exe"])), Start::Shown);
+        assert_eq!(
+            Start::from_args(arguments(&["hyalo.exe", "--hidden"])),
+            Start::Hidden
+        );
+        assert_eq!(
+            Start::from_args(arguments(&["hyalo.exe", "--settings"])),
+            Start::Settings
+        );
+        assert_eq!(
+            Start::from_args(arguments(&["hyalo.exe", "--hide"])),
+            Start::Shown
+        );
+        let both = arguments(&["hyalo.exe", "--hidden", "--settings"]);
+        assert_eq!(Start::from_args(both), Start::Settings, "settings win");
     }
 
     #[test]
@@ -143,7 +202,7 @@ mod tests {
             assert!(!ours(&claim(&name).expect("claim")), "held while running");
             Ok(())
         };
-        first(&name, true, run, || {}).expect("started");
+        first(&name, Start::Shown, run, |_| {}).expect("started");
         assert!(ours(&claim(&name).expect("claim")), "free once it returned");
     }
 

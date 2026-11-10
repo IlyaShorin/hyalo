@@ -8,7 +8,7 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 use std::{fs, io};
 
-use hyalo_core::config::{self, Config, Problem};
+use hyalo_core::config::{self, Change, Config, Problem, Refusal, Written};
 use windows::Win32::Foundation::{HANDLE, WAIT_TIMEOUT};
 use windows::Win32::Storage::FileSystem::{
     FILE_NOTIFY_CHANGE_FILE_NAME, FILE_NOTIFY_CHANGE_LAST_WRITE, FindCloseChangeNotification,
@@ -46,19 +46,42 @@ pub fn contents(path: &Path) -> Option<Vec<u8>> {
     }
 }
 
-/// The settings the file's bytes give; text that is not UTF-8 is a
-/// problem on the line where it stops being UTF-8.
+/// The settings the file's bytes give.
 pub fn read(bytes: Vec<u8>) -> Loaded {
-    match String::from_utf8(bytes) {
-        Ok(text) => config::parse(&text),
-        Err(error) => {
-            let valid = &error.as_bytes()[..error.utf8_error().valid_up_to()];
-            Err(Problem {
-                line: valid.iter().filter(|&&byte| byte == b'\n').count() + 1,
-                message: "this is not UTF-8 text: save the file as UTF-8".to_string(),
-            })
+    text(bytes).and_then(|text| config::parse(&text))
+}
+
+/// The settings as the file's bytes write them, for the settings window.
+pub fn written(bytes: Vec<u8>) -> Result<Written, Problem> {
+    text(bytes).and_then(|text| config::written(&text))
+}
+
+/// The file's bytes as text; text that is not UTF-8 is a problem on the
+/// line where it stops being UTF-8.
+fn text(bytes: Vec<u8>) -> Result<String, Problem> {
+    String::from_utf8(bytes).map_err(|error| {
+        let valid = &error.as_bytes()[..error.utf8_error().valid_up_to()];
+        Problem {
+            line: valid.iter().filter(|&&byte| byte == b'\n').count() + 1,
+            message: "this is not UTF-8 text: save the file as UTF-8".to_string(),
         }
-    }
+    })
+}
+
+/// The text the file at `path` holds now, read afresh (a file that is not
+/// there is written with the defaults first), with `change` made in it;
+/// `None` when the change makes no difference. Nothing is written.
+pub fn edited(path: &Path, change: &Change) -> Result<Option<String>, Refusal> {
+    let unreadable = || Refusal::Wrong("cannot read config.toml".to_string());
+    let text = text(contents(path).ok_or_else(unreadable)?).map_err(Refusal::Broken)?;
+    let edited = config::edit(&text, change)?;
+    Ok((edited != text).then_some(edited))
+}
+
+/// Puts `text` in the file at `path` whole or not at all, so the watcher
+/// never reads half of it.
+pub fn write(path: &Path, text: &str) -> io::Result<()> {
+    store::replace(path, text.as_bytes())
 }
 
 /// How long after a change the file is read: an editor may write it in
@@ -69,7 +92,7 @@ const SETTLE: Duration = Duration::from_millis(100);
 const LISTENING: u32 = 500;
 
 /// Watches the folder of `path` on a thread of its own and hands over
-/// the settings each time the file holds something other than what was
+/// what the file holds each time it holds something other than what was
 /// `seen` last, until `listening` says no one listens. What was saved
 /// after `seen` was read and before the watching began is handed over at
 /// once.
@@ -77,7 +100,7 @@ pub fn watch(
     path: PathBuf,
     seen: Option<Vec<u8>>,
     listening: impl Fn() -> bool + Send + 'static,
-    report: impl Fn(Loaded) + Send + 'static,
+    report: impl Fn(Vec<u8>) + Send + 'static,
 ) -> JoinHandle<()> {
     thread::spawn(move || {
         let Some(folder) = path.parent() else {
@@ -98,7 +121,7 @@ pub fn watch(
                 .filter(|now| seen.as_ref() != Some(now))
             {
                 seen = Some(now.clone());
-                report(read(now));
+                report(now);
             }
             changed = next_change(handle, &listening);
         }
@@ -126,6 +149,7 @@ fn next_change(handle: HANDLE, listening: &impl Fn() -> bool) -> bool {
 mod tests {
     use super::*;
     use crate::scratch::Scratch;
+    use hyalo_core::config::List;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::mpsc::{Receiver, channel};
@@ -189,6 +213,84 @@ mod tests {
         assert_eq!(load(&config_in(&scratch)), None);
     }
 
+    fn change(list: List, entry: &str) -> Change {
+        Change::Add(list, entry.to_string())
+    }
+
+    #[test]
+    fn a_change_is_made_in_the_text_the_file_holds_now() {
+        let scratch = Scratch::new("settings-edit").with(&["hyalo\\"]);
+        let path = config_in(&scratch);
+        fs::write(&path, "# mine\nhotkey = 'F4'\n").expect("write");
+        let edited = edited(&path, &change(List::RankHigher, "notes")).expect("edited");
+        let text = edited.expect("a change");
+        let expected = "# mine\nhotkey = 'F4'\n\n[folders]\nrank_higher = ['notes']\n";
+        assert_eq!(text, expected);
+        let before = fs::read_to_string(&path).expect("read");
+        assert_eq!(before, "# mine\nhotkey = 'F4'\n", "not written yet");
+        write(&path, &text).expect("write");
+        assert_eq!(fs::read_to_string(&path).expect("read"), text);
+        let names: Vec<_> = fs::read_dir(scratch.0.join("hyalo"))
+            .expect("the folder")
+            .collect();
+        assert_eq!(names.len(), 1, "no temporary file left");
+    }
+
+    #[test]
+    fn a_change_to_a_missing_file_is_made_in_the_defaults() {
+        let scratch = Scratch::new("settings-edit-missing");
+        let path = config_in(&scratch);
+        let edited = edited(&path, &change(List::Exclude, r"D:\old")).expect("edited");
+        let text = edited.expect("a change");
+        assert!(text.starts_with("# hyalo's settings."), "{text}");
+        assert!(
+            text.contains(r"exclude = ['C:\Windows\WinSxS', 'D:\old']"),
+            "{text}"
+        );
+        assert_eq!(fs::read_to_string(&path).expect("written"), config::DEFAULT);
+    }
+
+    #[test]
+    fn a_change_that_changes_nothing_is_not_there_to_write() {
+        let (_scratch, path) = configured("settings-edit-same");
+        assert_eq!(edited(&path, &change(List::RankLower, "TARGET")), Ok(None));
+    }
+
+    #[test]
+    fn a_broken_file_is_not_changed_and_says_why() {
+        let scratch = Scratch::new("settings-edit-broken").with(&["hyalo\\"]);
+        let path = config_in(&scratch);
+        fs::write(&path, "\nhotkye = 'F4'\n").expect("write");
+        let refused = edited(&path, &change(List::RankLower, "x")).expect_err("refused");
+        assert!(
+            matches!(refused, Refusal::Broken(Problem { line: 2, .. })),
+            "{refused:?}"
+        );
+        fs::write(&path, b"# \xC0\n").expect("write");
+        let refused = edited(&path, &change(List::RankLower, "x")).expect_err("refused");
+        assert!(
+            matches!(refused, Refusal::Broken(Problem { line: 1, .. })),
+            "{refused:?}"
+        );
+    }
+
+    #[test]
+    fn a_file_that_cannot_be_read_is_not_changed() {
+        let scratch = Scratch::new("settings-edit-folder").with(&["hyalo\\config.toml\\"]);
+        let refused = edited(&config_in(&scratch), &change(List::RankLower, "x"));
+        let why = "cannot read config.toml".to_string();
+        assert_eq!(refused, Err(Refusal::Wrong(why)));
+    }
+
+    #[test]
+    fn the_settings_as_written_come_from_the_files_bytes() {
+        let shown = written(b"hotkey = 'F4'\n".to_vec()).expect("good settings");
+        assert_eq!(shown.hotkey.to_string(), "F4");
+        assert_eq!(shown.list(List::RankLower), ["target"]);
+        let broken = written(b"# \xC0\n".to_vec()).expect_err("not UTF-8");
+        assert_eq!(broken.line, 1);
+    }
+
     #[test]
     fn the_file_lives_in_roaming_app_data_next_to_the_picks() {
         let picks = store::default_path().expect("picks");
@@ -215,7 +317,7 @@ mod tests {
             path.to_path_buf(),
             seen,
             move || flag.load(Ordering::SeqCst),
-            move |loaded| sender.send(loaded).expect("the test listens"),
+            move |bytes| sender.send(read(bytes)).expect("the test listens"),
         );
         (receiver, listening, watcher)
     }

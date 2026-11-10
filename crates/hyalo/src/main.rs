@@ -14,8 +14,13 @@ mod keys;
 mod launch;
 mod layout;
 mod notice;
+mod page;
+mod paint;
+mod panel;
+mod picker;
 mod query;
 mod rates;
+mod recorder;
 mod render;
 mod results;
 mod settings;
@@ -35,15 +40,16 @@ use windows::Win32::UI::HiDpi::{
     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext,
 };
 
-/// One launcher per session: the first start runs it, shown or, started
-/// with Windows, in the tray; a second start shows the first and goes.
+/// One launcher per session: the first start runs it, shown, in the tray
+/// (started with Windows) or with its settings open (`--settings`); a
+/// second start asks the first to show or to open its settings, and goes.
 fn main() -> windows::core::Result<()> {
-    let shown = autostart::shown(std::env::args());
-    instance::first(instance::NAME, shown, run, window::show_running)
+    let start = instance::Start::from_args(std::env::args());
+    instance::first(instance::NAME, start, run, window::ask_running)
 }
 
-fn run(shown: bool) -> windows::core::Result<()> {
+fn run(start: instance::Start) -> windows::core::Result<()> {
     // DPI awareness is per process and must be set before the first window.
     unsafe { SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2)? };
-    window::run(shown)
+    window::run(start)
 }

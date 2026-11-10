@@ -1,8 +1,7 @@
 //! What the launcher tells the user, quietly: a row under the empty bar
 //! (never while typing, so Enter still opens what was searched for), and
-//! the tray's tooltip. Enter on it opens the config, where the fix is.
-
-use std::path::Path;
+//! the tray's tooltip. Enter on it opens the settings window, which shows
+//! the way to the fix.
 
 use hyalo_core::config::Problem;
 use hyalo_core::hotkey::Hotkey;
@@ -33,8 +32,9 @@ impl Notice {
         }
     }
 
-    /// The row the launcher lists for it; Enter opens `config`.
-    pub fn item(&self, config: &Path) -> Item {
+    /// The row the launcher lists for it; Enter opens the settings
+    /// window, which shows the problem and the way to the file.
+    pub fn item(&self) -> Item {
         let advice = match self {
             Notice::Config(_) => "hyalo keeps its last good settings",
             Notice::Hotkey { .. } => "Choose another hotkey",
@@ -42,9 +42,9 @@ impl Notice {
         Item {
             id: ItemId("hyalo:notice".to_string()),
             title: self.said(),
-            subtitle: format!("{advice} · Enter to open config.toml"),
+            subtitle: format!("{advice} · Enter to open settings"),
             kind: Kind::Notice,
-            action: Action::Edit(config.to_string_lossy().into_owned()),
+            action: Action::Settings,
         }
     }
 }
@@ -64,15 +64,13 @@ mod tests {
         })
     }
 
-    const CONFIG: &str = r"C:\Users\Me\AppData\Roaming\hyalo\config.toml";
-
     #[test]
     fn a_problem_in_the_config_names_its_line() {
         assert_eq!(
             problem().said(),
             "config.toml, line 2: unknown field `hotkye`"
         );
-        let item = problem().item(Path::new(CONFIG));
+        let item = problem().item();
         assert_eq!(item.title, problem().said());
         assert!(
             item.subtitle.contains("last good settings"),
@@ -80,7 +78,7 @@ mod tests {
             item.subtitle
         );
         assert!(
-            item.subtitle.contains("Enter to open config.toml"),
+            item.subtitle.contains("Enter to open settings"),
             "{}",
             item.subtitle
         );
@@ -101,7 +99,7 @@ mod tests {
             kept: None,
         };
         assert_eq!(alone.said(), "Alt+Space is taken by another app");
-        let item = alone.item(Path::new(CONFIG));
+        let item = alone.item();
         assert!(
             item.subtitle.contains("another hotkey"),
             "{}",
@@ -110,9 +108,9 @@ mod tests {
     }
 
     #[test]
-    fn enter_opens_the_config_and_the_row_is_a_notice() {
-        let item = problem().item(Path::new(CONFIG));
-        assert_eq!(item.action, Action::Edit(CONFIG.to_string()));
+    fn enter_opens_the_settings_and_the_row_is_a_notice() {
+        let item = problem().item();
+        assert_eq!(item.action, Action::Settings);
         assert_eq!(item.kind, Kind::Notice);
         assert_eq!(item.id, ItemId("hyalo:notice".to_string()));
         assert_eq!(item.path(), None, "not a file to show in its folder");

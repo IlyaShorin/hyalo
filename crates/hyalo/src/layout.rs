@@ -61,6 +61,38 @@ pub fn row_at(y: f32, rows: usize) -> Option<usize> {
     (row < rows).then_some(row)
 }
 
+/// The settings window's size, frame included, in DIPs, and the least
+/// it may be made.
+const SETTINGS_SIZE: (f32, f32) = (700.0, 920.0);
+const SETTINGS_LEAST: (f32, f32) = (480.0, 360.0);
+/// The settings window never takes more than this share of the work area.
+const SETTINGS_SHARE: f32 = 0.9;
+
+/// Places the settings window in the middle of a monitor's work area,
+/// sized for the monitor's DPI scale and no larger than most of the
+/// work area.
+pub fn settings_rect(work_area: Rect, scale: f32) -> Rect {
+    let fit =
+        |dips: f32, room: i32| (dips * scale).min(room as f32 * SETTINGS_SHARE).round() as i32;
+    let width = fit(SETTINGS_SIZE.0, work_area.width);
+    let height = fit(SETTINGS_SIZE.1, work_area.height);
+    Rect {
+        x: work_area.x + (work_area.width - width) / 2,
+        y: work_area.y + (work_area.height - height) / 2,
+        width,
+        height,
+    }
+}
+
+/// The least size the settings window may be made, in pixels.
+pub fn settings_least(scale: f32) -> (i32, i32) {
+    let (width, height) = SETTINGS_LEAST;
+    (
+        (width * scale).round() as i32,
+        (height * scale).round() as i32,
+    )
+}
+
 /// The side of a row's icon, in DIPs.
 pub const ICON_SIZE: f32 = 32.0;
 
@@ -179,6 +211,53 @@ mod tests {
         assert_eq!(icon_pixels(96), 32);
         assert_eq!(icon_pixels(120), 40);
         assert_eq!(icon_pixels(168), 56);
+    }
+
+    #[test]
+    fn the_settings_window_sits_in_the_middle_of_the_work_area() {
+        let rect = settings_rect(FULL_HD, 1.0);
+        assert_eq!(
+            rect,
+            Rect {
+                x: 610,
+                y: 60,
+                width: 700,
+                height: 920
+            }
+        );
+        let rect = settings_rect(FULL_HD, 1.5);
+        assert_eq!(
+            (rect.width, rect.height),
+            (1050, 936),
+            "no taller than 90% of it"
+        );
+        assert_eq!((rect.x, rect.y), (435, 52));
+    }
+
+    #[test]
+    fn the_settings_window_fits_a_small_work_area_and_follows_its_monitor() {
+        let small = Rect {
+            x: -1280,
+            y: 40,
+            width: 1280,
+            height: 600,
+        };
+        let rect = settings_rect(small, 2.0);
+        assert_eq!(
+            rect,
+            Rect {
+                x: -1280 + 64,
+                y: 40 + 30,
+                width: 1152,
+                height: 540
+            }
+        );
+    }
+
+    #[test]
+    fn the_settings_window_has_a_least_size_by_scale() {
+        assert_eq!(settings_least(1.0), (480, 360));
+        assert_eq!(settings_least(1.5), (720, 540));
     }
 
     #[test]

@@ -30,6 +30,8 @@ pub fn run(action: &Action, as_admin: bool) -> Result<()> {
         Action::Reveal(path) => reveal(path),
         Action::CopyText(text) => copy(text),
         Action::Edit(path) => edit(path),
+        // The launcher opens its own window; there is nothing to run.
+        Action::Settings => Ok(()),
     }
 }
 
