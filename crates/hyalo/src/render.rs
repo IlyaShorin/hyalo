@@ -20,18 +20,19 @@ use hyalo_core::item::ItemId;
 use windows::Win32::Foundation::HWND;
 use windows::Win32::Graphics::Direct2D::Common::{D2D_RECT_F, D2D_SIZE_U, D2D1_COLOR_F};
 use windows::Win32::Graphics::Direct2D::{
-    D2D1_BITMAP_OPTIONS_NONE, D2D1_BITMAP_PROPERTIES1, D2D1_ELLIPSE,
+    D2D1_ANTIALIAS_MODE_ALIASED, D2D1_BITMAP_OPTIONS_NONE, D2D1_BITMAP_PROPERTIES1, D2D1_ELLIPSE,
     D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC, D2D1_ROUNDED_RECT, ID2D1Bitmap1,
 };
 use windows::Win32::Graphics::DirectWrite::{
-    DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_TEXT_METRICS,
-    DWRITE_TEXT_RANGE, IDWriteFactory, IDWriteTextFormat, IDWriteTextLayout,
+    DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_HIT_TEST_METRICS,
+    DWRITE_TEXT_METRICS, DWRITE_TEXT_RANGE, IDWriteFactory, IDWriteTextFormat, IDWriteTextLayout,
 };
-use windows::core::Result;
+use windows::core::{BOOL, Result};
 use windows_numerics::Vector2;
 
 use crate::apps::Icon;
-use crate::layout::{BAR_HEIGHT, ICON_SIZE, ROW_HEIGHT, row_top};
+use crate::field;
+use crate::layout::{BAR_HEIGHT, ICON_SIZE, ROW_HEIGHT, TEXT_LEFT, TEXT_RIGHT_PAD, row_top};
 use crate::surface::{
     DISPLAY_FONT, PREMULTIPLIED_BGRA, Surface, TEXT_FONT, rgba, text_format, trimmed,
 };
@@ -39,6 +40,10 @@ use crate::surface::{
 /// What to draw.
 pub struct Scene<'a> {
     pub query: &'a str,
+    /// The caret in the query, and what is selected there, in UTF-16
+    /// units.
+    pub caret: u32,
+    pub selection: Range<u32>,
     /// The results list under the bar; empty when there is none.
     pub rows: Vec<Row<'a>>,
     /// The selected row; ignored without rows.
@@ -62,12 +67,11 @@ const TITLE_SIZE: f32 = 15.0;
 const SUBTITLE_SIZE: f32 = 12.0;
 /// Matches the radius DWM uses for `DWMWCP_ROUND`.
 const CORNER_RADIUS: f32 = 8.0;
-/// Where the query, the titles and the subtitles start.
-const TEXT_LEFT: f32 = 56.0;
-const TEXT_RIGHT_PAD: f32 = 20.0;
 const ICON_CENTER_X: f32 = 30.0;
 /// The left edge of a row's icon.
 const ICON_LEFT: f32 = 12.0;
+/// How far past the query's room its letters and caret may still show.
+const QUERY_SLACK: f32 = 4.0;
 /// The title line and the subtitle line: top edge in the row, height.
 const TITLE_LINE: (f32, f32) = (4.0, 22.0);
 const SUBTITLE_LINE: (f32, f32) = (25.0, 18.0);
@@ -81,6 +85,8 @@ const TEXT: D2D1_COLOR_F = rgba(1.0, 1.0, 1.0, 0.95);
 const PLACEHOLDER_TEXT: D2D1_COLOR_F = rgba(1.0, 1.0, 1.0, 0.42);
 const ICON: D2D1_COLOR_F = rgba(1.0, 1.0, 1.0, 0.6);
 const CARET: D2D1_COLOR_F = rgba(0.45, 0.68, 1.0, 1.0);
+/// Behind the letters selected in the query: the caret's blue, see-through.
+const SELECTED: D2D1_COLOR_F = rgba(0.30, 0.52, 1.0, 0.45);
 const SEPARATOR: D2D1_COLOR_F = rgba(1.0, 1.0, 1.0, 0.10);
 const SELECTION: D2D1_COLOR_F = rgba(1.0, 1.0, 1.0, 0.12);
 const TITLE_TEXT: D2D1_COLOR_F = rgba(1.0, 1.0, 1.0, 0.92);
@@ -92,6 +98,8 @@ pub struct Renderer {
     fonts: Fonts,
     /// Icons already on the GPU, by item.
     icons: HashMap<ItemId, ID2D1Bitmap1>,
+    /// How far the query is scrolled left, in DIPs, so its caret shows.
+    scroll: f32,
 }
 
 /// The text formats: the query, a row's title, a row's subtitle.
@@ -109,6 +117,7 @@ impl Renderer {
             surface,
             fonts,
             icons: HashMap::new(),
+            scroll: 0.0,
         })
     }
 
@@ -126,7 +135,7 @@ impl Renderer {
         let (w, h) = self.surface.size();
         self.draw_glass(w, h)?;
         self.draw_search_icon()?;
-        self.draw_query(scene.query)?;
+        self.draw_query(scene, w)?;
         if scene.rows.is_empty() {
             return Ok(());
         }
@@ -204,29 +213,85 @@ impl Renderer {
         Ok(())
     }
 
-    /// The query or the placeholder, and the caret after what is typed.
-    /// No wrapping and leading alignment: the text runs on from its
-    /// start, so its layout needs no width.
-    fn draw_query(&self, query: &str) -> Result<()> {
-        let (text, color) = match query {
-            "" => (PLACEHOLDER, PLACEHOLDER_TEXT),
-            typed => (typed, TEXT),
-        };
+    /// Where in the query `text` a click `x` DIPs from the launcher's left
+    /// puts the caret, as the query is scrolled now: a UTF-16 position.
+    pub fn unit_at(&self, text: &str, x: f32) -> Result<u32> {
         let layout = self
             .surface
             .layout(text, &self.fonts.query, 0.0, BAR_HEIGHT)?;
-        self.surface.draw_text(&layout, TEXT_LEFT, 0.0, color)?;
-        let caret_x = TEXT_LEFT + self.typed_width(query)? + 1.0;
-        self.draw_caret(caret_x)
+        let (mut trailing, mut inside) = (BOOL::default(), BOOL::default());
+        let mut hit = DWRITE_HIT_TEST_METRICS::default();
+        let x = x - TEXT_LEFT + self.scroll;
+        unsafe { layout.HitTestPoint(x, BAR_HEIGHT / 2.0, &mut trailing, &mut inside, &mut hit)? };
+        // Past the middle of a letter is after it.
+        let after = match trailing.as_bool() {
+            true => hit.length,
+            false => 0,
+        };
+        Ok(hit.textPosition + after)
     }
 
-    fn typed_width(&self, query: &str) -> Result<f32> {
-        let layout = self
+    /// The query or the placeholder, what is selected in the query, and
+    /// the caret, scrolled so the caret shows. No wrapping and leading
+    /// alignment: the text runs on from its start, so its layout needs no
+    /// width.
+    fn draw_query(&mut self, scene: &Scene, w: f32) -> Result<()> {
+        let typed = self
             .surface
-            .layout(query, &self.fonts.query, 0.0, BAR_HEIGHT)?;
-        let mut metrics = DWRITE_TEXT_METRICS::default();
-        unsafe { layout.GetMetrics(&mut metrics)? };
-        Ok(metrics.widthIncludingTrailingWhitespace)
+            .layout(scene.query, &self.fonts.query, 0.0, BAR_HEIGHT)?;
+        let caret = x_at(&typed, scene.caret)?;
+        let room = w - TEXT_LEFT - TEXT_RIGHT_PAD;
+        self.scroll = field::scrolled(self.scroll, caret, width(&typed)?, room);
+        let left = TEXT_LEFT - self.scroll;
+        let room = D2D_RECT_F {
+            left: TEXT_LEFT - QUERY_SLACK,
+            top: 0.0,
+            right: w - TEXT_RIGHT_PAD + QUERY_SLACK,
+            bottom: BAR_HEIGHT,
+        };
+        let dc = &self.surface.dc;
+        unsafe { dc.PushAxisAlignedClip(&room, D2D1_ANTIALIAS_MODE_ALIASED) };
+        let drawn = self
+            .draw_typed(scene, &typed, left)
+            .and_then(|()| self.draw_caret(left + caret + 1.0));
+        unsafe { dc.PopAxisAlignedClip() };
+        drawn
+    }
+
+    /// The query with its selection behind it, or the placeholder.
+    fn draw_typed(&self, scene: &Scene, typed: &IDWriteTextLayout, left: f32) -> Result<()> {
+        if scene.query.is_empty() {
+            let placeholder =
+                self.surface
+                    .layout(PLACEHOLDER, &self.fonts.query, 0.0, BAR_HEIGHT)?;
+            return self
+                .surface
+                .draw_text(&placeholder, left, 0.0, PLACEHOLDER_TEXT);
+        }
+        self.draw_selected(typed, &scene.selection, left)?;
+        self.surface.draw_text(typed, left, 0.0, TEXT)
+    }
+
+    /// The band behind the letters selected, as high as the caret.
+    fn draw_selected(
+        &self,
+        typed: &IDWriteTextLayout,
+        selection: &Range<u32>,
+        left: f32,
+    ) -> Result<()> {
+        if selection.is_empty() {
+            return Ok(());
+        }
+        let half = QUERY_SIZE * 0.55;
+        let band = D2D_RECT_F {
+            left: left + x_at(typed, selection.start)?,
+            top: BAR_HEIGHT / 2.0 - half,
+            right: left + x_at(typed, selection.end)?,
+            bottom: BAR_HEIGHT / 2.0 + half,
+        };
+        let brush = self.surface.solid(SELECTED)?;
+        unsafe { self.surface.dc.FillRectangle(&band, &brush) };
+        Ok(())
     }
 
     fn draw_caret(&self, x: f32) -> Result<()> {
@@ -365,6 +430,22 @@ impl Renderer {
     }
 }
 
+/// How far from the start of the one-line `layout` the caret before the
+/// UTF-16 unit `at` goes, in DIPs.
+fn x_at(layout: &IDWriteTextLayout, at: u32) -> Result<f32> {
+    let (mut x, mut y) = (0.0, 0.0);
+    let mut metrics = DWRITE_HIT_TEST_METRICS::default();
+    unsafe { layout.HitTestTextPosition(at, false, &mut x, &mut y, &mut metrics)? };
+    Ok(x)
+}
+
+/// How wide the one-line `layout` is, spaces at its end included.
+fn width(layout: &IDWriteTextLayout) -> Result<f32> {
+    let mut metrics = DWRITE_TEXT_METRICS::default();
+    unsafe { layout.GetMetrics(&mut metrics)? };
+    Ok(metrics.widthIncludingTrailingWhitespace)
+}
+
 impl Fonts {
     fn new(dwrite: &IDWriteFactory) -> Result<Self> {
         let normal = DWRITE_FONT_WEIGHT_NORMAL;
@@ -401,8 +482,11 @@ mod tests {
     impl Scene<'static> {
         /// The bar alone, with `query` typed.
         fn bar(query: &'static str) -> Self {
+            let end = query.encode_utf16().count() as u32;
             Scene {
                 query,
+                caret: end,
+                selection: end..end,
                 rows: Vec::new(),
                 selected: 0,
             }
@@ -422,6 +506,39 @@ mod tests {
         on_hidden_desktop(|| {
             let frame = drawn(&Scene::bar(""), (720, 64), 96);
             assert_looks_like("bar-empty-100", &frame);
+        });
+    }
+
+    #[test]
+    fn a_selection_with_the_caret_in_the_middle_of_the_query() {
+        on_hidden_desktop(|| {
+            let scene = Scene {
+                caret: 7,
+                selection: 4..7,
+                ..Scene::bar("notepad plus")
+            };
+            let frame = drawn(&scene, (720, 64), 96);
+            assert_looks_like("bar-selected-100", &frame);
+        });
+    }
+
+    #[test]
+    fn a_query_longer_than_the_bar_scrolls_to_its_caret_and_back() {
+        on_hidden_desktop(|| {
+            let canvas = Canvas::new();
+            let mut renderer = Renderer::new(canvas.0, 720, 64, 96).expect("a renderer");
+            let long = r"C:\Users\Me\Documents\Projects\hyalo\crates\hyalo\reference\bar.png";
+            renderer.draw(&Scene::bar(long)).expect("draw");
+            let frame = renderer.read_frame().expect("read the frame back");
+            assert_looks_like("bar-scrolled-100", &frame);
+            let home = Scene {
+                caret: 0,
+                selection: 0..0,
+                ..Scene::bar(long)
+            };
+            renderer.draw(&home).expect("draw at the start");
+            let frame = renderer.read_frame().expect("read the frame back");
+            assert_looks_like("bar-scrolled-home-100", &frame);
         });
     }
 
@@ -485,9 +602,9 @@ mod tests {
             let mut renderer = Renderer::new(canvas.0, 1080, 336, 144).expect("a renderer");
             for _ in 0..2 {
                 let scene = Scene {
-                    query: "note",
                     rows: rows(),
                     selected: 1,
+                    ..Scene::bar("note")
                 };
                 renderer.draw(&scene).expect("draw");
                 let frame = renderer.read_frame().expect("read the frame back");
@@ -501,7 +618,6 @@ mod tests {
         on_hidden_desktop(|| {
             let id = ItemId("hyalo:calculator".to_string());
             let scene = Scene {
-                query: "1234567+0,5",
                 rows: vec![Row {
                     id: &id,
                     title: "1\u{A0}234\u{A0}567,5",
@@ -510,6 +626,7 @@ mod tests {
                     icon: None,
                 }],
                 selected: 0,
+                ..Scene::bar("1234567+0,5")
             };
             let frame = drawn(&scene, (720, 128), 96);
             assert_looks_like("answer-100", &frame);
@@ -521,7 +638,6 @@ mod tests {
         on_hidden_desktop(|| {
             let id = ItemId("hyalo:notice".to_string());
             let scene = Scene {
-                query: "",
                 rows: vec![Row {
                     id: &id,
                     title: "config.toml, line 2: unknown field `hotkye`, expected `hotkey` or `folders`",
@@ -530,6 +646,7 @@ mod tests {
                     icon: None,
                 }],
                 selected: 0,
+                ..Scene::bar("")
             };
             let frame = drawn(&scene, (720, 128), 96);
             assert_looks_like("notice-100", &frame);
@@ -541,7 +658,6 @@ mod tests {
         on_hidden_desktop(|| {
             let id = ItemId("hyalo:currency".to_string());
             let scene = Scene {
-                query: "100 usd",
                 rows: vec![Row {
                     id: &id,
                     title: "8\u{A0}275.36\u{A0}₽",
@@ -550,6 +666,7 @@ mod tests {
                     icon: None,
                 }],
                 selected: 0,
+                ..Scene::bar("100 usd")
             };
             let frame = drawn(&scene, (720, 128), 96);
             assert_looks_like("currency-100", &frame);

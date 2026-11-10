@@ -34,32 +34,37 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
-use windows::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, VIRTUAL_KEY, VK_CONTROL, VK_SHIFT};
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    GetDoubleClickTime, GetKeyState, ReleaseCapture, SetCapture, VIRTUAL_KEY, VK_CONTROL, VK_SHIFT,
+};
 use windows::Win32::UI::Shell::{NIN_SELECT, NINF_KEY};
 use windows::Win32::UI::WindowsAndMessaging::{
-    AllowSetForegroundWindow, CW_USEDEFAULT, CreateWindowExW, DefWindowProcW, DestroyWindow,
-    DispatchMessageW, FindWindowW, GetCursorPos, GetMessageW, GetWindowThreadProcessId, HTCLIENT,
-    HWND_TOPMOST, IDC_ARROW, IsWindow, IsWindowVisible, LoadCursorW, MSG, PostMessageW,
-    PostQuitMessage, RegisterClassExW, SW_HIDE, SW_SHOW, SWP_NOACTIVATE, SetForegroundWindow,
-    SetWindowPos, ShowWindow, TranslateMessage, WA_INACTIVE, WM_ACTIVATE, WM_APP, WM_CHAR,
-    WM_CONTEXTMENU, WM_DESTROY, WM_HOTKEY, WM_KEYDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCCALCSIZE,
-    WM_NCHITTEST, WM_SYSCHAR, WM_SYSKEYUP, WNDCLASSEXW, WS_CAPTION, WS_EX_NOREDIRECTIONBITMAP,
-    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_THICKFRAME,
+    AllowSetForegroundWindow, CS_DBLCLKS, CW_USEDEFAULT, CreateWindowExW, DefWindowProcW,
+    DestroyWindow, DispatchMessageW, FindWindowW, GetCursorPos, GetMessagePos, GetMessageW,
+    GetSystemMetrics, GetWindowThreadProcessId, HTCLIENT, HWND_TOPMOST, IDC_ARROW, IDC_IBEAM,
+    IsWindow, IsWindowVisible, LoadCursorW, MSG, PostMessageW, PostQuitMessage, RegisterClassExW,
+    SM_CXDOUBLECLK, SM_CYDOUBLECLK, SW_HIDE, SW_SHOW, SWP_NOACTIVATE, SetCursor,
+    SetForegroundWindow, SetWindowPos, ShowWindow, TranslateMessage, WA_INACTIVE, WM_ACTIVATE,
+    WM_APP, WM_CHAR, WM_CONTEXTMENU, WM_DESTROY, WM_HOTKEY, WM_KEYDOWN, WM_LBUTTONDBLCLK,
+    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCCALCSIZE, WM_NCHITTEST, WM_SETCURSOR,
+    WM_SYSCHAR, WM_SYSKEYUP, WNDCLASSEXW, WS_CAPTION, WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOOLWINDOW,
+    WS_EX_TOPMOST, WS_POPUP, WS_THICKFRAME,
 };
 use windows::core::{BOOL, PCWSTR, Result, w};
 
 use crate::apps::Icon;
 use crate::autostart::Autostart;
 use crate::catalog::{self, Catalog, FileIcons, Found, Provider, Request};
+use crate::clipboard;
+use crate::field::{self, Edit, Edited, Field};
 use crate::files::{self, Excluded, Files, Roots};
 use crate::highlight::utf16_ranges;
 use crate::hotkeys::{self, Hotkeys};
 use crate::instance::Start;
 use crate::keys::{self, Command, Held};
-use crate::layout::{self, Rect};
+use crate::layout::{self, Part, Rect};
 use crate::notice::Notice;
 use crate::picker::{self, Picker};
-use crate::query::Query;
 use crate::render::{Renderer, Row, Scene};
 use crate::results::{self, Listed, MAX_ROWS, Results};
 use crate::settings::{self, Loaded};
@@ -195,7 +200,7 @@ fn run_in_background(action: &Action, as_admin: bool) {
 
 struct App {
     hwnd: HWND,
-    query: Query,
+    query: Field,
     renderer: Option<Renderer>,
     placement: Placement,
     catalog: Catalog,
@@ -227,6 +232,20 @@ struct App {
     places: Places,
     /// The settings window, while it is open.
     settings: Option<SettingsWindow>,
+    /// What the left button went down on, while it is down.
+    pressed: Option<Press>,
+    /// When and where the last double-click in the query was, until a
+    /// third click uses it.
+    double: Option<(Instant, (i32, i32))>,
+}
+
+/// What the left button went down on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Press {
+    /// The query: moving selects.
+    Text,
+    /// A row: letting go over it opens it.
+    Row(usize),
 }
 
 impl App {
@@ -410,11 +429,92 @@ impl App {
         }
     }
 
-    /// Opens the row under `point`, as Enter would; whether there was one.
-    fn click(&mut self, point: POINT) -> bool {
-        let Some(row) = self.row_under(point) else {
+    /// What the launcher has under `point`, in client pixels.
+    fn part_at(&self, point: POINT) -> Part {
+        let scale = layout::scale(self.placement.dpi);
+        let rows = self.results.rows().len();
+        let width = self.placement.rect(rows).width as f32 / scale;
+        let (x, y) = (point.x as f32 / scale, point.y as f32 / scale);
+        layout::part_at(x, y, width, rows)
+    }
+
+    /// The character a click at `point` puts the caret before; `None`
+    /// without a picture to tell.
+    fn char_at(&self, point: POINT) -> Option<usize> {
+        let x = point.x as f32 / layout::scale(self.placement.dpi);
+        let text = self.query.text();
+        let unit = self.renderer.as_ref()?.unit_at(text, x).ok()?;
+        Some(field::char_index(text, unit))
+    }
+
+    /// Puts the caret at `point`, or with `extend` selects up to there.
+    fn place(&mut self, point: POINT, extend: bool) -> Edited {
+        self.char_at(point)
+            .map_or(Edited::Nothing, |at| self.query.place(at, extend))
+    }
+
+    /// The left button went down at `point`, with Shift held when
+    /// `shift`: in the query it places the caret, or selects to there,
+    /// or after a double-click selects everything; on a row, the row is
+    /// opened when the button comes up over it.
+    fn press(&mut self, point: POINT, shift: bool) -> Result<()> {
+        let (pressed, edited) = match self.part_at(point) {
+            Part::Text if self.third(point) => (None, self.query.apply(Edit::SelectAll)),
+            Part::Text => (Some(Press::Text), self.place(point, shift)),
+            Part::Row(row) => (Some(Press::Row(row)), Edited::Nothing),
+            Part::Glass => (None, Edited::Nothing),
+        };
+        self.pressed = pressed;
+        self.refresh(edited)
+    }
+
+    /// Whether a click at `point` is the third of a triple-click.
+    fn third(&mut self, point: POINT) -> bool {
+        let double = self.double.take();
+        field::third_click(
+            double,
+            Instant::now(),
+            (point.x, point.y),
+            double_click_time(),
+            double_click_room(),
+        )
+    }
+
+    /// A double-click at `point`: in the query it selects the word there;
+    /// elsewhere it is a press like any other.
+    fn double_click(&mut self, point: POINT) -> Result<()> {
+        if self.part_at(point) != Part::Text {
+            return self.press(point, false);
+        }
+        self.double = Some((Instant::now(), (point.x, point.y)));
+        self.pressed = None;
+        let edited = self
+            .char_at(point)
+            .map_or(Edited::Nothing, |at| self.query.select_word(at));
+        self.refresh(edited)
+    }
+
+    /// The pointer moved to `point`: with the button down in the query,
+    /// the selection follows it; else the row under it is selected.
+    fn pointer_moved(&mut self, point: POINT) -> Result<()> {
+        match self.pressed {
+            Some(Press::Text) => {
+                let edited = self.place(point, true);
+                self.refresh(edited)
+            }
+            _ => self.hover(point),
+        }
+    }
+
+    /// The left button came up at `point`: over the row it went down on,
+    /// that row opens, as Enter would. Whether one did.
+    fn release(&mut self, point: POINT) -> bool {
+        let Some(Press::Row(row)) = self.pressed.take() else {
             return false;
         };
+        if self.row_under(point) != Some(row) {
+            return false;
+        }
         self.results.select(row);
         self.act(Command::Open { as_admin: false });
         true
@@ -437,6 +537,56 @@ impl App {
         }
         self.note(item);
         true
+    }
+
+    /// Carries out a key that edits the query or copies from it, and
+    /// shows what came of it; whether the launcher hides: Ctrl+C with
+    /// nothing selected copied the selected row's path.
+    fn edit(&mut self, key: field::Key) -> Result<bool> {
+        let edited = match key {
+            field::Key::Copy => return Ok(self.copy()),
+            field::Key::Edit(edit) => self.query.apply(edit),
+            field::Key::Cut => self.cut(),
+            field::Key::Paste => {
+                let text = clipboard::text().unwrap_or_default();
+                text_edited(self.query.paste(&text))
+            }
+        };
+        self.refresh(edited).map(|()| false)
+    }
+
+    /// Copies the text selected in the bar; with none selected, the
+    /// selected row's path, as Ctrl+C always did. Whether it was the path.
+    fn copy(&mut self) -> bool {
+        match self.query.selected() {
+            "" => self.act(Command::Copy),
+            selected => {
+                (self.services.run)(&Action::CopyText(selected.to_string()), false);
+                false
+            }
+        }
+    }
+
+    /// Takes the selection out of the query onto the clipboard.
+    fn cut(&mut self) -> Edited {
+        let Some(text) = self.query.cut() else {
+            return Edited::Nothing;
+        };
+        (self.services.run)(&Action::CopyText(text), false);
+        Edited::Text
+    }
+
+    /// Shows what an edit changed: a new query searches again; a caret or
+    /// a selection moved is drawn.
+    fn refresh(&mut self, edited: Edited) -> Result<()> {
+        match edited {
+            Edited::Nothing => Ok(()),
+            Edited::Caret => self.redraw(),
+            Edited::Text => {
+                self.search();
+                self.present()
+            }
+        }
     }
 
     /// Notes a pick, on disk too when there is a picks file; a file or
@@ -585,7 +735,7 @@ fn hand_over(sender: &Sender<Found>, window: isize, found: Found) {
 
 /// What the window shows: the query and a row per result.
 fn scene<'a>(
-    query: &'a Query,
+    query: &'a Field,
     results: &'a Results,
     icons: &'a HashMap<ItemId, Icon>,
 ) -> Scene<'a> {
@@ -598,6 +748,8 @@ fn scene<'a>(
     };
     Scene {
         query: query.text(),
+        caret: query.caret_utf16(),
+        selection: query.selection_utf16(),
         rows: results.rows().iter().map(row).collect(),
         selected: results.selected(),
     }
@@ -649,7 +801,7 @@ fn open(services: Services, shown: bool) -> Result<HWND> {
     APP.with_borrow_mut(|app| {
         let mut opened = App {
             hwnd,
-            query: Query::default(),
+            query: Field::default(),
             renderer: None,
             placement,
             catalog: Catalog::default(),
@@ -667,6 +819,8 @@ fn open(services: Services, shown: bool) -> Result<HWND> {
             refused: None,
             places,
             settings: None,
+            pressed: None,
+            double: None,
         };
         opened.find_picked();
         let loaded = seen.clone().map_or(Ok(Config::default()), settings::read);
@@ -695,6 +849,8 @@ const WINDOW_CLASS: PCWSTR = w!("hyalo.launcher");
 fn register_class(instance: HINSTANCE) -> Result<()> {
     let window_class = WNDCLASSEXW {
         cbSize: size_of::<WNDCLASSEXW>() as u32,
+        // Double-clicks select words in the query.
+        style: CS_DBLCLKS,
         lpfnWndProc: Some(wndproc),
         hInstance: instance,
         hCursor: unsafe { LoadCursorW(None, IDC_ARROW)? },
@@ -791,8 +947,10 @@ fn on_message(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> Optio
             Some(Ok(()))
         }
         WM_KEYDOWN | WM_CHAR | WM_SYSCHAR | WM_SYSKEYUP => Some(on_keyboard(hwnd, message, wparam)),
-        WM_MOUSEMOVE => Some(with_app(|app| app.hover(client_point(lparam))).unwrap_or(Ok(()))),
-        WM_LBUTTONUP => Some(on_click(hwnd, client_point(lparam))),
+        WM_MOUSEMOVE | WM_LBUTTONDOWN | WM_LBUTTONDBLCLK | WM_LBUTTONUP => {
+            Some(on_mouse(hwnd, message, wparam, client_point(lparam)))
+        }
+        WM_SETCURSOR if (lparam.0 & 0xFFFF) as u32 == HTCLIENT => Some(on_set_cursor(hwnd)),
         _ => on_app_message(hwnd, message, wparam, lparam),
     }
 }
@@ -929,12 +1087,84 @@ fn client_point(lparam: LPARAM) -> POINT {
     }
 }
 
-/// A click opens the row under it and hides the launcher.
-fn on_click(hwnd: HWND, point: POINT) -> Result<()> {
-    if with_app(|app| app.click(point)) == Some(true) {
-        hide(hwnd);
+/// The Shift key, held while a mouse message was sent (`MK_SHIFT`).
+const MOUSE_SHIFT: usize = 0x0004;
+
+/// What the mouse does. While the button is down in the query, the
+/// window has the mouse, so selecting goes on outside it; a click that
+/// opens a row hides the launcher.
+fn on_mouse(hwnd: HWND, message: u32, wparam: WPARAM, point: POINT) -> Result<()> {
+    match message {
+        WM_LBUTTONDOWN => {
+            let shift = wparam.0 & MOUSE_SHIFT != 0;
+            let pressed = with_app(|app| app.press(point, shift).map(|()| app.pressed));
+            capture_while(hwnd, pressed)
+        }
+        WM_LBUTTONDBLCLK => with_app(|app| app.double_click(point)).unwrap_or(Ok(())),
+        WM_LBUTTONUP => {
+            // SAFETY: a plain call; without the mouse it does nothing.
+            let _ = unsafe { ReleaseCapture() };
+            if with_app(|app| app.release(point)) == Some(true) {
+                hide(hwnd);
+            }
+            Ok(())
+        }
+        _ => with_app(|app| app.pointer_moved(point)).unwrap_or(Ok(())),
     }
+}
+
+/// The pointer's look over the launcher, where the message that moved
+/// it put it.
+fn on_set_cursor(hwnd: HWND) -> Result<()> {
+    // SAFETY: a plain call.
+    let at = unsafe { GetMessagePos() };
+    set_cursor_over(hwnd, client_point(LPARAM(at as isize)))
+}
+
+/// Shows the pointer over the point `at` of the screen as an I-beam over
+/// the query, an arrow elsewhere.
+fn set_cursor_over(hwnd: HWND, at: POINT) -> Result<()> {
+    let mut point = at;
+    // SAFETY: a plain call into a live POINT.
+    let _ = unsafe { ScreenToClient(hwnd, &mut point) };
+    let shape = match with_app(|app| app.part_at(point)) {
+        Some(Part::Text) => IDC_IBEAM,
+        _ => IDC_ARROW,
+    };
+    // SAFETY: plain calls; a shared system cursor is never destroyed.
+    unsafe { SetCursor(Some(LoadCursorW(None, shape)?)) };
     Ok(())
+}
+
+/// Takes the mouse for `hwnd` when the button went down in the query.
+fn capture_while(hwnd: HWND, pressed: Option<Result<Option<Press>>>) -> Result<()> {
+    match pressed {
+        Some(Ok(Some(Press::Text))) => {
+            // SAFETY: a plain call on a window of this thread.
+            unsafe { SetCapture(hwnd) };
+            Ok(())
+        }
+        Some(Err(error)) => Err(error),
+        _ => Ok(()),
+    }
+}
+
+/// How soon a click must follow a double-click to make a triple-click:
+/// as soon as the second click of a double-click.
+fn double_click_time() -> Duration {
+    // SAFETY: a plain call.
+    Duration::from_millis(u64::from(unsafe { GetDoubleClickTime() }))
+}
+
+/// The box a double-click's clicks fall in, in pixels.
+fn double_click_room() -> (i32, i32) {
+    // SAFETY: plain calls.
+    unsafe {
+        (
+            GetSystemMetrics(SM_CXDOUBLECLK),
+            GetSystemMetrics(SM_CYDOUBLECLK),
+        )
+    }
 }
 
 /// The message was handled: answer 0, as Windows expects, and log a
@@ -996,11 +1226,12 @@ fn hide(hwnd: HWND) {
     });
 }
 
-/// Moves the selection, or acts on the selected row. Enter hides the
-/// launcher even with nothing to open; Ctrl+Enter and Ctrl+C hide it only
-/// when the row has a folder to show or a path to copy.
+/// Moves the selection, acts on the selected row, or edits the query.
+/// Enter hides the launcher even with nothing to open; Ctrl+Enter hides
+/// it only when the row has a folder to show.
 fn on_key(hwnd: HWND, key: VIRTUAL_KEY) -> Result<()> {
-    let moved = match keys::command(key, held()) {
+    let held = held();
+    let moved = match keys::command(key, held) {
         Some(Command::Up) => with_app(|app| app.move_selection(Results::up)),
         Some(Command::Down) => with_app(|app| app.move_selection(Results::down)),
         Some(Command::Hide) => {
@@ -1018,9 +1249,25 @@ fn on_key(hwnd: HWND, key: VIRTUAL_KEY) -> Result<()> {
             }
             None
         }
-        None => None,
+        None => return on_field_key(hwnd, field::key(key, held)),
     };
     moved.unwrap_or(Ok(()))
+}
+
+/// A key that edits the query or copies from it; Ctrl+C that copied a
+/// row's path hides the launcher.
+fn on_field_key(hwnd: HWND, key: Option<field::Key>) -> Result<()> {
+    let Some(key) = key else {
+        return Ok(());
+    };
+    match with_app(|app| app.edit(key)) {
+        Some(Ok(true)) => {
+            hide(hwnd);
+            Ok(())
+        }
+        Some(Err(error)) => Err(error),
+        _ => Ok(()),
+    }
 }
 
 /// Whether `key` is down, as of the key message being handled.
@@ -1051,13 +1298,18 @@ fn held() -> Held {
 /// Types one UTF-16 unit; a change to the query searches again.
 fn on_char(unit: u16) -> Result<()> {
     with_app(|app| {
-        if !app.query.type_unit(unit) {
-            return Ok(());
-        }
-        app.search();
-        app.present()
+        let typed = app.query.type_unit(unit);
+        app.refresh(text_edited(typed))
     })
     .unwrap_or(Ok(()))
+}
+
+/// A change to the text, or none.
+fn text_edited(changed: bool) -> Edited {
+    match changed {
+        true => Edited::Text,
+        false => Edited::Nothing,
+    }
 }
 
 /// Where the launcher goes: the monitor under the mouse cursor.
@@ -1137,18 +1389,19 @@ mod tests {
     use windows::Win32::Graphics::Dwm::DwmGetWindowAttribute;
     use windows::Win32::Graphics::Gdi::MonitorFromWindow;
     use windows::Win32::UI::Input::KeyboardAndMouse::{
-        SetKeyboardState, VK_A, VK_C, VK_DOWN, VK_ESCAPE, VK_RETURN, VK_UP,
+        SetKeyboardState, VK_A, VK_C, VK_DELETE, VK_DOWN, VK_END, VK_ESCAPE, VK_HOME, VK_LEFT,
+        VK_RETURN, VK_RIGHT, VK_UP, VK_V, VK_X,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
-        GetClientRect, GetWindowRect, IsWindow, PM_QS_POSTMESSAGE, PM_REMOVE, PeekMessageW,
-        SendMessageW, WA_ACTIVE, WM_NULL, WM_QUIT,
+        GetClientRect, GetCursor, GetWindowRect, IsWindow, PM_QS_POSTMESSAGE, PM_REMOVE,
+        PeekMessageW, SendMessageW, WA_ACTIVE, WM_NULL, WM_QUIT,
     };
 
     use super::*;
     use crate::autostart;
     use crate::render::Frame;
     use crate::scratch::Scratch;
-    use crate::test_desktop::on_hidden_desktop;
+    use crate::test_desktop::{in_own_window_station, on_hidden_desktop};
     use std::path::Path;
 
     fn app(title: &str) -> Item {
@@ -1464,10 +1717,32 @@ mod tests {
 
         /// A mouse message for the point (x, y) in DIPs.
         pub(super) fn mouse(&self, message: u32, x: f32, y: f32) {
+            self.mouse_with(message, x, y, 0);
+        }
+
+        /// The same, with the keys `keys` (`MK_*`) held.
+        pub(super) fn mouse_with(&self, message: u32, x: f32, y: f32, keys: usize) {
             let scale = layout::scale(self.placement().dpi);
             let (x, y) = ((x * scale) as isize, (y * scale) as isize);
             let point = LPARAM(y << 16 | x);
-            unsafe { SendMessageW(self.0, message, Some(WPARAM(0)), Some(point)) };
+            unsafe { SendMessageW(self.0, message, Some(WPARAM(keys)), Some(point)) };
+        }
+
+        /// The left button down and up at (x, y) in DIPs.
+        pub(super) fn click(&self, x: f32, y: f32) {
+            self.mouse(WM_LBUTTONDOWN, x, y);
+            self.mouse(WM_LBUTTONUP, x, y);
+        }
+
+        /// The same in pixels of the frame, at the bar's middle.
+        fn click_pixel(&self, x: usize) {
+            let scale = layout::scale(self.placement().dpi);
+            self.click(x as f32 / scale, layout::BAR_HEIGHT / 2.0);
+        }
+
+        /// What is selected in the search bar.
+        fn selected(&self) -> String {
+            with_app(|app| app.query.selected().to_string()).expect("app state")
         }
 
         pub(super) fn post(&self, message: u32, wparam: usize) {
@@ -1527,8 +1802,17 @@ mod tests {
                 .expect("read the frame back")
         }
 
+        /// The first column of the caret, in pixels, on the bar's middle
+        /// row.
         pub(super) fn caret_x(&self) -> usize {
-            caret_x(&self.frame()).expect("a caret on screen")
+            let scale = layout::scale(self.placement().dpi);
+            let middle = (layout::BAR_HEIGHT / 2.0 * scale) as usize;
+            caret_x(&self.frame(), middle).expect("a caret on screen")
+        }
+
+        /// What the search bar holds.
+        pub(super) fn query(&self) -> String {
+            with_app(|app| app.query.text().to_string()).expect("app state")
         }
 
         /// A window attribute as DWM holds it, read back from DWM.
@@ -1555,9 +1839,8 @@ mod tests {
         layout::row_top(row) + layout::ROW_HEIGHT / 2.0
     }
 
-    /// The first column of the blue caret on the middle row.
-    fn caret_x(frame: &Frame) -> Option<usize> {
-        let y = frame.height / 2;
+    /// The first column of the blue caret on the row `y`.
+    fn caret_x(frame: &Frame, y: usize) -> Option<usize> {
         (0..frame.width).find(|&x| {
             let [blue, _, red, alpha] = frame.pixel(x, y);
             blue > 220 && red < 160 && alpha > 220
@@ -2185,6 +2468,118 @@ mod tests {
     }
 
     #[test]
+    fn the_arrows_home_and_end_move_the_caret_through_the_query() {
+        on_hidden_desktop(|| {
+            let launcher = Launcher::open();
+            let start = launcher.caret_x();
+            launcher.type_text("notepad");
+            let end = launcher.caret_x();
+            launcher.press(VK_LEFT);
+            let left = launcher.caret_x();
+            assert!(start < left && left < end, "{start} < {left} < {end}");
+            launcher.press(VK_HOME);
+            assert_eq!(launcher.caret_x(), start);
+            launcher.press(VK_RIGHT);
+            assert!(launcher.caret_x() > start);
+            launcher.press(VK_END);
+            assert_eq!(launcher.caret_x(), end);
+        });
+    }
+
+    #[test]
+    fn a_letter_typed_in_the_middle_goes_in_at_the_caret_and_searches() {
+        on_hidden_desktop(|| {
+            let launcher = Launcher::listing(&["Notepad", "Paint"]);
+            launcher.type_text("ntepad");
+            launcher.press(VK_HOME);
+            launcher.press(VK_RIGHT);
+            launcher.type_text("o");
+            assert_eq!(launcher.query(), "notepad");
+            launcher.pump_until(|app| titles(app) == ["Notepad"]);
+        });
+    }
+
+    #[test]
+    fn shift_selects_and_what_is_typed_takes_the_selections_place() {
+        on_hidden_desktop(|| {
+            let launcher = Launcher::open();
+            launcher.type_text("paint");
+            hold(&[VK_SHIFT]);
+            launcher.press(VK_HOME);
+            hold(&[]);
+            launcher.type_text("note");
+            assert_eq!(launcher.query(), "note");
+        });
+    }
+
+    #[test]
+    fn ctrl_a_selects_everything_and_delete_takes_it_out() {
+        on_hidden_desktop(|| {
+            let launcher = Launcher::listing(&["Notepad"]);
+            launcher.search_for("note", 1);
+            hold(&[VK_CONTROL]);
+            launcher.press(VK_A);
+            hold(&[]);
+            launcher.press(VK_DELETE);
+            assert_eq!(launcher.query(), "");
+            launcher.pump_until(|app| app.results.rows().is_empty());
+            let bar = launcher.placement().rect(0);
+            assert_eq!(launcher.rect(), bar);
+        });
+    }
+
+    #[test]
+    fn ctrl_c_with_text_selected_copies_the_text_and_keeps_it_open() {
+        on_hidden_desktop(|| {
+            let (launcher, ran) = Launcher::listing_with(&["Notepad"], None);
+            launcher.search_for("note", 1);
+            hold(&[VK_SHIFT]);
+            launcher.press(VK_LEFT);
+            launcher.press(VK_LEFT);
+            hold(&[VK_CONTROL]);
+            launcher.press(VK_C);
+            assert_eq!(*ran.borrow(), [(Action::CopyText("te".to_string()), false)]);
+            assert!(launcher.visible());
+            assert_eq!(launcher.query(), "note");
+        });
+    }
+
+    #[test]
+    fn ctrl_x_cuts_the_selection_to_the_clipboard_and_searches_again() {
+        on_hidden_desktop(|| {
+            let (launcher, ran) = Launcher::listing_with(&["Notepad", "Note"], None);
+            launcher.search_for("notepad", 1);
+            hold(&[VK_SHIFT, VK_CONTROL]);
+            launcher.press(VK_LEFT);
+            hold(&[VK_CONTROL]);
+            launcher.press(VK_X);
+            assert_eq!(
+                *ran.borrow(),
+                [(Action::CopyText("notepad".to_string()), false)]
+            );
+            assert_eq!(launcher.query(), "");
+            launcher.press(VK_X);
+            assert_eq!(ran.borrow().len(), 1, "nothing selected, nothing cut");
+        });
+    }
+
+    #[test]
+    fn ctrl_v_pastes_the_clipboards_text_as_one_line() {
+        let name = "window::tests::ctrl_v_pastes_the_clipboards_text_as_one_line";
+        in_own_window_station(name, || {
+            on_hidden_desktop(|| {
+                crate::clipboard::copy("pad\r\nplus\r\n").expect("copy");
+                let launcher = Launcher::listing(&["Notepad", "Paint"]);
+                launcher.type_text("note");
+                hold(&[VK_CONTROL]);
+                launcher.press(VK_V);
+                assert_eq!(launcher.query(), "notepad plus");
+                assert_eq!(crate::clipboard::text().as_deref(), Some("pad\r\nplus\r\n"));
+            });
+        });
+    }
+
+    #[test]
     fn the_message_loop_delivers_typing_and_stops_on_quit() {
         on_hidden_desktop(|| {
             let launcher = Launcher::open();
@@ -2420,9 +2815,129 @@ mod tests {
         on_hidden_desktop(|| {
             let (launcher, ran) = Launcher::listing_with(&["Notes", "Notepad"], None);
             launcher.type_text("note");
-            launcher.mouse(WM_LBUTTONUP, 200.0, middle_of(1));
+            launcher.click(200.0, middle_of(1));
             assert_eq!(*ran.borrow(), [opened("Notepad", false)]);
             assert!(!launcher.visible());
+        });
+    }
+
+    #[test]
+    fn letting_go_over_another_row_than_the_one_pressed_opens_nothing() {
+        on_hidden_desktop(|| {
+            let (launcher, ran) = Launcher::listing_with(&["Notes", "Notepad"], None);
+            launcher.type_text("note");
+            launcher.mouse(WM_LBUTTONDOWN, 200.0, middle_of(0));
+            launcher.mouse(WM_LBUTTONUP, 200.0, middle_of(1));
+            launcher.mouse(WM_LBUTTONUP, 200.0, middle_of(1));
+            assert!(ran.borrow().is_empty());
+            assert!(launcher.visible());
+        });
+    }
+
+    #[test]
+    fn a_click_in_the_query_puts_the_caret_where_it_was_clicked() {
+        on_hidden_desktop(|| {
+            let launcher = Launcher::open();
+            let start = launcher.caret_x();
+            launcher.type_text("notepad notes");
+            let end = launcher.caret_x();
+            let middle = (start + end) / 2;
+            launcher.click_pixel(middle);
+            let caret = launcher.caret_x();
+            assert!(
+                caret.abs_diff(middle) < 10,
+                "clicked {middle}, caret at {caret}"
+            );
+            launcher.click_pixel(1);
+            assert_eq!(launcher.caret_x(), caret, "the icon is not the query");
+            launcher.click_pixel(end + 100);
+            assert_eq!(launcher.caret_x(), end, "past the text is its end");
+        });
+    }
+
+    #[test]
+    fn dragging_across_the_query_selects_what_it_passes_over() {
+        on_hidden_desktop(|| {
+            let (launcher, ran) = Launcher::listing_with(&["Notepad"], None);
+            launcher.type_text("note");
+            let scale = layout::scale(launcher.placement().dpi);
+            let end = launcher.caret_x() as f32 / scale;
+            let middle = layout::BAR_HEIGHT / 2.0;
+            launcher.mouse(WM_LBUTTONDOWN, layout::TEXT_LEFT, middle);
+            launcher.mouse(WM_MOUSEMOVE, end + 30.0, middle);
+            assert_eq!(launcher.selected(), "note");
+            launcher.mouse(WM_MOUSEMOVE, 200.0, middle_of(0));
+            launcher.mouse(WM_LBUTTONUP, 200.0, middle_of(0));
+            assert!(
+                ran.borrow().is_empty(),
+                "letting go over a row opens nothing"
+            );
+            assert_eq!(launcher.selected(), "note");
+            launcher.mouse(WM_MOUSEMOVE, layout::TEXT_LEFT, middle);
+            assert_eq!(
+                launcher.selected(),
+                "note",
+                "the button is up: nothing changes"
+            );
+            launcher.type_text("x");
+            assert_eq!(launcher.query(), "x");
+        });
+    }
+
+    #[test]
+    fn a_shift_click_selects_from_the_caret_to_where_it_was_clicked() {
+        on_hidden_desktop(|| {
+            let launcher = Launcher::open();
+            launcher.type_text("notepad");
+            let end = launcher.caret_x();
+            launcher.press(VK_HOME);
+            let scale = layout::scale(launcher.placement().dpi);
+            let middle = layout::BAR_HEIGHT / 2.0;
+            launcher.mouse_with(
+                WM_LBUTTONDOWN,
+                end as f32 / scale + 5.0,
+                middle,
+                MOUSE_SHIFT,
+            );
+            launcher.mouse(WM_LBUTTONUP, end as f32 / scale + 5.0, middle);
+            assert_eq!(launcher.selected(), "notepad");
+        });
+    }
+
+    #[test]
+    fn the_pointer_is_an_i_beam_over_the_query_and_an_arrow_elsewhere() {
+        on_hidden_desktop(|| {
+            let launcher = Launcher::open();
+            let rect = launcher.rect();
+            let scale = layout::scale(launcher.placement().dpi);
+            let on = |x: f32| POINT {
+                x: rect.x + (x * scale) as i32,
+                y: rect.y + (layout::BAR_HEIGHT / 2.0 * scale) as i32,
+            };
+            let shape = |name| unsafe { LoadCursorW(None, name) }.expect("a system cursor");
+            set_cursor_over(launcher.0, on(200.0)).expect("set the pointer");
+            assert_eq!(unsafe { GetCursor() }, shape(IDC_IBEAM));
+            set_cursor_over(launcher.0, on(20.0)).expect("set the pointer");
+            assert_eq!(unsafe { GetCursor() }, shape(IDC_ARROW));
+        });
+    }
+
+    #[test]
+    fn a_double_click_selects_a_word_and_a_third_click_everything() {
+        on_hidden_desktop(|| {
+            let launcher = Launcher::open();
+            launcher.type_text("open notes");
+            let scale = layout::scale(launcher.placement().dpi);
+            let on_notes = (launcher.caret_x() as f32 - 10.0) / scale;
+            let middle = layout::BAR_HEIGHT / 2.0;
+            launcher.click(on_notes, middle);
+            launcher.mouse(WM_LBUTTONDBLCLK, on_notes, middle);
+            launcher.mouse(WM_LBUTTONUP, on_notes, middle);
+            assert_eq!(launcher.selected(), "notes");
+            launcher.click(on_notes, middle);
+            assert_eq!(launcher.selected(), "open notes");
+            launcher.click(on_notes, middle);
+            assert_eq!(launcher.selected(), "", "a fourth click places the caret");
         });
     }
 

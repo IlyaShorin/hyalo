@@ -4,7 +4,7 @@
 
 use hyalo_core::item::{Action, Item};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    VIRTUAL_KEY, VK_C, VK_DOWN, VK_ESCAPE, VK_RETURN, VK_UP,
+    VIRTUAL_KEY, VK_DOWN, VK_ESCAPE, VK_RETURN, VK_UP,
 };
 
 /// A key that does something besides typing.
@@ -19,7 +19,8 @@ pub enum Command {
     },
     /// Show the selected file or folder in its folder: Ctrl+Enter.
     Reveal,
-    /// Copy the selected file's or folder's full path: Ctrl+C.
+    /// Copy the selected file's or folder's full path: Ctrl+C with no
+    /// text selected in the bar (the field says which keys copy).
     Copy,
 }
 
@@ -31,14 +32,13 @@ pub struct Held {
 }
 
 /// The command `key` gives with `held` modifiers; `None` for keys that
-/// only type (those arrive again as characters).
+/// type (those arrive again as characters) or edit the query.
 pub fn command(key: VIRTUAL_KEY, held: Held) -> Option<Command> {
     match key {
         VK_ESCAPE => Some(Command::Hide),
         VK_UP => Some(Command::Up),
         VK_DOWN => Some(Command::Down),
         VK_RETURN => Some(enter(held)),
-        VK_C if held.ctrl => Some(Command::Copy),
         _ => None,
     }
 }
@@ -121,8 +121,9 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_c_copies_and_c_alone_types() {
-        assert_eq!(command(VK_C, CTRL), Some(Command::Copy));
+    fn ctrl_c_is_the_fields_to_decide() {
+        use windows::Win32::UI::Input::KeyboardAndMouse::VK_C;
+        assert_eq!(command(VK_C, CTRL), None);
         assert_eq!(command(VK_C, NONE), None);
     }
 

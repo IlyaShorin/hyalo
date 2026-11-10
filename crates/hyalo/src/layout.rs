@@ -1,4 +1,5 @@
-//! Where the launcher window goes on a monitor. Pure math, no Win32.
+//! Where the launcher window goes on a monitor, and what is where in it.
+//! Pure math, no Win32.
 
 /// A rectangle in physical pixels.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -17,6 +18,16 @@ pub const BAR_HEIGHT: f32 = 64.0;
 pub const ROW_HEIGHT: f32 = 48.0;
 /// Space above the first row and below the last, in DIPs.
 const LIST_PADDING: f32 = 8.0;
+/// Where the query, the titles and the subtitles start, and the room
+/// right of them, in DIPs.
+pub const TEXT_LEFT: f32 = 56.0;
+pub const TEXT_RIGHT_PAD: f32 = 20.0;
+/// How far left of where the query starts a click still places the
+/// caret, in DIPs.
+const TEXT_GRASP: f32 = 8.0;
+/// The band round the launcher's edge that is its glass alone, in DIPs:
+/// as wide as the room beside a selected row.
+const EDGE: f32 = 6.0;
 /// The launcher never takes more than this share of the monitor width.
 const MAX_WIDTH_SHARE: f32 = 0.9;
 /// The top edge sits this far down the work area.
@@ -59,6 +70,32 @@ pub fn row_at(y: f32, rows: usize) -> Option<usize> {
     }
     let row = (below_the_bar / ROW_HEIGHT) as usize;
     (row < rows).then_some(row)
+}
+
+/// What a point of the launcher is on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Part {
+    /// The query: a click places the caret.
+    Text,
+    /// A row of the list: a click opens it.
+    Row(usize),
+    /// The glass around them: the search icon, the room beside the query,
+    /// the padding round the list, the edges.
+    Glass,
+}
+
+/// What the point (x, y), in DIPs, of a launcher `width` DIPs wide that
+/// lists `rows` rows is on.
+pub fn part_at(x: f32, y: f32, width: f32, rows: usize) -> Part {
+    let inside = (EDGE..width - EDGE).contains(&x) && (EDGE..height(rows) - EDGE).contains(&y);
+    let text =
+        (TEXT_LEFT - TEXT_GRASP..width - TEXT_RIGHT_PAD).contains(&x) && y < BAR_HEIGHT - EDGE;
+    match row_at(y, rows) {
+        _ if !inside => Part::Glass,
+        _ if text => Part::Text,
+        Some(row) => Part::Row(row),
+        None => Part::Glass,
+    }
 }
 
 /// The settings window's size, frame included, in DIPs, and the least
@@ -198,6 +235,47 @@ mod tests {
             assert_eq!(row_at(y, 3), None, "{y}");
         }
         assert_eq!(row_at(80.0, 0), None);
+    }
+
+    #[test]
+    fn the_query_takes_the_bar_from_just_before_its_text_to_its_right_room() {
+        for x in [48.0, 56.0, 300.0, 699.9] {
+            assert_eq!(part_at(x, 32.0, 720.0, 0), Part::Text, "{x}");
+        }
+        for x in [7.0, 30.0, 47.9, 700.0, 713.9] {
+            assert_eq!(part_at(x, 32.0, 720.0, 0), Part::Glass, "{x}");
+        }
+    }
+
+    #[test]
+    fn the_edges_are_glass_all_round() {
+        for (x, y) in [(5.9, 32.0), (714.0, 32.0), (300.0, 5.9), (300.0, 58.0)] {
+            assert_eq!(part_at(x, y, 720.0, 0), Part::Glass, "{x}, {y}");
+        }
+        assert_eq!(part_at(300.0, 6.0, 720.0, 0), Part::Text);
+        assert_eq!(part_at(300.0, 57.9, 720.0, 0), Part::Text);
+    }
+
+    #[test]
+    fn rows_take_the_list_but_its_padding_and_edges() {
+        assert_eq!(part_at(200.0, 72.0, 720.0, 3), Part::Row(0));
+        assert_eq!(part_at(200.0, 150.0, 720.0, 3), Part::Row(1));
+        assert_eq!(part_at(6.0, 150.0, 720.0, 3), Part::Row(1));
+        assert_eq!(part_at(713.9, 215.9, 720.0, 3), Part::Row(2));
+        for (x, y) in [
+            (200.0, 60.0),
+            (200.0, 71.9),
+            (200.0, 216.0),
+            (5.9, 150.0),
+            (714.0, 150.0),
+        ] {
+            assert_eq!(part_at(x, y, 720.0, 3), Part::Glass, "{x}, {y}");
+        }
+        assert_eq!(
+            part_at(300.0, 57.9, 720.0, 3),
+            Part::Text,
+            "the bar keeps its text"
+        );
     }
 
     #[test]

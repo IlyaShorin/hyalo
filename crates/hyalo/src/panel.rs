@@ -12,8 +12,8 @@ use std::collections::HashMap;
 use hyalo_core::config::{Change, List, Problem, Written};
 use windows::Win32::UI::Input::KeyboardAndMouse::{VK_ESCAPE, VK_RETURN, VK_SPACE, VK_TAB};
 
+use crate::field::Field;
 use crate::page::{self, Button, Card, Control, Laid, Page, Section, Strip, Target};
-use crate::query::Query;
 use crate::recorder::{Heard, Mods, Recorder};
 
 /// What the window must do.
@@ -71,7 +71,7 @@ pub struct Panel {
     starts: Option<bool>,
     recorder: Recorder,
     /// What is typed in each list's name field.
-    names: HashMap<List, Query>,
+    names: HashMap<List, Field>,
     /// What went wrong with the last change, and where it shows.
     note: Option<(Spot, String)>,
     focus: Option<Target>,

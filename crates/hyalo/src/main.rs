@@ -4,7 +4,9 @@
 mod apps;
 mod autostart;
 mod catalog;
+mod clipboard;
 mod com;
+mod field;
 mod files;
 mod highlight;
 mod hotkeys;
@@ -18,7 +20,6 @@ mod page;
 mod paint;
 mod panel;
 mod picker;
-mod query;
 mod rates;
 mod recorder;
 mod render;
