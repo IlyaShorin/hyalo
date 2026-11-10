@@ -3,12 +3,16 @@
 //! held and shows the running launcher instead.
 //!
 //! The mutex is created owned, and its owner holds it until the process
-//! ends, so a new build that replaces a running one can wait on the
-//! handle `Taken` keeps: the wait ends, with the mutex its own, when the
-//! old process exits.
+//! ends, so a new build that replaces a running one (`--replace`) waits
+//! on the handle `Taken` keeps: the wait ends, with the mutex its own,
+//! when the old process exits.
 
-use windows::Win32::Foundation::{CloseHandle, ERROR_ALREADY_EXISTS, GetLastError, HANDLE};
-use windows::Win32::System::Threading::{CreateMutexW, ReleaseMutex};
+use std::time::Duration;
+
+use windows::Win32::Foundation::{
+    CloseHandle, ERROR_ALREADY_EXISTS, GetLastError, HANDLE, WAIT_ABANDONED, WAIT_OBJECT_0,
+};
+use windows::Win32::System::Threading::{CreateMutexW, ReleaseMutex, WaitForSingleObject};
 use windows::core::{HSTRING, Result};
 
 use crate::autostart;
@@ -58,20 +62,40 @@ impl Start {
 /// The argument that opens the settings window.
 pub const SETTINGS: &str = "--settings";
 
+/// The argument an update starts the new build with: it waits for the
+/// launcher it replaces to end, then runs in its place.
+pub const REPLACE: &str = "--replace";
+
+/// Whether the command line's arguments ask this start to replace the
+/// launcher that runs.
+pub fn replacing(arguments: &[String]) -> bool {
+    arguments.iter().any(|argument| argument == REPLACE)
+}
+
+/// How long a start that replaces the launcher waits for it to end: it
+/// ends as soon as it has started the new build, but saving the picks
+/// and closing the window take a moment on a busy machine.
+pub const REPLACE_WAIT: Duration = Duration::from_secs(60);
+
 /// Runs the launcher if this is the first start: `run`, told how to
-/// start, holds the mutex `name` until it returns. A later start calls
-/// `ask` instead, to have the running launcher show or open its
-/// settings, unless it was to start hidden: a start with Windows has
-/// nothing to ask.
+/// start, holds the mutex `name` until it returns. A start that replaces
+/// the launcher waits up to `replace` for that one to end, then runs; it
+/// gives up when it does not. A later start calls `ask` instead, to have
+/// the running launcher show or open its settings, unless it was to start
+/// hidden: a start with Windows has nothing to ask.
 pub fn first(
     name: &str,
     start: Start,
+    replace: Option<Duration>,
     run: impl FnOnce(Start) -> Result<()>,
     ask: impl FnOnce(Start),
 ) -> Result<()> {
     match claim(name)? {
         Claim::Ours(_launcher) => run(start),
-        // A build replacing the running one would wait on it here.
+        Claim::Taken(running) if let Some(wait) = replace => match running.wait(wait) {
+            Some(_launcher) => run(start),
+            None => Ok(()),
+        },
         Claim::Taken(_running) if start != Start::Hidden => {
             ask(start);
             Ok(())
@@ -95,6 +119,25 @@ pub fn claim(name: &str) -> Result<Claim> {
     }
 }
 
+impl Taken {
+    /// Waits up to `wait` for the process that holds the mutex to let it
+    /// go or to end: the mutex is then this thread's. `None` when it was
+    /// still held after `wait`.
+    pub fn wait(self, wait: Duration) -> Option<Instance> {
+        let millis = u32::try_from(wait.as_millis()).unwrap_or(u32::MAX);
+        // SAFETY: the handle is ours and open; a mutex whose owner ended
+        // without letting go is had all the same (WAIT_ABANDONED).
+        let waited = unsafe { WaitForSingleObject(self.0, millis) };
+        if waited != WAIT_OBJECT_0 && waited != WAIT_ABANDONED {
+            return None;
+        }
+        // The handle moves to the instance, which closes it once.
+        let handle = self.0;
+        std::mem::forget(self);
+        Some(Instance(handle))
+    }
+}
+
 impl Drop for Instance {
     fn drop(&mut self) {
         // SAFETY: the handle is ours and owned by this thread; closed once.
@@ -115,6 +158,7 @@ impl Drop for Taken {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::thread::JoinHandle;
 
     fn name(test: &str) -> String {
         format!(r"Local\hyalo-test-{}-{test}", std::process::id())
@@ -149,7 +193,7 @@ mod tests {
             ran.set(Some(start));
             Ok(())
         };
-        first(name, start, run, |start| asked.set(Some(start))).expect("started");
+        first(name, start, None, run, |start| asked.set(Some(start))).expect("started");
         (ran.get(), asked.get())
     }
 
@@ -202,7 +246,7 @@ mod tests {
             assert!(!ours(&claim(&name).expect("claim")), "held while running");
             Ok(())
         };
-        first(&name, Start::Shown, run, |_| {}).expect("started");
+        first(&name, Start::Shown, None, run, |_| {}).expect("started");
         assert!(ours(&claim(&name).expect("claim")), "free once it returned");
     }
 
@@ -238,6 +282,89 @@ mod tests {
         go.send(()).expect("let it end");
         launcher.join().expect("the launcher");
         assert!(had(&taken, 5_000), "had once it ended");
+    }
+
+    /// A launcher on a thread of its own that holds the mutex `name`
+    /// until the test lets it end, `released` or not.
+    fn running(name: &str, released: bool) -> (std::sync::mpsc::Sender<()>, JoinHandle<()>) {
+        let (claimed, ready) = std::sync::mpsc::channel();
+        let (go, gone) = std::sync::mpsc::channel::<()>();
+        let name = name.to_string();
+        let launcher = std::thread::spawn(move || {
+            let ours = claim(&name).expect("claim");
+            claimed.send(()).expect("say so");
+            let _ = gone.recv();
+            match released {
+                true => drop(ours),
+                // The thread ends owning it: the mutex is abandoned.
+                false => std::mem::forget(ours),
+            }
+        });
+        ready.recv().expect("claimed");
+        (go, launcher)
+    }
+
+    #[test]
+    fn a_start_that_replaces_the_launcher_runs_once_that_one_has_ended() {
+        let name = name("replace");
+        let (go, launcher) = running(&name, true);
+        let ending = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            go.send(()).expect("let it end");
+        });
+        let began = std::time::Instant::now();
+        let ran = std::cell::Cell::new(None);
+        let run = |start| {
+            let elsewhere = name.clone();
+            let held = std::thread::spawn(move || !ours(&claim(&elsewhere).expect("claim")));
+            assert!(held.join().expect("the thread"), "held by the new launcher");
+            ran.set(Some(start));
+            Ok(())
+        };
+        let wait = Some(std::time::Duration::from_secs(5));
+        first(&name, Start::Hidden, wait, run, |_| panic!("asked")).expect("started");
+        assert_eq!(ran.get(), Some(Start::Hidden));
+        assert!(began.elapsed() >= std::time::Duration::from_millis(90));
+        ending.join().expect("ended");
+        launcher.join().expect("the launcher");
+        assert!(ours(&claim(&name).expect("claim")), "free once it returned");
+    }
+
+    #[test]
+    fn a_launcher_that_ended_without_letting_go_is_replaced_too() {
+        let name = name("abandoned");
+        let (go, launcher) = running(&name, false);
+        go.send(()).expect("let it end");
+        launcher.join().expect("the launcher");
+        let Claim::Taken(taken) = claim(&name).expect("claim") else {
+            panic!("abandoned, not gone");
+        };
+        assert!(taken.wait(std::time::Duration::from_secs(5)).is_some());
+    }
+
+    #[test]
+    fn a_start_that_replaces_gives_up_when_the_launcher_does_not_end() {
+        let name = name("stays");
+        let (go, launcher) = running(&name, true);
+        let ran = std::cell::Cell::new(false);
+        let run = |_| {
+            ran.set(true);
+            Ok(())
+        };
+        let wait = Some(std::time::Duration::from_millis(50));
+        first(&name, Start::Hidden, wait, run, |_| panic!("asked")).expect("gave up");
+        assert!(!ran.get());
+        go.send(()).expect("let it end");
+        launcher.join().expect("the launcher");
+    }
+
+    #[test]
+    fn the_command_line_says_whether_to_replace_the_launcher() {
+        let update = arguments(&["hyalo.exe", "--hidden", "--replace"]);
+        assert!(replacing(&update));
+        assert_eq!(Start::from_args(update), Start::Hidden);
+        assert!(!replacing(&arguments(&["hyalo.exe", "--hidden"])));
+        assert!(!replacing(&arguments(&["hyalo.exe", "--replaced"])));
     }
 
     #[test]

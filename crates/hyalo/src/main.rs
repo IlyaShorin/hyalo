@@ -44,9 +44,13 @@ use windows::Win32::UI::HiDpi::{
 /// One launcher per session: the first start runs it, shown, in the tray
 /// (started with Windows) or with its settings open (`--settings`); a
 /// second start asks the first to show or to open its settings, and goes.
+/// A start with `--replace` waits for the launcher that runs to end, then
+/// runs in its place.
 fn main() -> windows::core::Result<()> {
-    let start = instance::Start::from_args(std::env::args());
-    instance::first(instance::NAME, start, run, window::ask_running)
+    let arguments: Vec<String> = std::env::args().collect();
+    let start = instance::Start::from_args(arguments.clone());
+    let wait = instance::replacing(&arguments).then_some(instance::REPLACE_WAIT);
+    instance::first(instance::NAME, start, wait, run, window::ask_running)
 }
 
 fn run(start: instance::Start) -> windows::core::Result<()> {
