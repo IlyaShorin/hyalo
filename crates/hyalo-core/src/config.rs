@@ -11,6 +11,10 @@ use toml::Spanned;
 use crate::hotkey::Hotkey;
 use crate::places::{self, Place};
 
+mod edit;
+
+pub use edit::{Change, Refusal, edit};
+
 /// What the file holds when hyalo writes it the first time: every
 /// setting at its default, with a word on each.
 pub const DEFAULT: &str = r#"# hyalo's settings. Saved changes apply at once; a mistake keeps the last
@@ -53,14 +57,75 @@ pub struct Config {
 
 impl Default for Config {
     fn default() -> Self {
-        let place = |text: &str| Place::parse(text).expect("a built-in place");
+        let place = |text: &&str| Place::parse(text).expect("a built-in place");
+        let strings = |list: List| list.defaults().iter().map(|text| text.to_string());
+        let places = |list: List| list.defaults().iter().map(place).collect();
         Config {
             hotkey: Hotkey::default(),
-            exclude: vec![r"C:\Windows\WinSxS".to_string()],
-            rank_lower: vec![place("target")],
-            rank_higher: Vec::new(),
+            exclude: strings(List::Exclude).collect(),
+            rank_lower: places(List::RankLower),
+            rank_higher: places(List::RankHigher),
         }
     }
+}
+
+/// A list of folders in `[folders]`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum List {
+    Exclude,
+    RankLower,
+    RankHigher,
+}
+
+impl List {
+    /// Every list, in the order the file has them.
+    pub const ALL: [List; 3] = [List::Exclude, List::RankLower, List::RankHigher];
+
+    /// Its key in `[folders]`.
+    pub fn key(self) -> &'static str {
+        match self {
+            List::Exclude => "exclude",
+            List::RankLower => "rank_lower",
+            List::RankHigher => "rank_higher",
+        }
+    }
+
+    /// What it holds when the file leaves it out.
+    pub fn defaults(self) -> &'static [&'static str] {
+        match self {
+            List::Exclude => &[r"C:\Windows\WinSxS"],
+            List::RankLower => &["target"],
+            List::RankHigher => &[],
+        }
+    }
+
+    fn index(self) -> usize {
+        self as usize
+    }
+}
+
+/// The settings as the file writes them, for showing and changing them:
+/// the hotkey, and each list's entries as they are written.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Written {
+    pub hotkey: Hotkey,
+    lists: [Vec<String>; 3],
+}
+
+impl Written {
+    /// The entries of `list`, as written.
+    pub fn list(&self, list: List) -> &[String] {
+        &self.lists[list.index()]
+    }
+}
+
+/// The settings `text` writes, if it holds good settings.
+pub fn written(text: &str) -> Result<Written, Problem> {
+    let (config, lists) = read(text)?;
+    Ok(Written {
+        hotkey: config.hotkey,
+        lists,
+    })
 }
 
 /// What is wrong with a config, and where.
@@ -80,16 +145,37 @@ impl fmt::Display for Problem {
 /// The settings `text` gives: a setting left out keeps its default; an
 /// unknown one is a problem, so a typo does not go unseen.
 pub fn parse(text: &str) -> Result<Config, Problem> {
+    read(text).map(|(config, _)| config)
+}
+
+/// The settings `text` gives, and each list's entries as written.
+fn read(text: &str) -> Result<(Config, [Vec<String>; 3]), Problem> {
     let file: File = toml::from_str(text).map_err(|error| unreadable(text, &error))?;
     let folders = file.folders.unwrap_or_default();
+    let lists = [&folders.exclude, &folders.rank_lower, &folders.rank_higher];
+    let written = List::ALL.map(|list| as_written(lists[list.index()].as_deref(), list));
     let defaults = Config::default();
     let at = Lines(text);
-    Ok(Config {
+    let config = Config {
         hotkey: at.one(file.hotkey, defaults.hotkey, Hotkey::parse)?,
         exclude: at.each(folders.exclude, defaults.exclude, excluded)?,
         rank_lower: at.each(folders.rank_lower, defaults.rank_lower, place)?,
         rank_higher: at.each(folders.rank_higher, defaults.rank_higher, place)?,
-    })
+    };
+    Ok((config, written))
+}
+
+/// A list's entries as the file writes them, or its defaults when the
+/// file leaves it out.
+fn as_written(values: Option<&[Spanned<String>]>, list: List) -> Vec<String> {
+    match values {
+        Some(values) => values.iter().map(|value| value.get_ref().clone()).collect(),
+        None => list
+            .defaults()
+            .iter()
+            .map(|text| text.to_string())
+            .collect(),
+    }
 }
 
 /// The file as TOML has it; every value keeps where it was written.
@@ -322,6 +408,59 @@ rank_higher = ['notes']
             message: "`Kay` is not a key hyalo knows".to_string(),
         };
         assert_eq!(found.to_string(), "line 3: `Kay` is not a key hyalo knows");
+    }
+
+    fn entries(written: &Written, list: List) -> Vec<&str> {
+        written.list(list).iter().map(String::as_str).collect()
+    }
+
+    #[test]
+    fn the_lists_go_by_their_keys_in_folders() {
+        let keys = List::ALL.map(List::key);
+        assert_eq!(keys, ["exclude", "rank_lower", "rank_higher"]);
+    }
+
+    #[test]
+    fn the_file_written_at_first_is_written_as_the_defaults() {
+        let written = written(DEFAULT).expect("the default file");
+        assert_eq!(written.hotkey, Hotkey::default());
+        assert_eq!(entries(&written, List::Exclude), [r"C:\Windows\WinSxS"]);
+        assert_eq!(entries(&written, List::RankLower), ["target"]);
+        assert!(entries(&written, List::RankHigher).is_empty());
+        for list in List::ALL {
+            assert_eq!(entries(&written, list), list.defaults());
+        }
+    }
+
+    #[test]
+    fn a_list_left_out_is_written_as_its_defaults() {
+        let written = written("hotkey = 'F4'\n").expect("a config");
+        assert_eq!(written.hotkey.to_string(), "F4");
+        for list in List::ALL {
+            assert_eq!(entries(&written, list), list.defaults());
+        }
+    }
+
+    #[test]
+    fn entries_are_kept_as_the_file_writes_them() {
+        let text = "[folders]\nexclude = [' c:/Windows/WinSxS/ ']\nrank_lower = ['Vendor', 'D:\\Archive']\nrank_higher = []\n";
+        let written = written(text).expect("a config");
+        assert_eq!(entries(&written, List::Exclude), [" c:/Windows/WinSxS/ "]);
+        assert_eq!(
+            entries(&written, List::RankLower),
+            ["Vendor", r"D:\Archive"]
+        );
+        assert!(entries(&written, List::RankHigher).is_empty());
+    }
+
+    #[test]
+    fn a_broken_file_has_nothing_written_but_its_problem() {
+        let found = written("\n\nhotkey = 5\n").expect_err("a problem");
+        assert_eq!(found.line, 3);
+        assert_eq!(
+            written("[folders]\nexclude = ['x']\n").map(|_| ()),
+            Err(problem("[folders]\nexclude = ['x']\n"))
+        );
     }
 
     #[test]
