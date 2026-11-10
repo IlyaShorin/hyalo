@@ -4,7 +4,7 @@ A fast, glassy Spotlight-style launcher for Windows 11. Press a hotkey, type a f
 
 *hyalo* comes from Greek ὕαλος, "glass".
 
-> **Status:** early prototype: finds and opens apps, files and folders, answers arithmetic, converts currencies; lives in the tray, with a TOML config applied as you save it. Nothing to install yet.
+> **Status:** early prototype: finds and opens apps, files and folders, answers arithmetic, converts currencies; lives in the tray, with a TOML config applied as you save it and a settings window that edits it. Nothing to install yet.
 
 ## Goals
 
@@ -62,9 +62,9 @@ cargo run -p hyalo
 What the prototype does:
 
 - Alt+Space (or the hotkey the config names) shows or hides the glass search bar; it also hides when it loses focus. Starting hyalo again shows the one that runs: there is only ever one.
-- hyalo sits in the notification area with a glass lens for an icon (new icons start in the overflow behind `^`; drag it onto the taskbar to keep it in sight). A click on it shows or hides the launcher; a right click opens a menu: Show hyalo (with its hotkey), Settings (opens `config.toml` in the app Windows has for `.toml`, or Notepad), Start with Windows, Exit. Exit is how to quit: it takes the icon away and saves the picks.
+- hyalo sits in the notification area with a glass lens for an icon (new icons start in the overflow behind `^`; drag it onto the taskbar to keep it in sight). A click on it shows or hides the launcher; a right click opens a menu: Show hyalo (with its hotkey), Settings (opens the settings window), Start with Windows, Exit. Exit is how to quit: it takes the icon away and saves the picks.
 - Start with Windows writes the `hyalo` value under `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`, naming this `hyalo.exe` with `--hidden`, so it starts in the tray without showing the launcher. Windows' own switch (Settings > Apps > Startup) is respected: switched off there, the menu shows it unchecked; checking it in the menu switches it back on. It is off until you turn it on, and a debug build never offers it.
-- The settings live in `%APPDATA%\hyalo\config.toml`, written with every setting at its default and a comment on each the first time hyalo starts. Saved changes apply at once, no restart. A mistake (a typo in a name, a key hyalo does not know, a path in double quotes with its backslashes read as escapes) keeps the settings in force and is shown, with its line, under the empty search bar and in the tray icon's tooltip; Enter on that row opens the file. A hotkey Windows refuses, because another app holds it, is shown the same way, and the one before keeps working. The settings:
+- The settings live in `%APPDATA%\hyalo\config.toml`, written with every setting at its default and a comment on each the first time hyalo starts. Saved changes apply at once, no restart. A mistake (a typo in a name, a key hyalo does not know, a path in double quotes with its backslashes read as escapes) keeps the settings in force and is shown, with its line, under the empty search bar and in the tray icon's tooltip; Enter on that row opens the settings window, which shows the problem. A hotkey Windows refuses, because another app holds it, is shown the same way, and the one before keeps working. The settings:
 
   | Setting | Default | What it does |
   |---|---|---|
@@ -74,6 +74,8 @@ What the prototype does:
   | `[folders] rank_higher` | `[]` | Folders whose files rank higher, besides Desktop, Documents, Downloads and the project folders: a name or a full path |
 
   Why these defaults, from the index of a real machine (1 963 824 names): `WinSxS` held 267 639 of them, a seventh, every copy of every system file an update brought; `notepad.exe` listed nine copies that scored the same as `C:\Windows\notepad.exe`. Cargo's and Maven's build output lives in `target` folders; hyalo's own `target\llvm-cov-target\...\incremental` folders scored like real ones for `hyalo`. Write paths in single quotes, so that backslashes stay as they are.
+- The settings window (Settings in the tray menu, Enter on a notice, or `hyalo.exe --settings`, which opens it in the hyalo that runs) shows every setting of `config.toml` and changes it, dark over Mica: the hotkey (click the field and press the keys; a bare F1 to F24 will do, Esc keeps the one you have, and one Windows refuses is said so in place and never written), Start with Windows (a switch; a debug build has none), and the three lists of folders, each entry with a × to take it out, Add folder… for the system's folder picker, and for the two lists that rank, a field for a bare folder name such as `target`. Tab and Shift+Tab move a visible ring from control to control, Space and Enter use it, Esc closes the window, the wheel scrolls it when it is too short. There is only ever one: opening it again brings it forward.
+- There is no Save button: each change is written to `config.toml` at once, into the text on disk as it is at that moment, and only the value that changed: your comments, the order of the settings and the way you lay out the lists stay as they are (an entry is written in single quotes, on a line of its own in a list written one entry per line). The file is replaced whole, through a temporary file beside it, so hyalo never reads half of one. The file stays the one place the settings live: what you save in a text editor shows up in the open window, and what you are typing in one of its fields stays. While the file does not read (half-edited in Notepad, say), the window says what is wrong and where, changes nothing, and offers Open config.toml.
 - Typing lists up to eight matching apps (Start Menu desktop apps and Store apps, from `shell:AppsFolder`) with their icons, the matched letters highlighted. `ё` and `е` count as the same letter.
 - Arithmetic gets its answer as the first row: `+ - * /`, `^`, parentheses, `sqrt`, `round`, `abs`, decimals with a point or a comma (`2,5*3` answers `7,5`). `%` is per cent (`200+10%` is 220) unless an operand follows it (`7%3` is 1). Enter copies the answer.
 - Currencies convert the same way, at the Bank of Russia's official rates: `100 usd` answers in roubles (`8 275.36 ₽`), `400 rub` in dollars, and `in` or `в` names another target (`10 usd in eur`, `10$ в евро`). The amount and the currency go either way round, with or without a space, in any case: any code the bank publishes, a sign (`$ € ₽ £ ₸ ₺ ₴ ₹`; not `¥`, which is the yen and the yuan alike) or a word for the rouble, dollar, euro or yuan (`руб`, `долларов`, `евро`, `юаней`). A code or word typed in the wrong layout works too (`100 гыв`), and the amount may be arithmetic (`(100+50) usd`). Results have two decimals, more when small (`0.0121 $`); the second line names the rates' date. Enter copies the result.
@@ -102,14 +104,15 @@ The icon is drawn by a script, each size on its own; it writes `crates/hyalo/ass
 powershell -ExecutionPolicy Bypass -File scripts/icon.ps1
 ```
 
-To check the look, run the launcher and capture it over bright colour stripes:
+To check the look, run the launcher and capture it over bright colour stripes; the script shows it by starting `hyalo.exe` again, so it works whatever the hotkey:
 
 ```sh
 powershell -ExecutionPolicy Bypass -File scripts/snap.ps1 -Stripes                   # writes target/snap.png
 powershell -ExecutionPolicy Bypass -File scripts/snap.ps1 -Stripes -Type "no{DOWN}"   # types first, shows the list
+powershell -ExecutionPolicy Bypass -File scripts/snap.ps1 -Settings                  # opens and captures the settings window
 ```
 
-Rendering tests compare frames, pixel by pixel, with reference images in `crates/hyalo/reference`. A failing test writes what it saw to `target/frames`. After a deliberate change to the look, check the new frames by eye, then accept them:
+Rendering tests compare frames, pixel by pixel, with reference images in `crates/hyalo/reference`. A failing test writes what it saw to `target/frames`. The images keep the frames' premultiplied colours, which a viewer shows too dark; `scripts/frames.ps1 -Files a.png,b.png` writes them over a dark backdrop to `target/look` for looking. After a deliberate change to the look, check the new frames by eye, then accept them:
 
 ```sh
 HYALO_BLESS=1 cargo test -p hyalo
