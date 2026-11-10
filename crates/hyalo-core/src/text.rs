@@ -120,6 +120,10 @@ table! {
     /// The second line of an app that has no path to show.
     App => "App", "Приложение";
     Calculator => "Calculator · Enter to copy", "Калькулятор · Enter — скопировать";
+    /// The second line of a page of Windows' Settings app.
+    WindowsSettings => "Settings", "Параметры Windows";
+    /// The second line of a Control Panel item.
+    ControlPanel => "Control Panel", "Панель управления";
     /// An amount, its currency, the target, the rates' date.
     Currency => "{0} {1} → {2} · Bank of Russia, {3} · Enter to copy",
         "{0} {1} → {2} · Банк России, {3} · Enter — скопировать";

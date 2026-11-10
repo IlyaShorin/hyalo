@@ -35,6 +35,9 @@ pub enum Kind {
     File,
     Folder,
     Calculator,
+    /// One of Windows' own settings: a page of the Settings app or a
+    /// Control Panel item.
+    Setting,
     /// What hyalo tells the user, such as a mistake in the config: never
     /// ranked, never remembered as a pick.
     Notice,
@@ -45,6 +48,9 @@ pub enum Action {
     /// Hand the target to the shell: a path, or a `shell:AppsFolder\…` URI
     /// for a Store app.
     Open(String),
+    /// Start `program` with `arguments`, such as
+    /// `rundll32.exe sysdm.cpl,EditEnvironmentVariables`.
+    Launch { program: String, arguments: String },
     /// Open the folder a file or folder is in, with it selected.
     Reveal(String),
     /// Put the text on the clipboard, such as a calculator answer.

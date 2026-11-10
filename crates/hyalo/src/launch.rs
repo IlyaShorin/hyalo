@@ -24,6 +24,7 @@ use crate::com::Com;
 pub fn run(action: &Action, as_admin: bool) -> Result<()> {
     match action {
         Action::Open(target) => open(target, as_admin),
+        Action::Launch { program, arguments } => execute(program, Some(arguments), verb(as_admin)),
         Action::Reveal(path) => reveal(path),
         Action::CopyText(text) => copy(text),
         Action::Edit(path) => edit(path),
@@ -93,11 +94,15 @@ fn reveal(path: &str) -> Result<()> {
 /// until the shell has started it, so call it off the UI thread. Errors
 /// come back instead of a message box.
 fn open(target: &str, as_admin: bool) -> Result<()> {
-    let verb = match as_admin {
+    execute(target, None, verb(as_admin))
+}
+
+/// The verb that opens as administrator, or the usual one.
+fn verb(as_admin: bool) -> PCWSTR {
+    match as_admin {
         true => w!("runas"),
         false => PCWSTR::null(),
-    };
-    execute(target, None, verb)
+    }
 }
 
 /// Has the shell carry out `verb` (none: the usual one) on `file`, with

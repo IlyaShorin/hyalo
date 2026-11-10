@@ -13,5 +13,6 @@ pub mod matcher;
 pub mod places;
 pub mod rank;
 pub mod rates;
+pub mod system_settings;
 pub mod text;
 pub mod update;
