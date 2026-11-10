@@ -101,7 +101,8 @@ impl Drop for Watch {
 }
 
 /// Follows `root` until told to stop, opening it again whenever the watch
-/// breaks; every opening but a first one that worked says `Lost`. `set`
+/// breaks; every opening but a first one that worked says `Lost`, once
+/// its first read waits, so the walk that follows misses nothing. `set`
 /// is dropped once the first read waits for changes, or the first try
 /// failed.
 fn watch(
@@ -113,19 +114,25 @@ fn watch(
 ) {
     let top = root_name(root);
     let mut buffer = vec![0_u64; room.div_ceil(8)];
-    let (mut lost, mut set) = (false, Some(set));
+    let mut owed = Owed {
+        set: Some(set),
+        lost: false,
+    };
     while !stop.load(Ordering::SeqCst) {
         let Ok(directory) = Directory::open(root) else {
-            (lost, set) = (true, None);
+            owed = Owed {
+                set: None,
+                lost: true,
+            };
             thread::sleep(PATIENCE);
             continue;
         };
-        if lost && !tell(Event::Lost) {
-            return;
-        }
-        lost = true;
-        let ended = directory.follow(&top, &mut buffer, tell, stop, &mut set);
-        set = None;
+        let ended = directory.follow(&top, &mut buffer, tell, stop, &mut owed);
+        // Whatever opens it again has lost track of what changed between.
+        owed = Owed {
+            set: None,
+            lost: true,
+        };
         match ended {
             Ended::Broken => thread::sleep(PATIENCE),
             Ended::Stopped => return,
@@ -138,6 +145,13 @@ fn watch(
             }
         }
     }
+}
+
+/// What a watch owes once a read waits for changes: telling `start` it
+/// is set, and telling the provider it lost track.
+struct Owed {
+    set: Option<Sender<()>>,
+    lost: bool,
 }
 
 /// How following a directory ended.
@@ -191,12 +205,12 @@ impl Directory {
         buffer: &mut [u64],
         tell: &dyn Fn(Event) -> bool,
         stop: &AtomicBool,
-        set: &mut Option<Sender<()>>,
+        owed: &mut Owed,
     ) -> Ended {
         let mut worked = false;
         // Before every read: on a busy drive the wait never times out.
         while !stop.load(Ordering::SeqCst) {
-            match self.read(top, buffer, tell, stop, set) {
+            match self.read(top, buffer, tell, stop, owed) {
                 Ok(()) => {
                     worked = true;
                     thread::sleep(GATHER);
@@ -216,7 +230,7 @@ impl Directory {
         buffer: &mut [u64],
         tell: &dyn Fn(Event) -> bool,
         stop: &AtomicBool,
-        set: &mut Option<Sender<()>>,
+        owed: &mut Owed,
     ) -> Result<(), Ended> {
         let mut overlapped = OVERLAPPED {
             hEvent: self.event,
@@ -239,7 +253,11 @@ impl Directory {
             )
         };
         read.map_err(|_| Ended::Refused)?;
-        *set = None;
+        owed.set = None;
+        if std::mem::take(&mut owed.lost) && !tell(Event::Lost) {
+            self.cancel(&raw const overlapped);
+            return Err(Ended::Stopped);
+        }
         let event = match self.wait(&raw const overlapped, stop) {
             Waited::Read(0) | Waited::Overflowed => Event::Lost,
             Waited::Read(length) => Event::Changed(records(&bytes(buffer)[..length], top)),
