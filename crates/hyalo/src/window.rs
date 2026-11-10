@@ -241,9 +241,8 @@ impl App {
     fn show_tray(&mut self) {
         let said = self.notice().map(|notice| notice.said());
         let tip = tray::tip(self.hotkey(), said.as_deref());
-        if !self.services.tray.show(self.hwnd, &tip) {
-            eprintln!("hyalo: no tray icon until the taskbar is up");
-        }
+        // Without a taskbar yet, TaskbarCreated brings the icon later.
+        let _ = self.services.tray.show(self.hwnd, &tip);
     }
 
     /// Takes in what the config holds: good settings are put in force; a
@@ -269,16 +268,14 @@ impl App {
         });
         let places = self.services.places.clone();
         self.places = places.with(&config.rank_higher, &config.rank_lower);
-        if self.leave_out(&config.exclude) {
-            self.find_if_stale();
-        }
+        self.leave_out(&config.exclude);
+        self.find_if_stale();
         self.config = config;
     }
 
-    /// Tells the sources that walk folders what to leave out; whether any
-    /// of them had something else, which makes what it found stale.
-    fn leave_out(&mut self, paths: &[String]) -> bool {
-        let mut changed = false;
+    /// Tells the sources that walk folders what to leave out; what one of
+    /// them found is stale if it left out something else.
+    fn leave_out(&mut self, paths: &[String]) {
         for (source, found_at) in self.services.sources.iter().zip(&mut self.found_at) {
             if source
                 .excluded
@@ -286,10 +283,8 @@ impl App {
                 .is_some_and(|excluded| excluded.set(paths))
             {
                 *found_at = None;
-                changed = true;
             }
         }
-        changed
     }
 
     /// What to tell the user, if anything: a problem in the config comes
@@ -603,8 +598,9 @@ pub fn run(shown: bool) -> Result<()> {
 }
 
 /// Creates the launcher window on this thread, with the picks saved
-/// before, binds the hotkey, puts the icon in the tray and shows the
-/// window, or, not `shown`, only sets the providers looking.
+/// before, puts the config in force (the hotkey, the folders), puts the
+/// icon in the tray, sets the providers looking and, if `shown`, shows
+/// the window.
 fn open(services: Services, shown: bool) -> Result<HWND> {
     let hwnd = create_window()?;
     let placement = placement_under_cursor()?;
@@ -649,11 +645,8 @@ fn open(services: Services, shown: bool) -> Result<HWND> {
         *app = Some(opened);
     });
     style_window(hwnd)?;
-    match shown {
-        true => show(hwnd)?,
-        false => {
-            with_app(App::find_if_stale);
-        }
+    if shown {
+        show(hwnd)?;
     }
     Ok(hwnd)
 }
@@ -872,7 +865,7 @@ fn ask_to_show(hwnd: HWND) {
     // SAFETY: plain calls; the window may be gone by the time a call
     // reaches it, and then the call fails and nothing waits.
     unsafe {
-        let mut process = 0;
+        let mut process = u32::default();
         GetWindowThreadProcessId(hwnd, Some(&mut process));
         let _ = AllowSetForegroundWindow(process);
         let _ = PostMessageW(Some(hwnd), WM_SHOW, WPARAM::default(), LPARAM::default());

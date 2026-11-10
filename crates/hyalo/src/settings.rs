@@ -107,19 +107,16 @@ pub fn watch(
     })
 }
 
-/// Waits for the next change in the folder `handle` watches, and a
-/// moment more for it to settle; `false` when the watch ends first.
+/// Waits for the next change in the folder `handle` watches, or for no
+/// one to listen, and a moment more for a change to settle; `false` when
+/// the folder can no longer be watched (it is gone, say).
 fn next_change(handle: HANDLE, listening: &impl Fn() -> bool) -> bool {
     // SAFETY: the handle is open for as long as the watch runs.
     unsafe {
         if FindNextChangeNotification(handle).is_err() {
             return false;
         }
-        while WaitForSingleObject(handle, LISTENING) == WAIT_TIMEOUT {
-            if !listening() {
-                return false;
-            }
-        }
+        while listening() && WaitForSingleObject(handle, LISTENING) == WAIT_TIMEOUT {}
     }
     thread::sleep(SETTLE);
     true
@@ -294,6 +291,22 @@ mod tests {
             .expect("handed over");
         assert_eq!(hotkey(&loaded), "Win+F3");
         stop(&listening, watcher);
+    }
+
+    #[test]
+    fn stops_once_its_folder_is_gone_though_someone_listens() {
+        let (scratch, path) = configured("settings-gone");
+        let (_settings, _listening, watcher) = watching(&path);
+        thread::sleep(Duration::from_millis(200));
+        fs::remove_dir_all(scratch.0.join("hyalo")).expect("remove the folder");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !watcher.is_finished() {
+            assert!(
+                Instant::now() < deadline,
+                "still watching a folder that is gone"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
     }
 
     #[test]

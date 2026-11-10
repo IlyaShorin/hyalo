@@ -40,7 +40,7 @@ impl Hotkeys for System {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_desktop::on_hidden_desktop;
+    use crate::test_desktop::{on_hidden_desktop, take_turn};
     use windows::Win32::UI::WindowsAndMessaging::{
         CreateWindowExW, DestroyWindow, WINDOW_EX_STYLE, WINDOW_STYLE,
     };
@@ -70,6 +70,8 @@ mod tests {
 
     #[test]
     fn a_hotkey_one_window_holds_is_refused_to_another_until_freed() {
+        // Test runs side by side would take the same keys.
+        let _turn = take_turn("hotkey");
         on_hidden_desktop(|| {
             // Keys no one presses: the test holds them for the whole session
             // for a moment.

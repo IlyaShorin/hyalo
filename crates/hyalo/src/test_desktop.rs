@@ -69,7 +69,7 @@ const OWN_STATION: &str = "HYALO_TEST_OWN_WINDOW_STATION";
 /// child runs that test alone.
 pub fn in_own_window_station(name: &str, test: impl FnOnce()) {
     if std::env::var_os(OWN_STATION).is_some() {
-        let _turn = take_turn();
+        let _turn = take_turn("window-station");
         enter_own_window_station();
         test();
         return;
@@ -88,13 +88,14 @@ pub fn in_own_window_station(name: &str, test: impl FnOnce()) {
     );
 }
 
-/// Waits for this child's turn and holds it until the file is dropped. A
-/// normal user may not name a window station, and one without a name is
-/// named after the logon session: every child gets the same one. Children
-/// of test runs side by side, as mutator runs them, would copy over each
-/// other's text. The turn ends with the process at the latest.
-fn take_turn() -> File {
-    let path = std::env::temp_dir().join("hyalo-test-window-station.lock");
+/// Waits for this process's turn at `what` the whole session shares, and
+/// holds it until the file is dropped: test runs side by side, as mutator
+/// runs them, would otherwise meet there. A normal user may not name a
+/// window station, and one without a name is named after the logon
+/// session, so every child gets the same clipboard; global hotkeys are
+/// the session's too. The turn ends with the process at the latest.
+pub fn take_turn(what: &str) -> File {
+    let path = std::env::temp_dir().join(format!("hyalo-test-{what}.lock"));
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         // No sharing: a second open fails until the first is closed.

@@ -373,8 +373,15 @@ mod tests {
         let shown = tip(alt_space(), Some(&problem));
         assert_eq!(shown.encode_utf16().count(), TIP_UNITS);
         assert!(shown.starts_with("hyalo · жж") && shown.ends_with('…'));
-        let exact = "x".repeat(TIP_UNITS - "hyalo · ".len());
-        assert_eq!(tip(None, Some(&exact)), format!("hyalo · {exact}"));
+        let room = TIP_UNITS - "hyalo · ".encode_utf16().count();
+        let exact = "x".repeat(room);
+        assert_eq!(
+            tip(None, Some(&exact)),
+            format!("hyalo · {exact}"),
+            "just fits"
+        );
+        let over = "x".repeat(room + 1);
+        assert!(tip(None, Some(&over)).ends_with('…'), "one more does not");
     }
 
     /// The menu Win32 holds: each item's label, or `None` for a
@@ -468,6 +475,7 @@ mod tests {
         let show = (Some("Show hyalo	Alt+Space".to_string()), 1, false, false);
         assert_eq!(items[0], show);
         assert_eq!(items[1].0, None, "a separator");
+        assert_eq!(items[1].1, 0, "which sends no command");
         let start = (Some("Start with Windows".to_string()), 3, true, false);
         assert_eq!(items[3], start);
         assert_eq!(items[5], (Some("Exit".to_string()), 4, false, false));

@@ -147,6 +147,40 @@ mod tests {
         assert!(ours(&claim(&name).expect("claim")), "free once it returned");
     }
 
+    /// Whether the mutex `taken` holds can be had within `wait`.
+    fn had(taken: &Taken, wait: u32) -> bool {
+        use windows::Win32::Foundation::{WAIT_ABANDONED, WAIT_OBJECT_0};
+        use windows::Win32::System::Threading::WaitForSingleObject;
+        let had = unsafe { WaitForSingleObject(taken.0, wait) };
+        let had = [WAIT_OBJECT_0, WAIT_ABANDONED].contains(&had);
+        if had {
+            unsafe { ReleaseMutex(taken.0) }.expect("give it back");
+        }
+        had
+    }
+
+    #[test]
+    fn a_later_start_can_wait_for_the_launcher_to_end() {
+        let name = name("wait");
+        let (claimed, release) = std::sync::mpsc::channel();
+        let (go, gone) = std::sync::mpsc::channel::<()>();
+        let elsewhere = name.clone();
+        let launcher = std::thread::spawn(move || {
+            let ours = claim(&elsewhere).expect("claim");
+            claimed.send(()).expect("say so");
+            let _ = gone.recv();
+            drop(ours);
+        });
+        release.recv().expect("claimed");
+        let Claim::Taken(taken) = claim(&name).expect("claim again") else {
+            panic!("the launcher holds it");
+        };
+        assert!(!had(&taken, 0), "held while the launcher runs");
+        go.send(()).expect("let it end");
+        launcher.join().expect("the launcher");
+        assert!(had(&taken, 5_000), "had once it ended");
+    }
+
     #[test]
     fn a_claim_from_another_thread_finds_it_taken_too() {
         let name = name("thread");

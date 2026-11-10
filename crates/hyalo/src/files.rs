@@ -646,23 +646,35 @@ mod tests {
             icon_size: 32,
             known: Default::default(),
         };
+        let reports = std::sync::atomic::AtomicUsize::new(0);
+        let reported = || reports.load(std::sync::atomic::Ordering::SeqCst);
         std::thread::scope(|scope| {
-            let walker = scope.spawn(|| provider(&request, &|_| {}));
-            // Before the walk asks for its roots, the snapshot is in and
-            // what is excluded is out.
+            let walker = scope.spawn(|| {
+                provider(&request, &|_| {
+                    reports.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                })
+            });
+            // Before the walk asks for its roots, the snapshot is in, what
+            // is excluded is out, and the window was told of both.
             let deadline = Instant::now() + Duration::from_secs(5);
             let pruned = || {
                 let index = read(&files.0);
                 !index.is_empty() && index.find(&folder.path("gone")).is_none()
             };
-            while !pruned() && Instant::now() < deadline {
+            while !(pruned() && reported() == 2) && Instant::now() < deadline {
                 std::thread::sleep(Duration::from_millis(5));
             }
-            let (pruned, listed) = (pruned(), search(&files, "notes"));
+            let (pruned, told, listed) = (pruned(), reported(), search(&files, "notes"));
             gated.send(()).expect("let the walk go");
             walker.join().expect("the run");
             assert!(pruned, "pruned before the walk");
+            assert_eq!(told, 2, "the snapshot, then the prune");
             assert!(listed.is_empty(), "{listed:?}");
+            assert_eq!(
+                reported(),
+                3,
+                "then the walk; nothing left to prune after it"
+            );
         });
     }
 
