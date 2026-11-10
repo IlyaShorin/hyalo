@@ -1,0 +1,73 @@
+# Publishes a release for a pushed version tag: builds hyalo.exe on
+# Windows, writes its SHA-256 beside it, and puts both on a GitHub Release
+# with the tag's message as its notes. The launcher's updater offers that
+# release to every hyalo older than it, downloads hyalo.exe, and installs
+# it only if it matches hyalo.exe.sha256.
+#
+# To cut a release: set the version in the workspace Cargo.toml, commit,
+# then push an annotated tag of that version:
+#
+#   git tag -a v0.0.2 -m "What is new, one line per change"
+#   git push origin v0.0.2
+#
+# A tag that does not name the workspace version fails the workflow.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref_name }}
+
+jobs:
+  release:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      TAG: ${{ github.ref_name }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check that the tag names the workspace version
+        run: |
+          $metadata = cargo metadata --no-deps --format-version 1 | ConvertFrom-Json
+          $version = ($metadata.packages | Where-Object name -eq 'hyalo').version
+          if ("v$version" -cne $env:TAG) {
+            Write-Error "The tag $env:TAG does not name the workspace version ${version}: set the version in Cargo.toml, or tag v${version}."
+            exit 1
+          }
+          Add-Content -Path $env:GITHUB_ENV -Value "VERSION=$version"
+
+      - name: Take the notes from the tag's message
+        run: |
+          # The checkout fetched the tag without its message.
+          git fetch --force origin "refs/tags/${env:TAG}:refs/tags/${env:TAG}"
+          $notes = git tag --list $env:TAG --format='%(contents:subject)%0a%0a%(contents:body)'
+          $notes = ($notes -join "`n").Trim()
+          if (-not $notes) { $notes = "hyalo $env:VERSION" }
+          [IO.File]::WriteAllText("$PWD\notes.md", "$notes`n")
+
+      - name: Build
+        run: cargo build --release --locked -p hyalo
+
+      - name: Write the SHA-256 beside the exe
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item target\release\hyalo.exe dist\hyalo.exe
+          $hash = (Get-FileHash dist\hyalo.exe -Algorithm SHA256).Hash.ToLowerInvariant()
+          # As sha256sum writes it, in ASCII without a byte order mark.
+          [IO.File]::WriteAllText("$PWD\dist\hyalo.exe.sha256", "$hash  hyalo.exe`n")
+          Get-Content dist\hyalo.exe.sha256
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create $env:TAG dist\hyalo.exe dist\hyalo.exe.sha256 `
+            --verify-tag --title "hyalo $env:VERSION" --notes-file notes.md
