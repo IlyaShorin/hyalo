@@ -253,7 +253,9 @@ impl Panel {
         self.scroll = self.scroll.clamp(0.0, page::max_scroll(content, view));
     }
 
-    fn record(&mut self, key: u16, mods: Mods) -> Option<Effect> {
+    /// The key `key` went down with `mods` held, for the recorder; what
+    /// it heard, as `key` says.
+    pub fn record(&mut self, key: u16, mods: Mods) -> Option<Effect> {
         let heard = self.recorder.key(key, mods);
         self.note = None;
         match heard {

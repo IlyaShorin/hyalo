@@ -344,10 +344,7 @@ impl SettingsWindow {
     fn system_key(&mut self, key: u16) -> Outcome {
         self.recorded = self.panel.listening();
         match self.recorded {
-            true => {
-                let view = self.painter.view().1;
-                Outcome::Changed(self.panel.key(key, mods(), &self.laid, view))
-            }
+            true => Outcome::Changed(self.panel.record(key, mods())),
             false => Outcome::Unhandled,
         }
     }
@@ -972,16 +969,16 @@ mod tests {
             let settings = setup.settings();
             let menu = windows::Win32::UI::Input::KeyboardAndMouse::VK_MENU;
             assert!(
+                !settings.takes(WM_SYSCHAR, usize::from(b' ')),
+                "Alt+Space opens the window menu, from the start"
+            );
+            assert!(
                 settings.takes(WM_SYSCHAR, usize::from(b'k')),
                 "Alt+K, nothing recording"
             );
             assert!(
                 settings.takes(WM_SYSKEYUP, usize::from(menu.0)),
                 "Alt let go: no menu mode"
-            );
-            assert!(
-                !settings.takes(WM_SYSCHAR, usize::from(b' ')),
-                "Alt+Space opens the window menu"
             );
             settings.click(Target::Hotkey);
             hold(&[menu]);
