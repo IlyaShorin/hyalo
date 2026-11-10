@@ -3,14 +3,17 @@
 //! runs.
 //!
 //! Until the indexer service exists, this is how hyalo finds files: a
-//! plain walk, folder by folder, with the user's own rights. The first
-//! walk writes straight into the index the window searches, so files turn
-//! up while it runs; later walks build a fresh index and swap it in whole.
+//! plain walk, folder by folder, with the user's own rights, then a watch
+//! on every root that keeps the index in step with what changes. The
+//! first walk writes straight into the index the window searches, so
+//! files turn up while it runs; later walks build a fresh index and swap
+//! it in whole.
 
 use std::fs::{self, DirEntry, File};
 use std::io::{self, BufReader, BufWriter, Write};
 use std::os::windows::fs::FileTypeExt;
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard, TryLockError};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -18,7 +21,7 @@ use std::time::{Duration, Instant};
 use hyalo_core::item::{Item, ItemId};
 use hyalo_core::places::{self, Places};
 use hyalo_core::rank::Ranked;
-use hyalo_index::Index;
+use hyalo_index::{EntryId, Index};
 use windows::Win32::Storage::FileSystem::{GetDriveTypeW, GetLogicalDriveStringsW};
 use windows::Win32::System::Com::CoTaskMemFree;
 use windows::Win32::System::WindowsProgramming::DRIVE_FIXED;
@@ -29,6 +32,12 @@ use windows::core::{GUID, HSTRING};
 
 use crate::catalog::{Found, Provider, Request};
 use crate::store;
+
+mod changes;
+mod watch;
+
+use changes::{Change, Kind, Record};
+use watch::{Event, Watch};
 
 /// The file index the window searches.
 #[derive(Clone, Default)]
@@ -99,20 +108,36 @@ fn lowercase(text: &str) -> String {
     text.to_lowercase()
 }
 
-/// How long the files found are trusted before showing the launcher walks
-/// the drives again: a walk costs the disks and a core for a while.
+/// How often showing the launcher makes sure the files provider runs: it
+/// watches the drives for as long as the index is searched, so a later
+/// run finds it at work and does nothing, unless it ended.
 pub const REFRESH_AFTER: Duration = Duration::from_secs(20 * 60);
 
 /// How often a first walk tells the window to search again.
 const TICK: Duration = Duration::from_millis(250);
 
+/// The window is told of changes at most this often: a burst of them
+/// costs one search, not one each.
+const TELL_EVERY: Duration = Duration::from_millis(500);
+
+/// How long the provider waits for changes before it looks again whether
+/// the index is still searched and what is excluded.
+const IDLE: Duration = Duration::from_secs(1);
+
+/// How often a changed index is saved: the snapshot only has to be good
+/// enough to start from, since every start walks again, and saving
+/// writes the whole index.
+const SAVE_EVERY: Duration = Duration::from_secs(30 * 60);
+
 /// The folders a walk starts from: the fixed drives, or a stand-in.
 pub type Roots = Arc<dyn Fn() -> Vec<PathBuf> + Send + Sync>;
 
 /// The files provider. The first run loads the snapshot, if there is
-/// one; every run takes out what is `excluded`, walks the roots leaving
-/// it out, and saves the snapshot. A run that starts while another walks
-/// does nothing: the walk under way leaves out what is excluded by then.
+/// one; every run takes out what is `excluded`, watches the roots, walks
+/// them leaving it out, saves the snapshot, then follows what the watches
+/// see until nobody searches the index any more. A run that starts while
+/// another is at work does nothing: that one keeps up with what is
+/// excluded.
 pub fn provider(
     writer: Writer,
     roots: Roots,
@@ -131,7 +156,7 @@ pub fn provider(
             snapshot: snapshot.as_deref(),
             excluded: &excluded,
         };
-        walk.refresh(&writer.0, report);
+        walk.serve(&writer.0, report);
     })
 }
 
@@ -145,15 +170,187 @@ struct Walk<'a> {
 impl Walk<'_> {
     /// Loads the snapshot into an empty index; takes out what is
     /// excluded, before the walk and again after it, for what was
-    /// excluded while it went; walks the roots and saves the snapshot.
-    fn refresh(&self, shared: &RwLock<Index>, report: &dyn Fn(Found)) {
+    /// excluded while it went; watches the roots, from before the walk so
+    /// nothing that changes during it is missed; walks them and saves the
+    /// snapshot; then follows the watches.
+    fn serve(&self, shared: &Arc<RwLock<Index>>, report: &dyn Fn(Found)) {
         if read(shared).is_empty() {
             load_into(shared, self.snapshot, report);
         }
         prune(shared, self.excluded, report);
-        walk_into(shared, &(self.roots)(), self.excluded, report);
+        let roots = (self.roots)();
+        let (sender, events) = mpsc::channel();
+        let tell = |sender: mpsc::Sender<Event>| Box::new(move |event| sender.send(event).is_ok());
+        let watches: Vec<Watch> = roots
+            .iter()
+            .map(|root| Watch::start(root, tell(sender.clone())))
+            .collect();
+        self.walk(shared, &roots, report);
+        self.follow(shared, &roots, &events, report);
+        drop(watches);
+    }
+
+    /// Walks the roots, takes out what was excluded while it went, and
+    /// saves the snapshot.
+    fn walk(&self, shared: &RwLock<Index>, roots: &[PathBuf], report: &dyn Fn(Found)) {
+        walk_into(shared, roots, self.excluded, report);
         prune(shared, self.excluded, report);
         save_to(shared, self.snapshot);
+    }
+
+    /// Keeps the index in step with what the watches see, until nobody
+    /// but the provider holds it: changes as they come, a walk of every
+    /// root when a watch lost track, what is excluded as it changes. Tells
+    /// the window, and saves the snapshot, now and then when the index
+    /// changed, and once more at the end.
+    fn follow(
+        &self,
+        shared: &Arc<RwLock<Index>>,
+        roots: &[PathBuf],
+        events: &Receiver<Event>,
+        report: &dyn Fn(Found),
+    ) {
+        let version = read(shared).version();
+        let mut kept = Kept {
+            told: Mark::new(version),
+            saved: Mark::new(version),
+            excluded: self.excluded.paths(),
+        };
+        while Arc::strong_count(shared) > 1 {
+            // Out of the match, which would hold the lock through it.
+            let patience = kept.patience(read(shared).version());
+            match events.recv_timeout(patience) {
+                Ok(Event::Changed(records)) => self.take(shared, &records),
+                Ok(Event::Lost) => {
+                    self.walk(shared, roots, report);
+                    kept.saved = Mark::new(read(shared).version());
+                }
+                Err(_) => {}
+            }
+            self.keep_out(shared, &mut kept.excluded, report);
+            let version = read(shared).version();
+            if kept.told.due(version, Instant::now(), TELL_EVERY) {
+                report(Found::Files);
+            }
+            if kept.saved.due(version, Instant::now(), SAVE_EVERY) {
+                save_to(shared, self.snapshot);
+            }
+        }
+        if kept
+            .saved
+            .due(read(shared).version(), Instant::now(), Duration::ZERO)
+        {
+            save_to(shared, self.snapshot);
+        }
+    }
+
+    /// Makes the changes `records` hold, then walks the folders they
+    /// brought, and takes out what is excluded, should a folder moved in
+    /// hold some of it.
+    fn take(&self, shared: &RwLock<Index>, records: &[Record]) {
+        self.make(shared, &changes::changes(records));
+        prune(shared, self.excluded, &|_| {});
+    }
+
+    /// Makes `changes`, then walks the folders they brought.
+    fn make(&self, shared: &RwLock<Index>, changes: &[Change]) {
+        let mut walks = Vec::new();
+        for change in changes {
+            walks.extend(changes::apply(&mut write(shared), change, self.excluded));
+        }
+        for path in changes::outermost(walks) {
+            walk_afresh(shared, &path, self.excluded);
+        }
+    }
+
+    /// Puts in force what is excluded, if it changed since `seen`: takes
+    /// out what is excluded now, and brings back what no longer is.
+    fn keep_out(&self, shared: &RwLock<Index>, seen: &mut Vec<String>, report: &dyn Fn(Found)) {
+        let now = self.excluded.paths();
+        if now == *seen {
+            return;
+        }
+        prune(shared, self.excluded, report);
+        let back = seen.iter().filter(|path| !now.contains(path));
+        let back = back.filter_map(|path| Some(Change::Added(path.clone(), on_disk(path)?)));
+        self.make(shared, &back.collect::<Vec<_>>());
+        *seen = now;
+    }
+}
+
+/// What the provider last told the window, saved, and left out: the
+/// index's version and when.
+struct Kept {
+    told: Mark,
+    saved: Mark,
+    excluded: Vec<String>,
+}
+
+impl Kept {
+    /// How long to wait for changes: until the window is due to be told of
+    /// those made, or a while.
+    fn patience(&self, version: u64) -> Duration {
+        match version == self.told.version {
+            true => IDLE,
+            false => TELL_EVERY.saturating_sub(self.told.at.elapsed()),
+        }
+    }
+}
+
+/// The index's version when something was last done with it, and when.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Mark {
+    version: u64,
+    at: Instant,
+}
+
+impl Mark {
+    fn new(version: u64) -> Mark {
+        Mark {
+            version,
+            at: Instant::now(),
+        }
+    }
+
+    /// Whether it is due again for the index at `version`, at `now`, when
+    /// done at most every `every` and only for a version not done yet;
+    /// marks it done if so.
+    fn due(&mut self, version: u64, now: Instant, every: Duration) -> bool {
+        let due = version != self.version && now.duration_since(self.at) >= every;
+        if due {
+            *self = Mark { version, at: now };
+        }
+        due
+    }
+}
+
+/// What the walk would take the name at `path` for, if it is there.
+fn on_disk(path: &str) -> Option<Kind> {
+    let kind = fs::symlink_metadata(path).ok()?.file_type();
+    Some(match (kind.is_dir(), kind.is_symlink_dir()) {
+        (true, _) => Kind::Folder,
+        (false, true) => Kind::Link,
+        (false, false) => Kind::File,
+    })
+}
+
+/// Walks the folder at `path` again from nothing: whatever the index
+/// held under it goes, and what is there now comes in. Nothing, unless it
+/// is in the index and on disk a folder the walk enters: a junction made
+/// a moment ago is first told of as a plain folder.
+fn walk_afresh(shared: &RwLock<Index>, path: &str, excluded: &Excluded) {
+    if on_disk(path) != Some(Kind::Folder) {
+        return;
+    }
+    let emptied = || {
+        let mut index = write(shared);
+        let entry = index.find(path)?;
+        let (folder, name) = (index.parent(entry)?, index.name(entry)?.to_string());
+        index.remove(entry).ok()?;
+        index.add(folder, &name, true).ok()
+    };
+    if let Some(entry) = emptied() {
+        walk_under(Path::new(path), entry, false, shared, excluded);
     }
 }
 
@@ -282,17 +479,30 @@ fn walk(root: &Path, into: &RwLock<Index>, excluded: &Excluded) {
     let Ok(top) = write(into).add_root(&root_name(root)) else {
         return;
     };
-    let mut folders = vec![(root.to_path_buf(), top)];
-    while let Some((folder, id)) = folders.pop() {
+    walk_under(root, top, true, into, excluded);
+}
+
+/// Adds everything under `folder`, the entry `id`, that is not excluded,
+/// a folder at a time, as entries it has not seen. `at_root`: whether it
+/// is a root.
+fn walk_under(
+    folder: &Path,
+    id: EntryId,
+    at_root: bool,
+    into: &RwLock<Index>,
+    excluded: &Excluded,
+) {
+    let mut folders = vec![(folder.to_path_buf(), id, at_root)];
+    while let Some((folder, id, at_root)) = folders.pop() {
         let left_out = excluded.within(&folder);
-        let children = listing(&folder, id == top, &left_out);
+        let children = listing(&folder, at_root, &left_out);
         let mut index = write(into);
         for child in children {
             let Ok(entry) = index.add(id, &child.name, child.folder) else {
                 continue;
             };
             if child.enter {
-                folders.push((folder.join(&child.name), entry));
+                folders.push((folder.join(&child.name), entry, false));
             }
         }
     }
@@ -422,6 +632,8 @@ mod tests {
     use crate::scratch::Scratch;
     use hyalo_core::item::Kind;
     use std::cell::RefCell;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering::SeqCst;
 
     fn walked(root: &Path) -> Index {
         walked_leaving_out(root, &Excluded::default())
@@ -604,87 +816,90 @@ mod tests {
         )
     }
 
-    #[test]
-    fn a_folder_excluded_after_a_walk_leaves_the_index_at_the_next_run() {
-        let folder = Scratch::new("pruned").with(&[
-            "kept\\",
-            r"kept\notes.txt",
-            "gone\\",
-            r"gone\notes.txt",
-        ]);
-        let (provider, files, excluded) = walking_leaving_out(&folder, None);
-        run(&provider);
-        assert_eq!(search(&files, "notes").len(), 2);
-        excluded.set(&[folder.path("gone")]);
-        run(&provider);
-        assert_eq!(search(&files, "notes"), [folder.path(r"kept\notes.txt")]);
-        excluded.set(&[]);
-        run(&provider);
-        assert_eq!(
-            search(&files, "notes").len(),
-            2,
-            "back once no longer excluded"
-        );
+    /// A provider at work on a thread of its own, and what the window
+    /// searches. Dropped, nobody searches the index, so the provider ends.
+    struct Serving {
+        files: Option<Files>,
+        reports: Arc<AtomicUsize>,
+        thread: Option<thread::JoinHandle<()>>,
     }
 
-    #[test]
-    fn a_snapshot_holding_what_is_excluded_now_loses_it_before_the_walk() {
-        let folder = Scratch::new("pruned-snapshot").with(&["gone\\", r"gone\notes.txt"]);
-        let snapshot = folder.0.join("files.idx");
-        let (first, _) = walking(&folder, Some(snapshot.clone()));
-        run(&first);
-        let (gated, gate) = std::sync::mpsc::channel::<()>();
-        let (files, writer) = Files::new();
-        let gate = Mutex::new(gate);
-        let roots: Roots = Arc::new(move || {
-            let _ = gate.lock().expect("the gate").recv();
-            Vec::new()
-        });
-        let excluded = excluding(&[folder.path("gone")]);
-        let provider = provider(writer, roots, Some(snapshot), excluded);
-        let request = Request {
-            icon_size: 32,
-            known: Default::default(),
-        };
-        let reports = std::sync::atomic::AtomicUsize::new(0);
-        let reported = || reports.load(std::sync::atomic::Ordering::SeqCst);
-        std::thread::scope(|scope| {
-            let walker = scope.spawn(|| {
-                provider(&request, &|_| {
-                    reports.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    impl Serving {
+        fn new(provider: Provider, files: Files) -> Serving {
+            let reports = Arc::new(AtomicUsize::new(0));
+            let counted = Arc::clone(&reports);
+            let thread = thread::spawn(move || {
+                provider(&request(), &|found| {
+                    assert!(matches!(found, Found::Files));
+                    counted.fetch_add(1, SeqCst);
                 })
             });
-            // Before the walk asks for its roots, the snapshot is in, what
-            // is excluded is out, and the window was told of both.
-            let deadline = Instant::now() + Duration::from_secs(5);
-            let pruned = || {
-                let index = read(&files.0);
-                !index.is_empty() && index.find(&folder.path("gone")).is_none()
-            };
-            while !(pruned() && reported() == 2) && Instant::now() < deadline {
-                std::thread::sleep(Duration::from_millis(5));
+            Serving {
+                files: Some(files),
+                reports,
+                thread: Some(thread),
             }
-            let (pruned, told, listed) = (pruned(), reported(), search(&files, "notes"));
-            gated.send(()).expect("let the walk go");
-            walker.join().expect("the run");
-            assert!(pruned, "pruned before the walk");
-            assert_eq!(told, 2, "the snapshot, then the prune");
-            assert!(listed.is_empty(), "{listed:?}");
-            assert_eq!(
-                reported(),
-                3,
-                "then the walk; nothing left to prune after it"
-            );
-        });
+        }
+
+        fn files(&self) -> &Files {
+            self.files.as_ref().expect("still served")
+        }
+
+        fn reports(&self) -> usize {
+            self.reports.load(SeqCst)
+        }
+
+        /// Waits up to ten seconds for `done` to hold; whether it did.
+        fn until(&self, done: impl Fn(&Serving) -> bool) -> bool {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !done(self) && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(20));
+            }
+            done(self)
+        }
+
+        /// Waits for `query` to find just `paths`, in their order.
+        fn finds(&self, query: &str, paths: &[String]) {
+            self.until(|serving| search(serving.files(), query) == paths);
+            assert_eq!(search(self.files(), query), paths, "{query}");
+        }
+
+        /// Stops the provider; how often it told the window.
+        fn stop(mut self) -> usize {
+            self.end();
+            self.reports()
+        }
+
+        fn end(&mut self) {
+            self.files = None;
+            if let Some(thread) = self.thread.take() {
+                let ended = thread.join();
+                assert!(
+                    ended.is_ok() || thread::panicking(),
+                    "the provider panicked"
+                );
+            }
+        }
     }
 
-    fn run(provider: &Provider) -> usize {
-        let reports = RefCell::new(0);
-        let request = Request {
+    impl Drop for Serving {
+        fn drop(&mut self) {
+            self.end();
+        }
+    }
+
+    fn request() -> Request {
+        Request {
             icon_size: 32,
             known: Default::default(),
-        };
-        provider(&request, &|found| {
+        }
+    }
+
+    /// Runs the provider here; how often it told the window. Only for a
+    /// run that ends at once.
+    fn run(provider: &Provider) -> usize {
+        let reports = RefCell::new(0);
+        provider(&request(), &|found| {
             assert!(matches!(found, Found::Files));
             *reports.borrow_mut() += 1;
         });
@@ -699,9 +914,244 @@ mod tests {
     #[test]
     fn the_provider_walks_into_what_the_window_searches_and_says_so() {
         let folder = Scratch::new("provider").with(&["report.pdf"]);
-        let (provider, files) = walking(&folder, None);
-        assert!(run(&provider) >= 1);
-        assert_eq!(search(&files, "report"), [folder.path("report.pdf")]);
+        let serving = Serving::new_walking(&folder, None);
+        serving.finds("report", &[folder.path("report.pdf")]);
+        assert!(serving.stop() >= 1);
+    }
+
+    impl Serving {
+        fn new_walking(folder: &Scratch, snapshot: Option<PathBuf>) -> Serving {
+            let (provider, files) = walking(folder, snapshot);
+            Serving::new(provider, files)
+        }
+    }
+
+    #[test]
+    fn a_file_made_renamed_and_removed_is_followed_at_once() {
+        let folder = Scratch::new("live").with(&["sub\\"]);
+        let serving = Serving::new_walking(&folder, None);
+        serving.until(|serving| serving.reports() >= 1);
+        let path = |name: &str| folder.0.join(name);
+        fs::write(path(r"sub\fresh.txt"), b"x").expect("write");
+        serving.finds("fresh", &[folder.path(r"sub\fresh.txt")]);
+        fs::rename(path(r"sub\fresh.txt"), path(r"sub\renamed.txt")).expect("rename");
+        serving.finds("renamed", &[folder.path(r"sub\renamed.txt")]);
+        assert_eq!(search(serving.files(), "fresh"), Vec::<String>::new());
+        fs::rename(path(r"sub\renamed.txt"), path("moved.txt")).expect("move");
+        serving.finds("moved", &[folder.path("moved.txt")]);
+        fs::remove_file(path("moved.txt")).expect("remove");
+        serving.finds("moved", &[]);
+        assert_eq!(read(&serving.files().0).len(), 2, "the root and sub");
+    }
+
+    #[test]
+    fn a_folder_moved_in_whole_is_walked_and_one_renamed_keeps_its_files() {
+        let folder = Scratch::new("live-folder").with(&["watched\\"]);
+        let outside = Scratch::new("live-outside").with(&[
+            "brought\\",
+            r"brought\deep\",
+            r"brought\deep\inside.txt",
+        ]);
+        let root = folder.0.join("watched");
+        let (files, writer) = Files::new();
+        let roots: Roots = Arc::new(move || vec![root.clone()]);
+        let serving = Serving::new(provider(writer, roots, None, Excluded::default()), files);
+        serving.until(|serving| serving.reports() >= 1);
+        fs::rename(outside.0.join("brought"), folder.0.join(r"watched\brought")).expect("move in");
+        serving.finds("inside", &[folder.path(r"watched\brought\deep\inside.txt")]);
+        let renamed = folder.0.join(r"watched\taken");
+        fs::rename(folder.0.join(r"watched\brought"), &renamed).expect("rename");
+        serving.finds("inside", &[folder.path(r"watched\taken\deep\inside.txt")]);
+    }
+
+    #[test]
+    fn a_junction_made_while_watched_is_listed_but_not_entered() {
+        let folder = Scratch::new("live-link").with(&["real\\", r"real\inside.txt"]);
+        let serving = Serving::new_walking(&folder, None);
+        serving.finds("inside", &[folder.path(r"real\inside.txt")]);
+        let made = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(folder.0.join("link"))
+            .arg(folder.0.join("real"))
+            .output()
+            .expect("run mklink");
+        assert!(made.status.success(), "make a junction");
+        serving.finds("link", &[folder.path("link")]);
+        // Long enough for a walk of the junction to have shown.
+        thread::sleep(3 * TELL_EVERY);
+        assert_eq!(
+            search(serving.files(), "inside"),
+            [folder.path(r"real\inside.txt")]
+        );
+    }
+
+    #[test]
+    fn what_is_excluded_stays_out_when_made_while_watched() {
+        let folder = Scratch::new("live-excluded").with(&["kept\\"]);
+        let (provider, files, excluded) = walking_leaving_out(&folder, None);
+        excluded.set(&[folder.path("secret")]);
+        let serving = Serving::new(provider, files);
+        serving.until(|serving| serving.reports() >= 1);
+        fs::create_dir(folder.0.join("secret")).expect("make the excluded folder");
+        fs::write(folder.0.join(r"secret\plans.txt"), b"x").expect("write");
+        fs::write(folder.0.join(r"kept\plans.txt"), b"x").expect("write");
+        serving.finds("plans", &[folder.path(r"kept\plans.txt")]);
+        assert_eq!(search(serving.files(), "secret"), Vec::<String>::new());
+    }
+
+    #[test]
+    fn a_folder_excluded_while_watched_leaves_and_comes_back_when_no_longer() {
+        let folder = Scratch::new("pruned").with(&[
+            "kept\\",
+            r"kept\notes.txt",
+            "gone\\",
+            r"gone\notes.txt",
+        ]);
+        let (provider, files, excluded) = walking_leaving_out(&folder, None);
+        let serving = Serving::new(provider, files);
+        let both = [
+            folder.path(r"gone\notes.txt"),
+            folder.path(r"kept\notes.txt"),
+        ];
+        let listed = |serving: &Serving| {
+            let mut found = search(serving.files(), "notes");
+            found.sort();
+            found
+        };
+        assert!(serving.until(|serving| listed(serving) == both));
+        excluded.set(&[folder.path("gone")]);
+        serving.finds("notes", &[folder.path(r"kept\notes.txt")]);
+        excluded.set(&[]);
+        assert!(
+            serving.until(|serving| listed(serving) == both),
+            "back once no longer excluded"
+        );
+    }
+
+    #[test]
+    fn a_watch_that_lost_track_walks_again() {
+        let folder = Scratch::new("lost").with(&["before.txt"]);
+        let (files, writer) = Files::new();
+        let excluded = Excluded::default();
+        let walk = Walk {
+            roots: &|| Vec::new(),
+            snapshot: None,
+            excluded: &excluded,
+        };
+        let roots = [folder.0.clone()];
+        walk.walk(&writer.0, &roots, &|_| {});
+        // Made while nothing watches: only a walk finds it.
+        fs::write(folder.0.join("unseen.txt"), b"x").expect("write");
+        let (sender, events) = mpsc::channel();
+        sender.send(Event::Lost).expect("send");
+        // Searches until it finds, then lets the index go, which ends the
+        // following.
+        let searching = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while search(&files, "unseen").is_empty() && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(20));
+            }
+            search(&files, "unseen")
+        });
+        walk.follow(&writer.0, &roots, &events, &|_| {});
+        let found = searching.join().expect("the search");
+        assert_eq!(found, [folder.path("unseen.txt")]);
+    }
+
+    #[test]
+    fn what_changed_is_saved_by_the_time_it_stops() {
+        let folder = Scratch::new("saved-live");
+        let snapshot = folder.0.join("files.idx");
+        let serving = Serving::new_walking(&folder, Some(snapshot.clone()));
+        serving.until(|serving| serving.reports() >= 1);
+        fs::write(folder.0.join("late.txt"), b"x").expect("write");
+        serving.finds("late", &[folder.path("late.txt")]);
+        serving.stop();
+        let saved = load(&snapshot).expect("saved");
+        let rows = saved.search("late", &Places::default(), 5).rows;
+        assert_eq!(rows[0].item.id.0, folder.path("late.txt"));
+    }
+
+    #[test]
+    fn something_done_now_and_then_is_due_for_a_new_version_once_enough_time_passed() {
+        let start = Instant::now();
+        let mut mark = Mark {
+            version: 1,
+            at: start,
+        };
+        let every = Duration::from_millis(500);
+        let later = |millis| start + Duration::from_millis(millis);
+        assert!(!mark.due(1, later(600), every), "nothing new");
+        assert!(mark.due(2, later(600), every));
+        assert_eq!(
+            mark,
+            Mark {
+                version: 2,
+                at: later(600)
+            }
+        );
+        assert!(!mark.due(3, later(700), every), "too soon");
+        assert!(mark.due(3, later(1100), every));
+        assert!(!mark.due(3, later(1700), every), "done already");
+        assert!(
+            mark.due(4, later(1100), Duration::ZERO),
+            "at once, when asked to"
+        );
+    }
+
+    #[test]
+    fn it_waits_a_while_unless_the_window_is_due_to_be_told() {
+        let kept = Kept {
+            told: Mark::new(1),
+            saved: Mark::new(1),
+            excluded: Vec::new(),
+        };
+        assert_eq!(kept.patience(1), IDLE);
+        assert!(kept.patience(2) <= TELL_EVERY);
+        assert!(kept.patience(2) > TELL_EVERY / 2);
+        let long_ago = Kept {
+            told: Mark {
+                version: 1,
+                at: Instant::now() - IDLE,
+            },
+            ..kept
+        };
+        assert_eq!(long_ago.patience(2), Duration::ZERO);
+    }
+
+    #[test]
+    fn a_snapshot_holding_what_is_excluded_now_loses_it_before_the_walk() {
+        let folder = Scratch::new("pruned-snapshot").with(&["gone\\", r"gone\notes.txt"]);
+        let snapshot = folder.0.join("files.idx");
+        Serving::new_walking(&folder, Some(snapshot.clone())).stop();
+        let (gated, gate) = mpsc::channel::<()>();
+        let (files, writer) = Files::new();
+        let gate = Mutex::new(gate);
+        let roots: Roots = Arc::new(move || {
+            let _ = gate.lock().expect("the gate").recv();
+            Vec::new()
+        });
+        let excluded = excluding(&[folder.path("gone")]);
+        let serving = Serving::new(provider(writer, roots, Some(snapshot), excluded), files);
+        // Before the walk asks for its roots, the snapshot is in, what is
+        // excluded is out, and the window was told of both.
+        let pruned = |serving: &Serving| {
+            let index = read(&serving.files().0);
+            !index.is_empty() && index.find(&folder.path("gone")).is_none()
+        };
+        serving.until(|serving| pruned(serving) && serving.reports() == 2);
+        let (pruned, told) = (pruned(&serving), serving.reports());
+        let listed = search(serving.files(), "notes");
+        gated.send(()).expect("let the walk go");
+        serving.until(|serving| serving.reports() == 3);
+        assert!(pruned, "pruned before the walk");
+        assert_eq!(told, 2, "the snapshot, then the prune");
+        assert!(listed.is_empty(), "{listed:?}");
+        assert_eq!(
+            serving.stop(),
+            3,
+            "then the walk; nothing left to prune after it"
+        );
     }
 
     /// The memory `files` takes, and what the same index takes loaded
@@ -719,25 +1169,18 @@ mod tests {
         let names: Vec<String> = (0..300).map(|n| format!("file {n}.txt")).collect();
         let names: Vec<&str> = names.iter().map(String::as_str).collect();
         let folder = Scratch::new("shrink").with(&names);
-        let (provider, files) = walking(&folder, None);
-        run(&provider);
-        let (walked, exact) = memory(&files);
+        let snapshot = Scratch::new("shrink-snapshot");
+        let path = snapshot.0.join("files.idx");
+        let first = Serving::new_walking(&folder, Some(path.clone()));
+        first.until(|serving| serving.reports() >= 1 && read(&serving.files().0).len() == 301);
+        let (walked, exact) = memory(first.files());
         assert_eq!(walked, exact, "the first walk");
-        run(&provider);
-        let (walked, exact) = memory(&files);
+        first.stop();
+        // From the snapshot, then a walk into a fresh index.
+        let again = Serving::new_walking(&folder, Some(path));
+        again.until(|serving| serving.reports() >= 2);
+        let (walked, exact) = memory(again.files());
         assert_eq!(walked, exact, "a walk into a fresh index");
-    }
-
-    #[test]
-    fn walking_again_finds_what_changed() {
-        let folder = Scratch::new("again").with(&["old.txt"]);
-        let (provider, files) = walking(&folder, None);
-        run(&provider);
-        fs::remove_file(folder.0.join("old.txt")).expect("remove");
-        fs::write(folder.0.join("new.txt"), b"x").expect("write");
-        run(&provider);
-        assert_eq!(search(&files, "old"), Vec::<String>::new());
-        assert_eq!(search(&files, "new"), [folder.path("new.txt")]);
     }
 
     #[test]
@@ -745,20 +1188,27 @@ mod tests {
         let folder = Scratch::new("snapshot").with(&["kept.txt"]);
         let snapshot = Scratch::new("snapshot-file");
         let path = snapshot.0.join("hyalo").join("files.idx");
-        let (first, _) = walking(&folder, Some(path.clone()));
-        run(&first);
+        Serving::new_walking(&folder, Some(path.clone())).stop();
         assert!(path.exists(), "saved");
         fs::remove_file(folder.0.join("kept.txt")).expect("remove");
         let (files, writer) = Files::new();
-        let before_walking = Arc::new(Mutex::new(Vec::new()));
-        let (watched, seen) = (files.clone(), Arc::clone(&before_walking));
+        let before_walking = Arc::new(Mutex::new(None));
+        // Held weakly: a reader held for good would keep the provider at
+        // work for good.
+        let (watched, seen) = (Arc::downgrade(&files.0), Arc::clone(&before_walking));
         let roots: Roots = Arc::new(move || {
-            *seen.lock().expect("seen") = search(&watched, "kept");
+            let files = Files(watched.upgrade().expect("still searched"));
+            *seen.lock().expect("seen") = Some(search(&files, "kept"));
             vec![]
         });
-        run(&provider(writer, roots, Some(path), Excluded::default()));
+        let serving = Serving::new(
+            provider(writer, roots, Some(path), Excluded::default()),
+            files,
+        );
+        serving.until(|_| before_walking.lock().expect("seen").is_some());
+        drop(serving);
         let seen = before_walking.lock().expect("seen").clone();
-        assert_eq!(seen, [folder.path("kept.txt")]);
+        assert_eq!(seen, Some(vec![folder.path("kept.txt")]));
     }
 
     #[test]
@@ -766,15 +1216,15 @@ mod tests {
         let folder = Scratch::new("bad-snapshot").with(&["fresh.txt"]);
         let snapshot = Scratch::new("bad-snapshot-file").with(&["files.idx"]);
         let path = snapshot.0.join("files.idx");
-        let (provider, files) = walking(&folder, Some(path.clone()));
-        run(&provider);
-        assert_eq!(search(&files, "fresh"), [folder.path("fresh.txt")]);
+        let serving = Serving::new_walking(&folder, Some(path.clone()));
+        serving.finds("fresh", &[folder.path("fresh.txt")]);
+        serving.stop();
         let mut saved = BufReader::new(File::open(&path).expect("saved"));
         assert!(Index::load(&mut saved).is_ok());
     }
 
     #[test]
-    fn a_run_while_another_walks_does_nothing() {
+    fn a_run_while_another_is_at_work_does_nothing() {
         let folder = Scratch::new("busy").with(&["x.txt"]);
         let (files, writer) = Files::new();
         let (entered, release) = (std::sync::Barrier::new(2), std::sync::Barrier::new(2));
@@ -787,13 +1237,12 @@ mod tests {
             vec![root.clone()]
         });
         let provider = provider(writer, roots, None, Excluded::default());
-        let first = Arc::clone(&provider);
-        let walker = thread::spawn(move || run(&first));
+        let serving = Serving::new(Arc::clone(&provider), files);
         shared.0.wait();
         assert_eq!(run(&provider), 0, "busy");
         shared.1.wait();
-        walker.join().expect("the first walk");
-        assert_eq!(search(&files, "x"), [folder.path("x.txt")]);
+        serving.finds("x", &[folder.path("x.txt")]);
+        assert_eq!(run(&provider), 0, "still at work, watching");
     }
 
     #[test]
