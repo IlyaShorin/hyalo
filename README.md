@@ -4,7 +4,7 @@ A fast, glassy Spotlight-style launcher for Windows 11. Press a hotkey, type a f
 
 *hyalo* comes from Greek ὕαλος, "glass".
 
-> **Status:** early prototype: finds and opens apps, files and folders, answers arithmetic. Nothing to install yet.
+> **Status:** early prototype: finds and opens apps, files and folders, answers arithmetic, converts currencies. Nothing to install yet.
 
 ## Goals
 
@@ -18,8 +18,8 @@ A fast, glassy Spotlight-style launcher for Windows 11. Press a hotkey, type a f
 
 | Crate | Role |
 |---|---|
-| `hyalo` | Launcher: window, hotkey, tray, rendering, providers (apps, calculator, settings, windows) |
-| `hyalo-core` | Items, matching (incl. wrong keyboard layout), ranking, frecency, location boosts; later the query language and pipe protocol. Pure and tested |
+| `hyalo` | Launcher: window, hotkey, tray, rendering, providers (apps, files, exchange rates, settings, windows) |
+| `hyalo-core` | Items, matching (incl. wrong keyboard layout), ranking, frecency, location boosts, the calculator and currency answers; later the query language and pipe protocol. Pure and tested |
 | `hyalo-index` | The file index: every name once in an arena (and folded in another), 16-byte entries, search split over every core, a snapshot on disk. Pure: a directory walk feeds it now, the indexer service later |
 | `hyalo-indexer` | Windows service: reads the MFT, follows the USN journal, answers queries over a named pipe restricted to the user |
 
@@ -62,6 +62,8 @@ What the prototype does:
 - Alt+Space shows or hides the glass search bar; it also hides when it loses focus.
 - Typing lists up to eight matching apps (Start Menu desktop apps and Store apps, from `shell:AppsFolder`) with their icons, the matched letters highlighted. `ё` and `е` count as the same letter.
 - Arithmetic gets its answer as the first row: `+ - * /`, `^`, parentheses, `sqrt`, `round`, `abs`, decimals with a point or a comma (`2,5*3` answers `7,5`). `%` is per cent (`200+10%` is 220) unless an operand follows it (`7%3` is 1). Enter copies the answer.
+- Currencies convert the same way, at the Bank of Russia's official rates: `100 usd` answers in roubles (`8 275.36 ₽`), `400 rub` in dollars, and `in` or `в` names another target (`10 usd in eur`, `10$ в евро`). The amount and the currency go either way round, with or without a space, in any case: any code the bank publishes, a sign (`$ € ₽ £ ₸ ₺ ₴ ₹`; not `¥`, which is the yen and the yuan alike) or a word for the rouble, dollar, euro or yuan (`руб`, `долларов`, `евро`, `юаней`). A code or word typed in the wrong layout works too (`100 гыв`), and the amount may be arithmetic (`(100+50) usd`). Results have two decimals, more when small (`0.0121 $`); the second line names the rates' date. Enter copies the result.
+- The rates come from cbr.ru (one small request, user agent `hyalo`, through the system's proxy settings) and are kept in `%LOCALAPPDATA%\hyalo\rates.xml`, so a start without a network converts with the last rates. A start, and showing the launcher at most hourly, asks the bank again when the rates are older than today, once a day when it has nothing newer (weekends, holidays).
 - Files and folders from every fixed drive are listed too, with their shell icons and their folder as the second line. Apps rank above files that match as well; files under Desktop, Documents, Downloads and the project folders in your profile (`code`, `projects`, `source`, `src`, `dev`, `repos`, `git`) rank a little higher, files under `node_modules`, `AppData`, caches, `Windows` and folders whose names start with a dot (`.git`, `.vscode`) lower.
 - The files come from a walk of the fixed drives with your own rights (no admin). The first walk fills the list as it goes; the index is saved to `%LOCALAPPDATA%\hyalo\files.idx`, so the next start finds files at once, and showing the launcher walks again after 20 minutes. Junctions and symbolic links are listed but never followed; `$Recycle.Bin`, `System Volume Information` and the other `$` folders at a drive's root are left out.
 - Up and Down move the selection, or point at a row; Enter or a click opens it, Ctrl+Shift+Enter opens it as administrator, Ctrl+Enter shows a file or folder in its folder, Ctrl+C copies its full path, Esc hides the launcher.
