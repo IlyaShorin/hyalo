@@ -13,10 +13,12 @@ mod instance;
 mod keys;
 mod launch;
 mod layout;
+mod notice;
 mod query;
 mod rates;
 mod render;
 mod results;
+mod settings;
 mod store;
 mod tray;
 mod window;
@@ -28,26 +30,18 @@ mod scratch;
 #[cfg(test)]
 mod test_desktop;
 
-use instance::Claim;
 use windows::Win32::UI::HiDpi::{
     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext,
 };
 
+/// One launcher per session: the first start runs it, shown or, started
+/// with Windows, in the tray; a second start shows the first and goes.
 fn main() -> windows::core::Result<()> {
-    // Started with Windows: into the tray, not onto the screen.
-    let shown = !std::env::args().any(|arg| arg == autostart::HIDDEN);
-    // One launcher per session: a second start shows the first and goes.
-    let _launcher = match instance::claim(instance::NAME)? {
-        Claim::Ours(launcher) => launcher,
-        Claim::Taken(running) => {
-            // A build replacing the running one would wait on it here.
-            drop(running);
-            if shown {
-                window::show_running();
-            }
-            return Ok(());
-        }
-    };
+    let shown = autostart::shown(std::env::args());
+    instance::first(instance::NAME, shown, run, window::show_running)
+}
+
+fn run(shown: bool) -> windows::core::Result<()> {
     // DPI awareness is per process and must be set before the first window.
     unsafe { SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2)? };
     window::run(shown)

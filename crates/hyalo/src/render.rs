@@ -886,6 +886,26 @@ mod tests {
     }
 
     #[test]
+    fn a_notice_under_the_empty_bar_at_100_percent() {
+        on_hidden_desktop(|| {
+            let id = ItemId("hyalo:notice".to_string());
+            let scene = Scene {
+                query: "",
+                rows: vec![Row {
+                    id: &id,
+                    title: "config.toml, line 2: unknown field `hotkye`, expected `hotkey` or `folders`",
+                    subtitle: "hyalo keeps its last good settings · Enter to open config.toml",
+                    highlights: Vec::new(),
+                    icon: None,
+                }],
+                selected: 0,
+            };
+            let frame = drawn(&scene, (720, 128), 96);
+            assert_looks_like("notice-100", &frame);
+        });
+    }
+
+    #[test]
     fn a_currency_row_shows_its_signs_at_100_percent() {
         on_hidden_desktop(|| {
             let id = ItemId("hyalo:currency".to_string());

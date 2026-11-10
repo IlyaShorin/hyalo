@@ -28,6 +28,27 @@ pub struct Instance(HANDLE);
 /// The mutex another process holds.
 pub struct Taken(HANDLE);
 
+/// Runs the launcher if this is the first start: `run`, told whether to
+/// show it, holds the mutex `name` until it returns. A later start calls
+/// `show` instead, unless it was to start hidden: a start with Windows
+/// has nothing to show.
+pub fn first(
+    name: &str,
+    shown: bool,
+    run: impl FnOnce(bool) -> Result<()>,
+    show: impl FnOnce(),
+) -> Result<()> {
+    match claim(name)? {
+        Claim::Ours(_launcher) => run(shown),
+        // A build replacing the running one would wait on it here.
+        Claim::Taken(_running) if shown => {
+            show();
+            Ok(())
+        }
+        Claim::Taken(_running) => Ok(()),
+    }
+}
+
 /// Creates the mutex `name`, owned by this thread, unless it is there
 /// already.
 pub fn claim(name: &str) -> Result<Claim> {
@@ -86,6 +107,44 @@ mod tests {
         let name = name("gone");
         drop(claim(&name).expect("claim"));
         assert!(ours(&claim(&name).expect("claim again")));
+    }
+
+    /// What `first` did: ran the launcher (and whether shown), or showed
+    /// the one running.
+    fn started(name: &str, shown: bool) -> (Option<bool>, bool) {
+        let ran = std::cell::Cell::new(None);
+        let showed = std::cell::Cell::new(false);
+        let run = |shown| {
+            ran.set(Some(shown));
+            Ok(())
+        };
+        first(name, shown, run, || showed.set(true)).expect("started");
+        (ran.get(), showed.get())
+    }
+
+    #[test]
+    fn the_first_start_runs_the_launcher_shown_or_hidden() {
+        assert_eq!(started(&name("first-shown"), true), (Some(true), false));
+        assert_eq!(started(&name("first-hidden"), false), (Some(false), false));
+    }
+
+    #[test]
+    fn a_later_start_shows_the_running_launcher_unless_it_starts_hidden() {
+        let name = name("later");
+        let _running = claim(&name).expect("claim");
+        assert_eq!(started(&name, true), (None, true));
+        assert_eq!(started(&name, false), (None, false));
+    }
+
+    #[test]
+    fn the_launcher_holds_the_mutex_while_it_runs_and_frees_it_after() {
+        let name = name("holds");
+        let run = |_| {
+            assert!(!ours(&claim(&name).expect("claim")), "held while running");
+            Ok(())
+        };
+        first(&name, true, run, || {}).expect("started");
+        assert!(ours(&claim(&name).expect("claim")), "free once it returned");
     }
 
     #[test]

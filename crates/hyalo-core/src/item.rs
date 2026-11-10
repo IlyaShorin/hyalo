@@ -31,6 +31,9 @@ pub enum Kind {
     File,
     Folder,
     Calculator,
+    /// What hyalo tells the user, such as a mistake in the config: never
+    /// ranked, never remembered as a pick.
+    Notice,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

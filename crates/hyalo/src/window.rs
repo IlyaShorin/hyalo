@@ -16,6 +16,7 @@ use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::{Duration, Instant, SystemTime};
 
+use hyalo_core::config::{Config, Problem};
 use hyalo_core::frecency::{Frecency, Timestamp};
 use hyalo_core::hotkey::Hotkey;
 use hyalo_core::item::{Action, Item, ItemId, Kind};
@@ -38,12 +39,12 @@ use windows::Win32::UI::Shell::{NIN_SELECT, NINF_KEY};
 use windows::Win32::UI::WindowsAndMessaging::{
     AllowSetForegroundWindow, CW_USEDEFAULT, CreateWindowExW, DefWindowProcW, DestroyWindow,
     DispatchMessageW, FindWindowW, GetCursorPos, GetMessageW, GetWindowThreadProcessId, HTCLIENT,
-    HWND_TOPMOST, IDC_ARROW, IsWindowVisible, LoadCursorW, MSG, PostMessageW, PostQuitMessage,
-    RegisterClassExW, SW_HIDE, SW_SHOW, SWP_NOACTIVATE, SetForegroundWindow, SetWindowPos,
-    ShowWindow, TranslateMessage, WA_INACTIVE, WM_ACTIVATE, WM_APP, WM_CHAR, WM_CONTEXTMENU,
-    WM_DESTROY, WM_HOTKEY, WM_KEYDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCCALCSIZE, WM_NCHITTEST,
-    WNDCLASSEXW, WS_CAPTION, WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
-    WS_THICKFRAME,
+    HWND_TOPMOST, IDC_ARROW, IsWindow, IsWindowVisible, LoadCursorW, MSG, PostMessageW,
+    PostQuitMessage, RegisterClassExW, SW_HIDE, SW_SHOW, SWP_NOACTIVATE, SetForegroundWindow,
+    SetWindowPos, ShowWindow, TranslateMessage, WA_INACTIVE, WM_ACTIVATE, WM_APP, WM_CHAR,
+    WM_CONTEXTMENU, WM_DESTROY, WM_HOTKEY, WM_KEYDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCCALCSIZE,
+    WM_NCHITTEST, WNDCLASSEXW, WS_CAPTION, WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOOLWINDOW,
+    WS_EX_TOPMOST, WS_POPUP, WS_THICKFRAME,
 };
 use windows::core::{BOOL, PCWSTR, Result, w};
 
@@ -55,9 +56,11 @@ use crate::highlight::utf16_ranges;
 use crate::hotkeys::{self, Hotkeys};
 use crate::keys::{self, Command, Held};
 use crate::layout::{self, Rect};
+use crate::notice::Notice;
 use crate::query::Query;
 use crate::render::{Renderer, Row, Scene};
 use crate::results::{self, Listed, MAX_ROWS, Results};
+use crate::settings::{self, Loaded};
 use crate::tray::{self, Tray};
 use crate::{http, launch, rates, store};
 
@@ -152,7 +155,7 @@ impl Services {
             picks: store::default_path(),
             hotkeys: Box::new(hotkeys::System),
             tray: Rc::new(tray::Shell),
-            config: store::ours("APPDATA", "config.toml"),
+            config: settings::default_path(),
             autostart: Autostart::real(),
         }
     }
@@ -192,6 +195,15 @@ struct App {
     hotkey: Option<(i32, Hotkey)>,
     /// When the launcher last lost the focus while shown.
     deactivated_at: Option<Instant>,
+    /// The settings in force: the config's last good ones.
+    config: Config,
+    /// What is wrong with the config file, if anything.
+    problem: Option<Problem>,
+    /// The config's hotkey, when Windows refused it.
+    refused: Option<Hotkey>,
+    /// Where files rank higher or lower: the user's folders and the
+    /// config's.
+    places: Places,
 }
 
 impl App {
@@ -219,8 +231,58 @@ impl App {
 
     /// Shows hyalo's icon in the tray with what it should say.
     fn show_tray(&mut self) {
-        let tip = tray::tip(self.hotkey(), None);
-        self.services.tray.show(self.hwnd, &tip);
+        let said = self.notice().map(|notice| notice.said());
+        let tip = tray::tip(self.hotkey(), said.as_deref());
+        if !self.services.tray.show(self.hwnd, &tip) {
+            eprintln!("hyalo: no tray icon until the taskbar is up");
+        }
+    }
+
+    /// Takes in what the config holds: good settings are put in force; a
+    /// problem keeps the ones in force and is told.
+    fn configure(&mut self, loaded: Loaded) {
+        match loaded {
+            Ok(config) => {
+                self.problem = None;
+                self.apply(config);
+            }
+            Err(problem) => self.problem = Some(problem),
+        }
+        self.show_tray();
+    }
+
+    /// Puts `config` in force: its hotkey, unless Windows refuses it, and
+    /// its places.
+    fn apply(&mut self, config: Config) {
+        let wanted = config.hotkey;
+        self.refused = self.bind(wanted).err().map(|error| {
+            eprintln!("hyalo: {wanted} is taken by another app: {error}");
+            wanted
+        });
+        let places = self.services.places.clone();
+        self.places = places.with(&config.rank_higher, &config.rank_lower);
+        self.config = config;
+    }
+
+    /// What to tell the user, if anything: a problem in the config comes
+    /// before a refused hotkey.
+    fn notice(&self) -> Option<Notice> {
+        let problem = self.problem.clone().map(Notice::Config);
+        let kept = self.hotkey();
+        problem.or_else(|| self.refused.map(|wanted| Notice::Hotkey { wanted, kept }))
+    }
+
+    /// Watches the config, if there is one, from what it held at start,
+    /// for as long as the window is there.
+    fn watch_config(&self, seen: Option<Vec<u8>>) {
+        let Some(path) = self.services.config.clone() else {
+            return;
+        };
+        let (sender, window) = (self.found.0.clone(), self.hwnd.0 as isize);
+        // SAFETY: IsWindow takes any handle, even one gone since.
+        let listening = move || unsafe { IsWindow(Some(HWND(window as *mut _))) }.as_bool();
+        let report = move |loaded| hand_over(&sender, window, Found::Config(loaded));
+        settings::watch(path, seen, listening, report);
     }
 
     /// What the tray's menu holds now.
@@ -339,7 +401,7 @@ impl App {
     /// answer is not noted: it already comes first, and each sum would
     /// leave a pick behind.
     fn note(&mut self, item: Item) {
-        if item.kind == Kind::Calculator {
+        if matches!(item.kind, Kind::Calculator | Kind::Notice) {
             return;
         }
         self.frecency.record(&item.id, self.query.text(), now());
@@ -369,9 +431,19 @@ impl App {
     fn listed(&self) -> Results {
         let query = self.query.text();
         let items = self.catalog.items.iter().chain(&self.catalog.picked);
-        let (frecency, places) = (&self.frecency, &self.services.places);
+        let (frecency, places) = (&self.frecency, &self.places);
         let found = Results::search(query, items, self.file_hits(), frecency, places, now());
-        found.answered(results::answer(query, self.catalog.rates.as_ref()))
+        let answer = match query.is_empty() {
+            true => self.notice_row(),
+            false => results::answer(query, self.catalog.rates.as_ref()),
+        };
+        found.answered(answer)
+    }
+
+    /// The notice's row, when there is a config for it to open.
+    fn notice_row(&self) -> Option<Item> {
+        let config = self.services.config.as_deref()?;
+        Some(self.notice()?.item(config))
     }
 
     /// The files and folders the index finds for the query: enough to
@@ -382,9 +454,7 @@ impl App {
             return Vec::new();
         }
         let enough = MAX_ROWS + self.catalog.picked.len();
-        self.services
-            .files
-            .search(query, &self.services.places, enough)
+        self.services.files.search(query, &self.places, enough)
     }
 
     /// Asks for the icons of the files and folders listed that have none
@@ -440,8 +510,12 @@ impl App {
     /// up. After an icon the search finds the same rows; it costs less
     /// than the redraw that follows.
     fn take_found(&mut self) -> Result<()> {
-        for found in self.found.1.try_iter() {
-            self.catalog.take(found);
+        let found: Vec<Found> = self.found.1.try_iter().collect();
+        for found in found {
+            match found {
+                Found::Config(loaded) => self.configure(loaded),
+                found => self.catalog.take(found),
+            }
         }
         self.results = self.results.kept(self.listed());
         self.fetch_icons();
@@ -512,6 +586,8 @@ fn open(services: Services, shown: bool) -> Result<HWND> {
         .map(store::load)
         .unwrap_or_default();
     let sources = services.sources.len();
+    let places = services.places.clone();
+    let seen = services.config.as_deref().and_then(settings::contents);
     APP.with_borrow_mut(|app| {
         let mut opened = App {
             hwnd,
@@ -528,13 +604,14 @@ fn open(services: Services, shown: bool) -> Result<HWND> {
             pointer: None,
             hotkey: None,
             deactivated_at: None,
+            config: Config::default(),
+            problem: None,
+            refused: None,
+            places,
         };
         opened.find_picked();
-        let hotkey = Hotkey::default();
-        if let Err(error) = opened.bind(hotkey) {
-            eprintln!("hyalo: {hotkey} is taken by another app: {error}");
-        }
-        opened.show_tray();
+        opened.configure(seen.clone().map_or(Ok(Config::default()), settings::read));
+        opened.watch_config(seen);
         *app = Some(opened);
     });
     style_window(hwnd)?;
@@ -746,16 +823,21 @@ fn on_command(hwnd: HWND, command: tray::Command) -> Result<()> {
     }
 }
 
-/// From a second start: shows the launcher that runs already. The second
+/// From a second start: shows the launcher that runs already.
+pub fn show_running() {
+    // SAFETY: a plain call.
+    if let Ok(hwnd) = unsafe { FindWindowW(WINDOW_CLASS, PCWSTR::null()) } {
+        ask_to_show(hwnd);
+    }
+}
+
+/// Asks the launcher `hwnd`, in another process, to show. The second
 /// start was the user's, so it may hand the foreground on; the launcher,
 /// in the background, could not take it on its own.
-pub fn show_running() {
+fn ask_to_show(hwnd: HWND) {
     // SAFETY: plain calls; the window may be gone by the time a call
     // reaches it, and then the call fails and nothing waits.
     unsafe {
-        let Ok(hwnd) = FindWindowW(WINDOW_CLASS, PCWSTR::null()) else {
-            return;
-        };
         let mut process = 0;
         GetWindowThreadProcessId(hwnd, Some(&mut process));
         let _ = AllowSetForegroundWindow(process);
@@ -803,6 +885,7 @@ fn show(hwnd: HWND) -> Result<()> {
     with_app(|app| -> Result<()> {
         app.placement = placement;
         app.find_if_stale();
+        app.search();
         app.present()?;
         app.pointer = pointer_over(hwnd);
         Ok(())
@@ -1041,8 +1124,9 @@ mod tests {
     }
 
     impl Tray for Taskbar {
-        fn show(&self, _: HWND, tip: &str) {
+        fn show(&self, _: HWND, tip: &str) -> bool {
             self.tips.borrow_mut().push(tip.to_string());
+            true
         }
 
         fn remove(&self, _: HWND) {
@@ -1427,6 +1511,16 @@ mod tests {
     }
 
     #[test]
+    fn a_second_start_asks_it_to_show() {
+        on_hidden_desktop(|| {
+            let launcher = Launcher::open();
+            launcher.press(VK_ESCAPE);
+            ask_to_show(launcher.0);
+            launcher.pump_until(|_| unsafe { IsWindowVisible(launcher.0) }.as_bool());
+        });
+    }
+
+    #[test]
     fn a_second_start_shows_it_and_keeps_it_shown() {
         on_hidden_desktop(|| {
             let launcher = Launcher::open();
@@ -1577,6 +1671,188 @@ mod tests {
             assert_eq!(runs.load(Ordering::SeqCst), 1);
             launcher.hotkey();
             assert_eq!(runs.load(Ordering::SeqCst), 1, "still fresh when shown");
+        });
+    }
+
+    /// A config file of its own for one test, holding `text`.
+    fn config_file(test: &str, text: &str) -> (Scratch, PathBuf) {
+        let scratch = Scratch::new(test).with(&["hyalo\\"]);
+        let path = scratch.0.join("hyalo").join("config.toml");
+        std::fs::write(&path, text).expect("write the config");
+        (scratch, path)
+    }
+
+    /// A launcher listing Notepad, on the config at `path`, with
+    /// `keyboard` and a stand-in taskbar.
+    fn configured(path: &Path, keyboard: &Rc<Keyboard>) -> (Launcher, Rc<Taskbar>, Ran) {
+        let taskbar = Rc::new(Taskbar::default());
+        let (mut services, ran) = services(listing(&["Notepad"]).0, None);
+        services.tray = taskbar.clone();
+        services.hotkeys = Box::new(keyboard.clone());
+        services.config = Some(path.to_path_buf());
+        let launcher = Launcher::serving(services);
+        launcher.pump_until(|app| !app.catalog.items.is_empty());
+        (launcher, taskbar, ran)
+    }
+
+    fn hotkey(text: &str) -> Hotkey {
+        Hotkey::parse(text).expect("a hotkey")
+    }
+
+    /// The titles listed now.
+    fn listed() -> Vec<String> {
+        with_app(|app| titles(app)).expect("app state")
+    }
+
+    #[test]
+    fn a_missing_config_is_written_with_the_defaults() {
+        on_hidden_desktop(|| {
+            let scratch = Scratch::new("window-config-missing");
+            let path = scratch.0.join("hyalo").join("config.toml");
+            let keyboard = Rc::new(Keyboard::default());
+            let _launcher = configured(&path, &keyboard);
+            let written = std::fs::read_to_string(&path).expect("written");
+            assert_eq!(written, hyalo_core::config::DEFAULT);
+            assert_eq!(keyboard.held(), ["Alt+Space"]);
+        });
+    }
+
+    #[test]
+    fn the_hotkey_comes_from_the_config() {
+        on_hidden_desktop(|| {
+            let (_scratch, path) = config_file("window-config-hotkey", "hotkey = 'Ctrl+Shift+K'\n");
+            let keyboard = Rc::new(Keyboard::default());
+            let (launcher, taskbar, _) = configured(&path, &keyboard);
+            assert_eq!(keyboard.held(), ["Ctrl+Shift+K"]);
+            assert_eq!(*taskbar.tips.borrow(), ["hyalo · Ctrl+Shift+K"]);
+            launcher.tray(WM_CONTEXTMENU, (0, 0));
+            let menus = taskbar.menus.borrow();
+            assert_eq!(menus[0].0, tray::menu(Some(hotkey("Ctrl+Shift+K")), None));
+        });
+    }
+
+    #[test]
+    fn a_hotkey_saved_applies_at_once_and_frees_the_old_one() {
+        on_hidden_desktop(|| {
+            let (_scratch, path) = config_file("window-config-save", "");
+            let keyboard = Rc::new(Keyboard::default());
+            let (launcher, taskbar, _) = configured(&path, &keyboard);
+            std::fs::write(&path, "hotkey = 'Win+F2'\n").expect("save");
+            launcher.pump_until(|_| keyboard.held() == ["Win+F2"]);
+            assert_eq!(
+                taskbar.tips.borrow().last().expect("a tip"),
+                "hyalo · Win+F2"
+            );
+        });
+    }
+
+    #[test]
+    fn a_hotkey_windows_refuses_keeps_the_old_one_and_says_so() {
+        on_hidden_desktop(|| {
+            let (_scratch, path) = config_file("window-config-refused", "");
+            let keyboard = Rc::new(Keyboard::default());
+            keyboard.taken.borrow_mut().push(hotkey("Ctrl+K"));
+            let (launcher, taskbar, _) = configured(&path, &keyboard);
+            std::fs::write(&path, "hotkey = 'Ctrl+K'\n").expect("save");
+            launcher.pump_until(|app| app.results.rows().len() == 1);
+            let said = "Ctrl+K is taken: Alt+Space still shows hyalo";
+            assert_eq!(first_row().0, said);
+            assert_eq!(keyboard.held(), ["Alt+Space"]);
+            let tip = taskbar.tips.borrow().last().expect("a tip").clone();
+            assert_eq!(tip, format!("hyalo · {said}"));
+        });
+    }
+
+    #[test]
+    fn a_broken_config_keeps_the_settings_in_force_and_says_where() {
+        let picks = PicksFile::new("broken-config");
+        let picked = picks.0.clone();
+        on_hidden_desktop(move || {
+            let text = "hotkey = 'Ctrl+Shift+K'\n";
+            let (_scratch, path) = config_file("window-config-broken", text);
+            let keyboard = Rc::new(Keyboard::default());
+            let taskbar = Rc::new(Taskbar::default());
+            let (mut services, ran) = services(listing(&[]).0, Some(picked.clone()));
+            services.tray = taskbar.clone();
+            services.hotkeys = Box::new(keyboard.clone());
+            services.config = Some(path.clone());
+            let launcher = Launcher::serving(services);
+            std::fs::write(&path, "\nhotkye = 1\n").expect("save");
+            launcher.pump_until(|app| app.results.rows().len() == 1);
+            let (title, subtitle) = first_row();
+            assert!(
+                title.starts_with("config.toml, line 2: unknown field `hotkye`"),
+                "{title}"
+            );
+            assert!(subtitle.contains("last good settings"), "{subtitle}");
+            assert_eq!(keyboard.held(), ["Ctrl+Shift+K"]);
+            assert!(
+                taskbar
+                    .tips
+                    .borrow()
+                    .last()
+                    .expect("a tip")
+                    .contains("line 2")
+            );
+            launcher.press(VK_RETURN);
+            let opened = Action::Open(path.to_string_lossy().into_owned());
+            assert_eq!(*ran.borrow(), [(opened, false)]);
+            assert!(!picked.exists(), "a notice is not a pick");
+        });
+    }
+
+    #[test]
+    fn fixing_the_config_takes_the_notice_away() {
+        on_hidden_desktop(|| {
+            let (_scratch, path) = config_file("window-config-fixed", "hotkey = 5\n");
+            let keyboard = Rc::new(Keyboard::default());
+            let (launcher, _, _) = configured(&path, &keyboard);
+            assert_eq!(
+                launcher.rect(),
+                launcher.placement().rect(1),
+                "broken at start"
+            );
+            std::fs::write(&path, "hotkey = 'Ctrl+Alt+H'\n").expect("save");
+            launcher.pump_until(|app| app.results.rows().is_empty());
+            assert_eq!(launcher.rect(), launcher.placement().rect(0));
+            assert_eq!(keyboard.held(), ["Ctrl+Alt+H"]);
+        });
+    }
+
+    #[test]
+    fn the_notice_is_not_listed_while_typing() {
+        on_hidden_desktop(|| {
+            let (_scratch, path) = config_file("window-config-typing", "hotkey = 5\n");
+            let keyboard = Rc::new(Keyboard::default());
+            let (launcher, _, ran) = configured(&path, &keyboard);
+            launcher.type_text("note");
+            assert_eq!(listed(), ["Notepad"]);
+            launcher.press(VK_RETURN);
+            assert_eq!(*ran.borrow(), [opened("Notepad", false)]);
+        });
+    }
+
+    #[test]
+    fn folders_the_config_ranks_higher_rise_and_change_when_saved() {
+        on_hidden_desktop(|| {
+            let higher = "[folders]\nrank_higher = ['high']\n";
+            let (_scratch, path) = config_file("window-config-places", higher);
+            let tree = Scratch::new("window-places").with(&[
+                "high\\",
+                "low\\",
+                "high\\notes.txt",
+                "low\\notes.txt",
+            ]);
+            let (mut services, _) = walking(just(&tree.0), None);
+            services.config = Some(path.clone());
+            let launcher = Launcher::serving(services);
+            launcher.search_for("notes", 2);
+            let first =
+                || with_app(|app| app.results.rows()[0].item.id.0.clone()).expect("app state");
+            assert_eq!(first(), tree.path("high\\notes.txt"));
+            std::fs::write(&path, "[folders]\nrank_higher = ['low']\n").expect("save");
+            let low = tree.path("low\\notes.txt");
+            launcher.pump_until(|app| app.results.rows()[0].item.id.0 == low);
         });
     }
 

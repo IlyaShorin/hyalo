@@ -60,7 +60,8 @@ fn kind_weight(kind: Kind) -> f64 {
         Kind::File => 0,
         Kind::Folder => 1,
         Kind::App => 2,
-        Kind::Calculator => 3,
+        // A notice is never ranked; it goes first, as an answer does.
+        Kind::Calculator | Kind::Notice => 3,
     };
     f64::from(step) * KIND_STEP
 }

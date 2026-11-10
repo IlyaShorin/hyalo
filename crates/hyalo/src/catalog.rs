@@ -11,6 +11,7 @@ use windows::core::Result;
 
 use crate::apps::{self, Icon};
 use crate::com::Com;
+use crate::settings::Loaded;
 
 /// One piece of what a provider found.
 pub enum Found {
@@ -24,6 +25,8 @@ pub enum Found {
     Picked(Vec<Item>),
     /// The newest exchange rates.
     Rates(Rates),
+    /// What the config holds since it was saved.
+    Config(Loaded),
 }
 
 /// What the window asks a provider for.
@@ -66,6 +69,8 @@ impl Catalog {
             Found::Files => {}
             Found::Picked(items) => items.into_iter().for_each(|item| self.pick(item)),
             Found::Rates(rates) => self.rates = Some(rates),
+            // The window puts settings in force; there is nothing to list.
+            Found::Config(_) => {}
         }
     }
 

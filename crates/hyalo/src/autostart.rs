@@ -27,6 +27,12 @@ const NAME: &str = "hyalo";
 /// The argument that starts the launcher hidden, in the tray.
 pub const HIDDEN: &str = "--hidden";
 
+/// Whether to show the launcher at start, by the command line's
+/// arguments: not when started with Windows.
+pub fn shown(arguments: impl IntoIterator<Item = String>) -> bool {
+    !arguments.into_iter().any(|argument| argument == HIDDEN)
+}
+
 /// Whether, and how, this executable starts with Windows.
 pub struct Autostart {
     /// The Run key and the StartupApproved key, under the current user's.
@@ -271,6 +277,15 @@ pub mod tests {
         assert!(starts(Some(&ours), Some(&ON), exe));
         assert!(starts(Some(&ours), Some(&[6, 0, 0, 0]), exe));
         assert!(starts(Some(&ours), Some(&[]), exe), "a mark of nothing");
+    }
+
+    #[test]
+    fn started_with_windows_it_is_not_shown() {
+        let arguments =
+            |list: &[&str]| list.iter().map(|text| text.to_string()).collect::<Vec<_>>();
+        assert!(shown(arguments(&["hyalo.exe"])));
+        assert!(!shown(arguments(&["hyalo.exe", "--hidden"])));
+        assert!(shown(arguments(&["hyalo.exe", "--hide"])));
     }
 
     #[test]

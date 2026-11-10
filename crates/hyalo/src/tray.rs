@@ -14,11 +14,10 @@ use windows::Win32::UI::Shell::{
     NOTIFYICON_VERSION_4, NOTIFYICONDATAW, Shell_NotifyIconW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, CreatePopupMenu, DestroyIcon, DestroyMenu, GetSystemMetrics, HICON, HMENU,
-    IMAGE_ICON, LR_DEFAULTCOLOR, LoadImageW, MENU_ITEM_FLAGS, MF_CHECKED, MF_GRAYED, MF_SEPARATOR,
-    MF_STRING, PostMessageW, RegisterWindowMessageW, SM_CXSMICON, SM_MENUDROPALIGNMENT,
-    SetForegroundWindow, TPM_BOTTOMALIGN, TPM_LEFTALIGN, TPM_NONOTIFY, TPM_RETURNCMD,
-    TPM_RIGHTALIGN, TPM_RIGHTBUTTON, TrackPopupMenuEx, WM_APP, WM_NULL,
+    AppendMenuW, CreatePopupMenu, DestroyIcon, DestroyMenu, HICON, HMENU, IMAGE_ICON,
+    LR_DEFAULTCOLOR, LoadImageW, MENU_ITEM_FLAGS, MF_CHECKED, MF_GRAYED, MF_SEPARATOR, MF_STRING,
+    PostMessageW, RegisterWindowMessageW, SM_CXSMICON, SetForegroundWindow, TPM_BOTTOMALIGN,
+    TPM_LEFTALIGN, TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenuEx, WM_APP, WM_NULL,
 };
 use windows::core::{HSTRING, PCWSTR, Result, w};
 
@@ -132,8 +131,9 @@ pub fn taskbar_created() -> u32 {
 /// `Shell`, a stand-in in tests.
 pub trait Tray {
     /// Shows hyalo's icon with `tip`, adding it when the taskbar has none
-    /// yet: at start, after Explorer restarts.
-    fn show(&self, window: HWND, tip: &str);
+    /// yet: at start, after Explorer restarts. Whether the taskbar took
+    /// it: at logon it may not be up yet, and TaskbarCreated says when.
+    fn show(&self, window: HWND, tip: &str) -> bool;
     /// Takes the icon away.
     fn remove(&self, window: HWND);
     /// Opens the menu at `at`, in screen pixels, until the user picks an
@@ -148,22 +148,17 @@ pub struct Shell;
 const ICON_ID: u32 = 1;
 
 impl Tray for Shell {
-    fn show(&self, window: HWND, tip: &str) {
-        let Ok(icon) = icon(small_icon()) else {
-            eprintln!("hyalo: no icon for the tray");
-            return;
-        };
-        let data = data(window, Some(icon), tip);
+    fn show(&self, window: HWND, tip: &str) -> bool {
+        let icon = icon(small_icon()).ok();
+        let data = data(window, icon, tip);
         // SAFETY: `data` is a live NOTIFYICONDATAW sized as it says; the
         // shell copies the icon, so it is destroyed afterwards.
         unsafe {
             let shown = Shell_NotifyIconW(NIM_MODIFY, &data).as_bool()
                 || Shell_NotifyIconW(NIM_ADD, &data).as_bool()
                     && Shell_NotifyIconW(NIM_SETVERSION, &data).as_bool();
-            if !shown {
-                eprintln!("hyalo: the taskbar took no tray icon");
-            }
-            let _ = DestroyIcon(icon);
+            let _ = icon.map(|icon| DestroyIcon(icon));
+            shown
         }
     }
 
@@ -182,12 +177,11 @@ impl Tray for Shell {
         // elsewhere; WM_NULL afterwards lets it close on the first click.
         unsafe {
             let _ = SetForegroundWindow(window);
-            let side = match GetSystemMetrics(SM_MENUDROPALIGNMENT) {
-                0 => TPM_LEFTALIGN,
-                _ => TPM_RIGHTALIGN,
-            };
-            // The command comes back here rather than as WM_COMMAND.
-            let flags = TPM_RIGHTBUTTON | TPM_BOTTOMALIGN | TPM_RETURNCMD | TPM_NONOTIFY | side;
+            // Above and to the right of the point, which Windows moves to
+            // fit the screen; the command comes back here rather than as
+            // WM_COMMAND.
+            let flags =
+                TPM_RIGHTBUTTON | TPM_BOTTOMALIGN | TPM_LEFTALIGN | TPM_RETURNCMD | TPM_NONOTIFY;
             let picked = TrackPopupMenuEx(menu, flags.0, at.x, at.y, window, None);
             let _ = PostMessageW(Some(window), WM_NULL, WPARAM(0), LPARAM(0));
             let _ = DestroyMenu(menu);
@@ -276,13 +270,14 @@ fn flags(entry: &Entry) -> MENU_ITEM_FLAGS {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_desktop::on_hidden_desktop;
     use windows::Win32::Graphics::Gdi::{
         BI_RGB, BITMAPINFO, BITMAPINFOHEADER, DIB_RGB_COLORS, DeleteObject, GetDC, GetDIBits,
         ReleaseDC,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
-        GetIconInfo, GetMenuItemCount, GetMenuItemID, GetMenuState, GetMenuStringW, ICONINFO,
-        MF_BYPOSITION,
+        CreateWindowExW, DestroyWindow, GetIconInfo, GetMenuItemCount, GetMenuItemID, GetMenuState,
+        GetMenuStringW, ICONINFO, MF_BYPOSITION, WINDOW_EX_STYLE, WINDOW_STYLE,
     };
 
     fn alt_space() -> Option<Hotkey> {
@@ -399,6 +394,66 @@ mod tests {
                 (text, id, checked, grayed)
             })
             .collect()
+    }
+
+    /// A plain window that is never shown.
+    fn window() -> HWND {
+        let (ex, style) = (WINDOW_EX_STYLE(0), WINDOW_STYLE(0));
+        let none = (None, None, None, None);
+        unsafe {
+            CreateWindowExW(
+                ex,
+                w!("STATIC"),
+                w!(""),
+                style,
+                0,
+                0,
+                0,
+                0,
+                none.0,
+                none.1,
+                none.2,
+                none.3,
+            )
+        }
+        .expect("a window")
+    }
+
+    #[test]
+    fn a_desktop_with_no_taskbar_takes_no_icon() {
+        on_hidden_desktop(|| {
+            let window = window();
+            assert!(!Shell.show(window, "hyalo · Alt+Space"));
+            Shell.remove(window);
+            unsafe { DestroyWindow(window) }.expect("destroy");
+        });
+    }
+
+    #[test]
+    fn the_icon_tells_its_window_with_the_tray_message_and_shows_its_tip() {
+        let icon = icon(16).expect("the icon");
+        let data = data(HWND::default(), Some(icon), "hyalo · Alt+Space");
+        unsafe { DestroyIcon(icon) }.expect("destroy the icon");
+        assert_eq!(data.uCallbackMessage, WM_TRAY);
+        assert_eq!(data.uID, ICON_ID);
+        assert_eq!(data.uFlags, NIF_MESSAGE | NIF_TIP | NIF_SHOWTIP | NIF_ICON);
+        assert_eq!(unsafe { data.Anonymous.uVersion }, NOTIFYICON_VERSION_4);
+        let tip: Vec<u16> = "hyalo · Alt+Space\0".encode_utf16().collect();
+        assert_eq!(&data.szTip[..tip.len()], &tip[..]);
+        let bare = data_without_icon();
+        assert_eq!(bare.uFlags, NIF_MESSAGE | NIF_TIP | NIF_SHOWTIP);
+    }
+
+    fn data_without_icon() -> NOTIFYICONDATAW {
+        data(HWND::default(), None, "")
+    }
+
+    #[test]
+    fn a_tip_too_long_for_the_shell_is_cut_and_still_ends() {
+        let long = "x".repeat(300);
+        let data = data(HWND::default(), None, &long);
+        assert_eq!(data.szTip[data.szTip.len() - 1], 0);
+        assert_eq!(data.szTip[data.szTip.len() - 2], u16::from(b'x'));
     }
 
     #[test]
