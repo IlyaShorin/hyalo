@@ -51,7 +51,7 @@ use windows::core::{BOOL, PCWSTR, Result, w};
 use crate::apps::Icon;
 use crate::autostart::Autostart;
 use crate::catalog::{self, Catalog, FileIcons, Found, Provider, Request};
-use crate::files::{self, Files, Roots};
+use crate::files::{self, Excluded, Files, Roots};
 use crate::highlight::utf16_ranges;
 use crate::hotkeys::{self, Hotkeys};
 use crate::keys::{self, Command, Held};
@@ -96,6 +96,9 @@ pub type Runner = Box<dyn Fn(&Action, bool)>;
 pub struct Source {
     pub provider: Provider,
     pub trusted: Duration,
+    /// What it leaves out of the folders it walks, if it walks any: the
+    /// config's to set.
+    pub excluded: Option<Excluded>,
 }
 
 /// What the window relies on from outside: the real ones in `run`,
@@ -128,16 +131,20 @@ impl Services {
     fn real() -> Self {
         let (files, writer) = Files::new();
         let drives: Roots = Arc::new(files::fixed_drives);
-        let walk = files::provider(writer, drives, files::default_snapshot());
+        let excluded = Excluded::default();
+        let snapshot = files::default_snapshot();
+        let walk = files::provider(writer, drives, snapshot, excluded.clone());
         Self {
             sources: vec![
                 Source {
                     provider: Arc::new(catalog::find_apps),
                     trusted: catalog::REFRESH_AFTER,
+                    excluded: None,
                 },
                 Source {
                     provider: walk,
                     trusted: files::REFRESH_AFTER,
+                    excluded: Some(excluded),
                 },
                 Source {
                     provider: rates::provider(
@@ -146,6 +153,7 @@ impl Services {
                         Arc::new(rates::moscow_today),
                     ),
                     trusted: rates::REFRESH_AFTER,
+                    excluded: None,
                 },
             ],
             files,
@@ -261,7 +269,27 @@ impl App {
         });
         let places = self.services.places.clone();
         self.places = places.with(&config.rank_higher, &config.rank_lower);
+        if self.leave_out(&config.exclude) {
+            self.find_if_stale();
+        }
         self.config = config;
+    }
+
+    /// Tells the sources that walk folders what to leave out; whether any
+    /// of them had something else, which makes what it found stale.
+    fn leave_out(&mut self, paths: &[String]) -> bool {
+        let mut changed = false;
+        for (source, found_at) in self.services.sources.iter().zip(&mut self.found_at) {
+            if source
+                .excluded
+                .as_ref()
+                .is_some_and(|excluded| excluded.set(paths))
+            {
+                *found_at = None;
+                changed = true;
+            }
+        }
+        changed
     }
 
     /// What to tell the user, if anything: a problem in the config comes
@@ -1162,6 +1190,7 @@ mod tests {
             sources: vec![Source {
                 provider,
                 trusted: catalog::REFRESH_AFTER,
+                excluded: None,
             }],
             files: Files::default(),
             icons,
@@ -1183,9 +1212,11 @@ mod tests {
         let (mut services, ran) = services(listing(&[]).0, picks);
         let (files, writer) = Files::new();
         services.files = files;
+        let excluded = Excluded::default();
         services.sources.push(Source {
-            provider: files::provider(writer, roots, None),
+            provider: files::provider(writer, roots, None, excluded.clone()),
             trusted: files::REFRESH_AFTER,
+            excluded: Some(excluded),
         });
         (services, ran)
     }
@@ -1857,6 +1888,37 @@ mod tests {
     }
 
     #[test]
+    fn folders_the_config_leaves_out_are_not_listed_and_change_when_saved() {
+        on_hidden_desktop(|| {
+            let tree = Scratch::new("window-excluded").with(&[
+                "keep\\",
+                "drop\\",
+                "keep\\notes.txt",
+                "drop\\notes.txt",
+            ]);
+            let excluding = |path: &str| format!("[folders]\nexclude = ['{path}']\n");
+            let (_scratch, config) =
+                config_file("window-config-exclude", &excluding(&tree.path("drop")));
+            let (mut services, _) = walking(just(&tree.0), None);
+            services.config = Some(config.clone());
+            let launcher = Launcher::serving(services);
+            launcher.search_for("notes", 1);
+            assert_eq!(listed(), ["notes.txt"]);
+            let kept = tree.path("keep\\notes.txt");
+            assert_eq!(
+                with_app(|app| app.results.rows()[0].item.id.0.clone()),
+                Some(kept)
+            );
+            std::fs::write(&config, excluding(&tree.path("keep"))).expect("save");
+            let dropped = tree.path("drop\\notes.txt");
+            launcher.pump_until(|app| {
+                let rows = app.results.rows();
+                rows.len() == 1 && rows[0].item.id.0 == dropped
+            });
+        });
+    }
+
+    #[test]
     fn the_icon_comes_back_when_explorer_restarts() {
         on_hidden_desktop(|| {
             let (launcher, taskbar, _) = in_the_tray(None, None);
@@ -2239,6 +2301,7 @@ mod tests {
         let source = Source {
             provider,
             trusted: rates::REFRESH_AFTER,
+            excluded: None,
         };
         (source, release)
     }

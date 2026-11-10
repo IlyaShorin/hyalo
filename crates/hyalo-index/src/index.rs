@@ -185,22 +185,28 @@ impl Index {
     /// compared regardless of case, as Windows compares them. Each name
     /// costs one pass over the index.
     pub fn find(&self, path: &str) -> Option<EntryId> {
-        let mut names = path.split('\\').filter(|name| !name.is_empty());
-        let mut at = self.child(NO_PARENT, names.next()?)?;
-        for name in names {
-            at = self.child(at, name)?;
-        }
-        Some(EntryId(at))
+        let path = lower(path.trim_end_matches('\\'));
+        let found = self.roots().find_map(|root| {
+            let rest = path.strip_prefix(&lower(self.name_at(root)))?;
+            let rest = match rest {
+                "" => rest,
+                _ => rest.strip_prefix('\\')?,
+            };
+            let mut names = rest.split('\\').filter(|name| !name.is_empty());
+            names.try_fold(root, |at, name| self.child(at, name))
+        });
+        found.map(EntryId)
     }
 
-    /// The live entry named `name` in the folder `parent`.
+    /// The live roots, such as `C:`, or a folder walked from the top.
+    fn roots(&self) -> impl Iterator<Item = u32> + '_ {
+        let roots = self.entries.iter().enumerate();
+        let roots = roots.filter(|(_, entry)| entry.is_live() && entry.is_root());
+        roots.map(|(at, _)| offset(at))
+    }
+
+    /// The live entry named `name`, lowercased, in the folder `parent`.
     fn child(&self, parent: u32, name: &str) -> Option<u32> {
-        let lower = |text: &str| {
-            text.chars()
-                .flat_map(char::to_lowercase)
-                .collect::<String>()
-        };
-        let name = lower(name);
         let named = |entry: &Entry| {
             entry.parent == parent && entry.is_live() && lower(self.name_of(*entry)) == name
         };
@@ -448,6 +454,11 @@ fn offset(at: usize) -> u32 {
     u32::try_from(at).expect("the index stays under 4 GB of names and 4 billion entries")
 }
 
+/// `text` lowercased, as Windows compares names: `Ё` as `ё`, never as `е`.
+fn lower(text: &str) -> String {
+    text.to_lowercase()
+}
+
 /// The name folded, if it can be a name: not empty, not too long either
 /// way, and one name, without a backslash, unless it is a root.
 fn checked(name: &str, root: bool) -> Result<String, Error> {
@@ -485,6 +496,18 @@ mod tests {
         assert_eq!(index.find(r"C:\Users\Me"), Some(me));
         assert_eq!(index.find(r"C:\USERS\me\NOTES.TXT"), Some(notes));
         assert_eq!(index.find(r"C:\Windows\System32\"), Some(system));
+    }
+
+    #[test]
+    fn finds_entries_under_a_root_named_by_a_whole_path() {
+        let mut index = Index::default();
+        let data = index.add_root(r"D:\Data").unwrap();
+        let notes = index.add(data, "notes.txt", false).unwrap();
+        index.add_root(r"D:\Data2").unwrap();
+        assert_eq!(index.find(r"d:\data"), Some(data));
+        assert_eq!(index.find(r"D:\Data\NOTES.txt"), Some(notes));
+        assert_eq!(index.find(r"D:\DataX\notes.txt"), None);
+        assert_eq!(index.find(r"D:\Data2\notes.txt"), None);
     }
 
     #[test]

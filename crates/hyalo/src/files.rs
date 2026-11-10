@@ -59,6 +59,46 @@ fn write(index: &RwLock<Index>) -> RwLockWriteGuard<'_, Index> {
     index.write().unwrap_or_else(PoisonError::into_inner)
 }
 
+/// What the walk leaves out, as the config last said: full paths, each
+/// with everything under it. The window sets it; the walk reads it as it
+/// goes, so a change reaches a walk under way too.
+#[derive(Clone, Default)]
+pub struct Excluded(Arc<RwLock<Vec<String>>>);
+
+impl Excluded {
+    /// Leaves out `paths` from now on; whether they differ from before.
+    pub fn set(&self, paths: &[String]) -> bool {
+        let mut held = self.0.write().unwrap_or_else(PoisonError::into_inner);
+        let changed = *held != paths;
+        held.clone_from(&paths.to_vec());
+        changed
+    }
+
+    fn paths(&self) -> Vec<String> {
+        self.0
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// The names left out of the folder at `folder`, lowercased.
+    fn within(&self, folder: &Path) -> Vec<String> {
+        let paths = self.0.read().unwrap_or_else(PoisonError::into_inner);
+        if paths.is_empty() {
+            return Vec::new();
+        }
+        let folder = lowercase(folder.to_string_lossy().trim_end_matches('\\'));
+        let split = paths.iter().filter_map(|path| path.rsplit_once('\\'));
+        let here = split.filter(|(parent, _)| lowercase(parent) == folder);
+        here.map(|(_, name)| lowercase(name)).collect()
+    }
+}
+
+/// `text` lowercased, as Windows compares names.
+fn lowercase(text: &str) -> String {
+    text.to_lowercase()
+}
+
 /// How long the files found are trusted before showing the launcher walks
 /// the drives again: a walk costs the disks and a core for a while.
 pub const REFRESH_AFTER: Duration = Duration::from_secs(20 * 60);
@@ -70,9 +110,15 @@ const TICK: Duration = Duration::from_millis(250);
 pub type Roots = Arc<dyn Fn() -> Vec<PathBuf> + Send + Sync>;
 
 /// The files provider. The first run loads the snapshot, if there is
-/// one; every run walks the roots and saves the snapshot. A run that
-/// starts while another walks does nothing.
-pub fn provider(writer: Writer, roots: Roots, snapshot: Option<PathBuf>) -> Provider {
+/// one; every run takes out what is `excluded`, walks the roots leaving
+/// it out, and saves the snapshot. A run that starts while another walks
+/// does nothing: the walk under way leaves out what is excluded by then.
+pub fn provider(
+    writer: Writer,
+    roots: Roots,
+    snapshot: Option<PathBuf>,
+    excluded: Excluded,
+) -> Provider {
     let writer = Mutex::new(writer);
     Arc::new(move |_: &Request, report: &dyn Fn(Found)| {
         let writer = match writer.try_lock() {
@@ -80,22 +126,58 @@ pub fn provider(writer: Writer, roots: Roots, snapshot: Option<PathBuf>) -> Prov
             Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
             Err(TryLockError::WouldBlock) => return,
         };
-        refresh(&writer.0, &*roots, snapshot.as_deref(), report);
+        let walk = Walk {
+            roots: &*roots,
+            snapshot: snapshot.as_deref(),
+            excluded: &excluded,
+        };
+        walk.refresh(&writer.0, report);
     })
 }
 
-/// Loads the snapshot into an empty index, then asks for the roots,
-/// walks them and saves the snapshot.
-fn refresh(
-    shared: &RwLock<Index>,
-    roots: &dyn Fn() -> Vec<PathBuf>,
-    snapshot: Option<&Path>,
-    report: &dyn Fn(Found),
-) {
-    if read(shared).is_empty() {
-        load_into(shared, snapshot, report);
+/// What a run of the provider goes by.
+struct Walk<'a> {
+    roots: &'a dyn Fn() -> Vec<PathBuf>,
+    snapshot: Option<&'a Path>,
+    excluded: &'a Excluded,
+}
+
+impl Walk<'_> {
+    /// Loads the snapshot into an empty index; takes out what is
+    /// excluded, before the walk and again after it, for what was
+    /// excluded while it went; walks the roots and saves the snapshot.
+    fn refresh(&self, shared: &RwLock<Index>, report: &dyn Fn(Found)) {
+        if read(shared).is_empty() {
+            load_into(shared, self.snapshot, report);
+        }
+        prune(shared, self.excluded, report);
+        walk_into(shared, &(self.roots)(), self.excluded, report);
+        prune(shared, self.excluded, report);
+        save_to(shared, self.snapshot);
     }
-    walk_into(shared, &roots(), report);
+}
+
+/// Takes what is excluded out of the index, with everything under it,
+/// and says so if anything was there.
+fn prune(shared: &RwLock<Index>, excluded: &Excluded, report: &dyn Fn(Found)) {
+    let mut index = write(shared);
+    let found: Vec<_> = excluded
+        .paths()
+        .iter()
+        .filter_map(|path| index.find(path))
+        .collect();
+    for entry in &found {
+        // An entry under another excluded one went with it.
+        let _ = index.remove(*entry);
+    }
+    drop(index);
+    if !found.is_empty() {
+        report(Found::Files);
+    }
+}
+
+/// Saves the index at `snapshot`, if there is one.
+fn save_to(shared: &RwLock<Index>, snapshot: Option<&Path>) {
     let index = read(shared);
     if let Some(path) = snapshot
         && let Err(error) = save(&index, path)
@@ -123,15 +205,20 @@ fn load_into(shared: &RwLock<Index>, snapshot: Option<&Path>, report: &dyn Fn(Fo
 /// Walks the roots: straight into an empty index, so files turn up as
 /// they are found, or into a fresh one swapped in whole. Either way gives
 /// back the room kept for growth.
-fn walk_into(shared: &RwLock<Index>, roots: &[PathBuf], report: &dyn Fn(Found)) {
+fn walk_into(
+    shared: &RwLock<Index>,
+    roots: &[PathBuf],
+    excluded: &Excluded,
+    report: &dyn Fn(Found),
+) {
     let started = Instant::now();
     let empty = read(shared).is_empty();
     if empty {
-        walk_all(roots, shared, &|| report(Found::Files));
+        walk_all(roots, shared, excluded, &|| report(Found::Files));
         write(shared).shrink_to_fit();
     } else {
         let fresh = RwLock::default();
-        walk_all(roots, &fresh, &|| {});
+        walk_all(roots, &fresh, excluded, &|| {});
         let mut fresh = fresh.into_inner().unwrap_or_else(PoisonError::into_inner);
         fresh.shrink_to_fit();
         *write(shared) = fresh;
@@ -176,11 +263,11 @@ fn save(index: &Index, path: &Path) -> io::Result<()> {
 
 /// Walks every root into `into`, each on a thread of its own; `tick`
 /// runs on this thread every so often until all are done.
-fn walk_all(roots: &[PathBuf], into: &RwLock<Index>, tick: &dyn Fn()) {
+fn walk_all(roots: &[PathBuf], into: &RwLock<Index>, excluded: &Excluded, tick: &dyn Fn()) {
     thread::scope(|scope| {
         let walkers: Vec<_> = roots
             .iter()
-            .map(|root| scope.spawn(move || walk(root, into)))
+            .map(|root| scope.spawn(move || walk(root, into, excluded)))
             .collect();
         while !walkers.iter().all(|walker| walker.is_finished()) {
             thread::sleep(TICK);
@@ -190,14 +277,15 @@ fn walk_all(roots: &[PathBuf], into: &RwLock<Index>, tick: &dyn Fn()) {
 }
 
 /// Adds `root` to the index as a root of its own, then everything under
-/// it, a folder at a time.
-fn walk(root: &Path, into: &RwLock<Index>) {
+/// it that is not excluded, a folder at a time.
+fn walk(root: &Path, into: &RwLock<Index>, excluded: &Excluded) {
     let Ok(top) = write(into).add_root(&root_name(root)) else {
         return;
     };
     let mut folders = vec![(root.to_path_buf(), top)];
     while let Some((folder, id)) = folders.pop() {
-        let children = listing(&folder, id == top);
+        let left_out = excluded.within(&folder);
+        let children = listing(&folder, id == top, &left_out);
         let mut index = write(into);
         for child in children {
             let Ok(entry) = index.add(id, &child.name, child.folder) else {
@@ -224,15 +312,16 @@ struct Child {
     enter: bool,
 }
 
-/// What the walk keeps of a folder's entries; nothing if it cannot be
-/// read (no rights, gone since).
-fn listing(folder: &Path, at_root: bool) -> Vec<Child> {
+/// What the walk keeps of a folder's entries, but for the names
+/// `left_out` (lowercased); nothing if it cannot be read (no rights,
+/// gone since).
+fn listing(folder: &Path, at_root: bool, left_out: &[String]) -> Vec<Child> {
     let Ok(entries) = fs::read_dir(folder) else {
         return Vec::new();
     };
-    entries
-        .filter_map(|entry| child(entry.ok()?, at_root))
-        .collect()
+    let children = entries.filter_map(|entry| child(entry.ok()?, at_root));
+    let kept = |child: &Child| left_out.is_empty() || !left_out.contains(&lowercase(&child.name));
+    children.filter(kept).collect()
 }
 
 /// An entry as a child, unless the walk leaves it out. A junction or a
@@ -335,9 +424,80 @@ mod tests {
     use std::cell::RefCell;
 
     fn walked(root: &Path) -> Index {
+        walked_leaving_out(root, &Excluded::default())
+    }
+
+    fn walked_leaving_out(root: &Path, excluded: &Excluded) -> Index {
         let index = RwLock::default();
-        walk(root, &index);
+        walk(root, &index, excluded);
         index.into_inner().expect("the index")
+    }
+
+    /// What leaves out `paths`.
+    fn excluding(paths: &[String]) -> Excluded {
+        let excluded = Excluded::default();
+        excluded.set(paths);
+        excluded
+    }
+
+    #[test]
+    fn setting_what_is_left_out_says_whether_it_changed() {
+        let excluded = Excluded::default();
+        assert!(!excluded.set(&[]), "nothing to nothing");
+        let one = [r"C:\Windows\WinSxS".to_string()];
+        assert!(excluded.set(&one));
+        assert!(!excluded.set(&one), "the same again");
+        assert!(excluded.set(&[]));
+    }
+
+    #[test]
+    fn the_names_left_out_of_a_folder_are_those_excluded_in_it() {
+        let paths = [
+            r"C:\Windows\WinSxS".to_string(),
+            r"c:\windows\Installer".to_string(),
+            r"C:\Temp".to_string(),
+            r"D:\Windows\Other".to_string(),
+        ];
+        let excluded = excluding(&paths);
+        assert_eq!(
+            excluded.within(Path::new(r"C:\WINDOWS")),
+            ["winsxs", "installer"]
+        );
+        assert_eq!(
+            excluded.within(Path::new(r"C:\")),
+            ["temp"],
+            "at a drive's root"
+        );
+        assert_eq!(
+            excluded.within(Path::new(r"C:\Windows\System32")),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            Excluded::default().within(Path::new(r"C:\Windows")),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn a_walk_leaves_out_what_is_excluded_with_everything_in_it() {
+        let folder = Scratch::new("excluded").with(&[
+            "kept\\",
+            r"kept\notes.txt",
+            "Dropped\\",
+            r"Dropped\notes.txt",
+            r"Dropped\deeper\",
+            r"Dropped\deeper\notes.md",
+            "secret.txt",
+        ]);
+        let paths = [folder.path("dropped"), folder.path("SECRET.TXT")];
+        let index = walked_leaving_out(&folder.0, &excluding(&paths));
+        assert_eq!(found(&index, "notes"), [folder.path(r"kept\notes.txt")]);
+        assert_eq!(
+            index.find(&folder.path("Dropped")),
+            None,
+            "the folder itself too"
+        );
+        assert_eq!(found(&index, "secret"), Vec::<String>::new());
     }
 
     fn found(index: &Index, query: &str) -> Vec<String> {
@@ -412,7 +572,7 @@ mod tests {
 
     #[test]
     fn a_folder_it_cannot_read_lists_nothing() {
-        assert!(listing(Path::new(r"C:\no such folder here"), false).is_empty());
+        assert!(listing(Path::new(r"C:\no such folder here"), false, &[]).is_empty());
     }
 
     #[test]
@@ -424,10 +584,86 @@ mod tests {
     /// A provider walking `folder`, keeping its snapshot at `snapshot`, and
     /// what the window searches.
     fn walking(folder: &Scratch, snapshot: Option<PathBuf>) -> (Provider, Files) {
+        let (provider, files, _) = walking_leaving_out(folder, snapshot);
+        (provider, files)
+    }
+
+    /// The same, and what it leaves out.
+    fn walking_leaving_out(
+        folder: &Scratch,
+        snapshot: Option<PathBuf>,
+    ) -> (Provider, Files, Excluded) {
         let (files, writer) = Files::new();
         let root = folder.0.clone();
         let roots: Roots = Arc::new(move || vec![root.clone()]);
-        (provider(writer, roots, snapshot), files)
+        let excluded = Excluded::default();
+        (
+            provider(writer, roots, snapshot, excluded.clone()),
+            files,
+            excluded,
+        )
+    }
+
+    #[test]
+    fn a_folder_excluded_after_a_walk_leaves_the_index_at_the_next_run() {
+        let folder = Scratch::new("pruned").with(&[
+            "kept\\",
+            r"kept\notes.txt",
+            "gone\\",
+            r"gone\notes.txt",
+        ]);
+        let (provider, files, excluded) = walking_leaving_out(&folder, None);
+        run(&provider);
+        assert_eq!(search(&files, "notes").len(), 2);
+        excluded.set(&[folder.path("gone")]);
+        run(&provider);
+        assert_eq!(search(&files, "notes"), [folder.path(r"kept\notes.txt")]);
+        excluded.set(&[]);
+        run(&provider);
+        assert_eq!(
+            search(&files, "notes").len(),
+            2,
+            "back once no longer excluded"
+        );
+    }
+
+    #[test]
+    fn a_snapshot_holding_what_is_excluded_now_loses_it_before_the_walk() {
+        let folder = Scratch::new("pruned-snapshot").with(&["gone\\", r"gone\notes.txt"]);
+        let snapshot = folder.0.join("files.idx");
+        let (first, _) = walking(&folder, Some(snapshot.clone()));
+        run(&first);
+        let (gated, gate) = std::sync::mpsc::channel::<()>();
+        let (files, writer) = Files::new();
+        let gate = Mutex::new(gate);
+        let roots: Roots = Arc::new(move || {
+            let _ = gate.lock().expect("the gate").recv();
+            Vec::new()
+        });
+        let excluded = excluding(&[folder.path("gone")]);
+        let provider = provider(writer, roots, Some(snapshot), excluded);
+        let request = Request {
+            icon_size: 32,
+            known: Default::default(),
+        };
+        std::thread::scope(|scope| {
+            let walker = scope.spawn(|| provider(&request, &|_| {}));
+            // Before the walk asks for its roots, the snapshot is in and
+            // what is excluded is out.
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let pruned = || {
+                let index = read(&files.0);
+                !index.is_empty() && index.find(&folder.path("gone")).is_none()
+            };
+            while !pruned() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            let (pruned, listed) = (pruned(), search(&files, "notes"));
+            gated.send(()).expect("let the walk go");
+            walker.join().expect("the run");
+            assert!(pruned, "pruned before the walk");
+            assert!(listed.is_empty(), "{listed:?}");
+        });
     }
 
     fn run(provider: &Provider) -> usize {
@@ -508,7 +744,7 @@ mod tests {
             *seen.lock().expect("seen") = search(&watched, "kept");
             vec![]
         });
-        run(&provider(writer, roots, Some(path)));
+        run(&provider(writer, roots, Some(path), Excluded::default()));
         let seen = before_walking.lock().expect("seen").clone();
         assert_eq!(seen, [folder.path("kept.txt")]);
     }
@@ -538,7 +774,7 @@ mod tests {
             gate.1.wait();
             vec![root.clone()]
         });
-        let provider = provider(writer, roots, None);
+        let provider = provider(writer, roots, None, Excluded::default());
         let first = Arc::clone(&provider);
         let walker = thread::spawn(move || run(&first));
         shared.0.wait();
