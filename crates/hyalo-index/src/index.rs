@@ -151,6 +151,8 @@ pub struct Index {
     free: Vec<u32>,
     /// Bytes of `names` that no entry names any more.
     garbage: usize,
+    /// Counts the changes made.
+    version: u64,
 }
 
 impl Default for Index {
@@ -163,6 +165,7 @@ impl Default for Index {
             folded: String::new(),
             free: Vec::new(),
             garbage: 0,
+            version: 0,
         }
     }
 }
@@ -201,6 +204,7 @@ impl Index {
     /// Removes an entry and, if it is a folder, everything under it.
     pub fn remove(&mut self, id: EntryId) -> Result<(), Error> {
         self.live(id)?;
+        self.version += 1;
         self.unlink(id.0);
         let mut doomed = vec![id.0];
         while let Some(at) = doomed.pop() {
@@ -224,6 +228,7 @@ impl Index {
         if let Some(there) = self.child(parent.0, name).filter(|&at| at != id.0) {
             self.remove(EntryId(there))?;
         }
+        self.version += 1;
         self.unlink(id.0);
         self.garbage += entry.name_len();
         self.entries[id.0 as usize] = self.store(parent.0, name, &folded, entry.is_folder());
@@ -248,6 +253,18 @@ impl Index {
 
     pub fn is_folder(&self, id: EntryId) -> Option<bool> {
         Some(self.live(id).ok()?.is_folder())
+    }
+
+    /// The folder the entry is in; none for a root, or an entry removed.
+    pub fn parent(&self, id: EntryId) -> Option<EntryId> {
+        let entry = self.live(id).ok()?;
+        (!entry.is_root()).then_some(EntryId(entry.parent))
+    }
+
+    /// A number that changes with every change made, so a reader can tell
+    /// whether there was one.
+    pub fn version(&self) -> u64 {
+        self.version
     }
 
     /// The full path: the root's name, then every folder's, joined by
@@ -523,6 +540,7 @@ impl Index {
 
     /// Stores a new entry, in the place of a removed one if there is one.
     fn place(&mut self, parent: u32, name: &str, folded: &str, folder: bool) -> EntryId {
+        self.version += 1;
         let entry = self.store(parent, name, folded, folder);
         let at = match self.free.pop() {
             Some(at) => {
@@ -942,6 +960,39 @@ mod tests {
         assert!(index.memory() < 4096, "{} bytes", index.memory());
         assert_eq!(index.find(r"C:\Users\Me\notes 9999.txt"), Some(notes));
         assert_eq!(index.find(r"C:\Windows\System32").map(|_| ()), Some(()));
+    }
+
+    #[test]
+    fn an_entry_knows_its_folder_and_a_root_has_none() {
+        let (mut index, [c, users, me, notes, ..]) = drive();
+        assert_eq!(index.parent(notes), Some(me));
+        assert_eq!(index.parent(users), Some(c));
+        assert_eq!(index.parent(c), None);
+        index.remove(me).unwrap();
+        assert_eq!(index.parent(notes), None, "removed");
+    }
+
+    #[test]
+    fn the_version_moves_with_every_change_and_only_then() {
+        let (mut index, [c, _, me, notes, windows, _]) = drive();
+        let mut seen = vec![index.version()];
+        let mut changed = |index: &Index| {
+            let moved = !seen.contains(&index.version());
+            seen.push(index.version());
+            moved
+        };
+        index.put(me, "notes.txt", false).unwrap();
+        assert!(!changed(&index), "put of what is there");
+        index.put(me, "new.txt", false).unwrap();
+        assert!(changed(&index), "put");
+        index.add(c, "x", false).unwrap();
+        assert!(changed(&index), "add");
+        index.rename(notes, windows, "n.txt").unwrap();
+        assert!(changed(&index), "rename");
+        index.remove(notes).unwrap();
+        assert!(changed(&index), "remove");
+        assert_eq!(index.remove(notes), Err(Error::NoSuchEntry));
+        assert!(!changed(&index), "a refused change");
     }
 
     #[test]
