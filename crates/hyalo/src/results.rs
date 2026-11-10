@@ -2,7 +2,6 @@
 
 use std::collections::HashSet;
 
-use hyalo_core::calculator;
 use hyalo_core::frecency::{Frecency, Timestamp};
 use hyalo_core::item::Item;
 use hyalo_core::places::Places;
@@ -28,11 +27,11 @@ pub struct Results {
 }
 
 impl Results {
-    /// The calculator's answer if the query is arithmetic, then the best
-    /// of the items ranked for `query` and of the `files` the index found
-    /// for it: `MAX_ROWS` in all, the first one selected. Equal scores
-    /// list items first; something found both ways is listed once. An
-    /// empty query lists nothing: it would match everything equally.
+    /// The best of the items ranked for `query` and of the `files` the
+    /// index found for it: `MAX_ROWS` in all, the first one selected.
+    /// Equal scores list items first; something found both ways is listed
+    /// once. An empty query lists nothing: it would match everything
+    /// equally.
     pub fn search<'a>(
         query: &str,
         items: impl IntoIterator<Item = &'a Item>,
@@ -44,10 +43,6 @@ impl Results {
         if query.is_empty() {
             return Self::default();
         }
-        let answer = calculator::answer(query).map(|item| Listed {
-            item,
-            matched: Vec::new(),
-        });
         let mut ranked = rank(query, items, frecency, places, now);
         ranked.extend(files);
         ranked.sort_by(|one, other| other.score.total_cmp(&one.score));
@@ -59,24 +54,26 @@ impl Results {
                 item: ranked.item,
                 matched: ranked.found.positions,
             });
-        let rows = answer.into_iter().chain(ranked).take(MAX_ROWS).collect();
+        let rows = ranked.take(MAX_ROWS).collect();
         Self { rows, selected: 0 }
     }
 
-    /// The rows for `query` in items that changed, such as after the
-    /// provider looked again. The item selected before stays selected
-    /// where it moved, so what Enter opens does not change under the
-    /// user's fingers; if it is gone, the first row is.
-    pub fn refreshed<'a>(
-        &self,
-        query: &str,
-        items: impl IntoIterator<Item = &'a Item>,
-        files: Vec<Ranked>,
-        frecency: &Frecency,
-        places: &Places,
-        now: Timestamp,
-    ) -> Self {
-        let mut fresh = Self::search(query, items, files, frecency, places, now);
+    /// These rows under `answer`, if there is one, still `MAX_ROWS` in
+    /// all: the answer, such as the calculator's, comes first.
+    pub fn answered(mut self, answer: Option<Item>) -> Self {
+        let answer = answer.map(|item| Listed {
+            item,
+            matched: Vec::new(),
+        });
+        self.rows = answer.into_iter().chain(self.rows).take(MAX_ROWS).collect();
+        self
+    }
+
+    /// `fresh` rows for the same query, such as after the provider looked
+    /// again, with the item selected here still selected where it moved,
+    /// so what Enter opens does not change under the user's fingers; if
+    /// it is gone, the first row is.
+    pub fn kept(&self, mut fresh: Self) -> Self {
         let kept = self.picked().and_then(|picked| {
             let mut rows = fresh.rows.iter();
             rows.position(|row| row.item.id == picked.item.id)
@@ -124,6 +121,7 @@ impl Results {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hyalo_core::calculator;
     use hyalo_core::item::{Action, ItemId, Kind};
 
     const NOW: Timestamp = Timestamp(1_700_000_000);
@@ -208,18 +206,29 @@ mod tests {
         assert_eq!(titles(&results), &many[..MAX_ROWS]);
     }
 
+    /// The rows for `query` under the calculator's answer.
+    fn answered(query: &str, items: &[Item]) -> Results {
+        search(query, items).answered(calculator::answer(query))
+    }
+
     #[test]
-    fn an_arithmetic_query_lists_its_answer_first() {
-        let results = search("2+2", &apps(&["2+2 Notes", "Paint"]));
+    fn an_answer_is_listed_first() {
+        let results = answered("2+2", &apps(&["2+2 Notes", "Paint"]));
         assert_eq!(titles(&results), ["4", "2+2 Notes"]);
         assert_eq!(picked(&results), Some("4"));
+    }
+
+    #[test]
+    fn no_answer_leaves_the_rows_as_they_are() {
+        let results = search("note", &apps(&["Notes"])).answered(None);
+        assert_eq!(titles(&results), ["Notes"]);
     }
 
     #[test]
     fn the_answer_takes_one_of_the_eight_rows() {
         let many: Vec<String> = (1..=10).map(|n| format!("1+1 App {n:02}")).collect();
         let many: Vec<&str> = many.iter().map(String::as_str).collect();
-        let results = search("1+1", &apps(&many));
+        let results = answered("1+1", &apps(&many));
         assert_eq!(titles(&results)[0], "2");
         assert_eq!(titles(&results)[1..], many[..MAX_ROWS - 1]);
     }
@@ -257,16 +266,7 @@ mod tests {
     }
 
     fn refreshed(results: &Results, query: &str, items: &[Item]) -> Results {
-        let (frecency, places) = (&Frecency::default(), &Places::default());
-        results.refreshed(query, items, Vec::new(), frecency, places, NOW)
-    }
-
-    #[test]
-    fn a_refresh_lists_the_files_found_too() {
-        let (frecency, places) = (&Frecency::default(), &Places::default());
-        let files = rank("notes", &[file(r"C:\notes.txt")], frecency, places, NOW);
-        let results = Results::default().refreshed("notes", [], files, frecency, places, NOW);
-        assert_eq!(titles(&results), ["notes.txt"]);
+        results.kept(search(query, items))
     }
 
     #[test]

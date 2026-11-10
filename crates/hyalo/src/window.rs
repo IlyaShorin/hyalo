@@ -15,6 +15,7 @@ use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::{Duration, Instant, SystemTime};
 
+use hyalo_core::calculator;
 use hyalo_core::frecency::{Frecency, Timestamp};
 use hyalo_core::item::{Action, Item, ItemId, Kind};
 use hyalo_core::places::Places;
@@ -262,11 +263,18 @@ impl App {
 
     /// Lists what the query finds, best first, the first row selected.
     fn search(&mut self) {
-        let files = self.file_hits();
+        self.results = self.listed();
+        self.fetch_icons();
+    }
+
+    /// The rows for the query: its answer, if it has one, then the best
+    /// items and files.
+    fn listed(&self) -> Results {
+        let query = self.query.text();
         let items = self.catalog.items.iter().chain(&self.catalog.picked);
         let (frecency, places) = (&self.frecency, &self.services.places);
-        self.results = Results::search(self.query.text(), items, files, frecency, places, now());
-        self.fetch_icons();
+        let found = Results::search(query, items, self.file_hits(), frecency, places, now());
+        found.answered(calculator::answer(query))
     }
 
     /// The files and folders the index finds for the query: enough to
@@ -338,12 +346,7 @@ impl App {
         for found in self.found.1.try_iter() {
             self.catalog.take(found);
         }
-        let files = self.file_hits();
-        let items = self.catalog.items.iter().chain(&self.catalog.picked);
-        let (query, frecency, places) = (self.query.text(), &self.frecency, &self.services.places);
-        self.results = self
-            .results
-            .refreshed(query, items, files, frecency, places, now());
+        self.results = self.results.kept(self.listed());
         self.fetch_icons();
         match unsafe { IsWindowVisible(self.hwnd) }.as_bool() {
             true => self.present(),
