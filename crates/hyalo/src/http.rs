@@ -69,8 +69,11 @@ impl Exchange {
                 flags(address.secure),
             )
         })?;
+        // A GET sends no body, and a request without callbacks needs no
+        // context for them.
+        let (no_body, no_context) = (u32::default(), usize::default());
         unsafe {
-            WinHttpSendRequest(request.0, None, None, 0, 0, 0)?;
+            WinHttpSendRequest(request.0, None, None, no_body, no_body, no_context)?;
             WinHttpReceiveResponse(request.0, std::ptr::null_mut())?;
         }
         Ok(Self {
@@ -235,12 +238,21 @@ mod tests {
     }
 
     #[test]
-    fn nobody_listening_is_an_error() {
-        let port = {
-            let listener = TcpListener::bind("127.0.0.1:0").expect("a free port");
-            listener.local_addr().expect("an address").port()
-        };
+    fn a_server_that_hangs_up_without_answering_is_an_error() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("a free port");
+        let port = listener.local_addr().expect("an address").port();
+        let server = std::thread::spawn(move || drop(listener.accept().expect("a request")));
         assert!(get(&local(port, false)).is_err());
+        server.join().expect("the server");
+    }
+
+    #[test]
+    fn an_address_without_a_host_is_an_error() {
+        let nowhere = Address {
+            host: "",
+            ..local(80, false)
+        };
+        assert!(get(&nowhere).is_err());
     }
 
     #[test]
