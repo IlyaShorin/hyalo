@@ -886,6 +886,26 @@ mod tests {
     }
 
     #[test]
+    fn a_currency_row_shows_its_signs_at_100_percent() {
+        on_hidden_desktop(|| {
+            let id = ItemId("hyalo:currency".to_string());
+            let scene = Scene {
+                query: "100 usd",
+                rows: vec![Row {
+                    id: &id,
+                    title: "8\u{A0}275.36\u{A0}₽",
+                    subtitle: "100 USD → RUB · Bank of Russia, 10.11.2026 · Enter to copy",
+                    highlights: Vec::new(),
+                    icon: None,
+                }],
+                selected: 0,
+            };
+            let frame = drawn(&scene, (720, 128), 96);
+            assert_looks_like("currency-100", &frame);
+        });
+    }
+
+    #[test]
     fn the_picture_is_composed_above_the_window_content() {
         on_hidden_desktop(|| {
             let canvas = Canvas::new();

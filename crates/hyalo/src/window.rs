@@ -15,7 +15,6 @@ use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::{Duration, Instant, SystemTime};
 
-use hyalo_core::calculator;
 use hyalo_core::frecency::{Frecency, Timestamp};
 use hyalo_core::item::{Action, Item, ItemId, Kind};
 use hyalo_core::places::Places;
@@ -54,7 +53,7 @@ use crate::keys::{self, Command, Held};
 use crate::layout::{self, Rect};
 use crate::query::Query;
 use crate::render::{Renderer, Row, Scene};
-use crate::results::{Listed, MAX_ROWS, Results};
+use crate::results::{self, Listed, MAX_ROWS, Results};
 use crate::{http, launch, rates, store};
 
 const HOTKEY_TOGGLE: i32 = 1;
@@ -282,7 +281,7 @@ impl App {
         let items = self.catalog.items.iter().chain(&self.catalog.picked);
         let (frecency, places) = (&self.frecency, &self.services.places);
         let found = Results::search(query, items, self.file_hits(), frecency, places, now());
-        found.answered(calculator::answer(query))
+        found.answered(results::answer(query, self.catalog.rates.as_ref()))
     }
 
     /// The files and folders the index finds for the query: enough to
@@ -1497,6 +1496,66 @@ mod tests {
             let copy = Action::CopyText("6".to_string());
             assert_eq!(*ran.borrow(), [(copy, false)]);
             assert!(!launcher.visible());
+        });
+    }
+
+    /// A rates source that hands over the fixture's rates, of 10.11.2026,
+    /// once the test lets it go.
+    fn rating() -> (Source, Sender<()>) {
+        let (release, gate) = channel::<()>();
+        let gate = Mutex::new(gate);
+        let provider: Provider = Arc::new(move |_: &Request, report: &dyn Fn(Found)| {
+            let _ = gate.lock().expect("the gate").recv();
+            report(Found::Rates(rates::tests::fixture()));
+        });
+        let source = Source {
+            provider,
+            trusted: rates::REFRESH_AFTER,
+        };
+        (source, release)
+    }
+
+    /// The first row: what it shows, and its second line.
+    fn first_row() -> (String, String) {
+        let first = with_app(|app| app.results.rows()[0].item.clone()).expect("app state");
+        (first.title, first.subtitle)
+    }
+
+    #[test]
+    fn a_currency_lists_its_conversion_on_top_and_enter_copies_it() {
+        on_hidden_desktop(|| {
+            let (source, release) = rating();
+            let (mut services, ran) = services(listing(&["Notepad"]).0, None);
+            services.sources.push(source);
+            let launcher = Launcher::serving(services);
+            release.send(()).expect("let the rates go");
+            launcher.pump_until(|app| app.catalog.rates.is_some());
+            launcher.type_text("100 usd");
+            assert_eq!(launcher.rect(), launcher.placement().rect(1));
+            let (title, subtitle) = first_row();
+            assert_eq!(title, "8\u{A0}275.36\u{A0}₽");
+            assert!(subtitle.contains("10.11.2026"), "{subtitle}");
+            launcher.press(VK_RETURN);
+            let copy = Action::CopyText("8275.36".to_string());
+            assert_eq!(*ran.borrow(), [(copy, false)]);
+            assert!(!launcher.visible());
+        });
+    }
+
+    #[test]
+    fn rates_found_while_a_currency_is_typed_answer_it_at_once() {
+        on_hidden_desktop(|| {
+            let (source, release) = rating();
+            let (mut services, _) = services(listing(&[]).0, None);
+            services.sources.push(source);
+            let launcher = Launcher::serving(services);
+            launcher.type_text("400 rub");
+            let listed = with_app(|app| titles(app)).expect("app state");
+            assert_eq!(listed, Vec::<String>::new());
+            release.send(()).expect("let the rates go");
+            launcher.pump_until(|app| app.results.rows().len() == 1);
+            assert_eq!(first_row().0, "4.83\u{A0}$");
+            assert_eq!(launcher.rect(), launcher.placement().rect(1));
         });
     }
 

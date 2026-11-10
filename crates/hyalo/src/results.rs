@@ -6,9 +6,18 @@ use hyalo_core::frecency::{Frecency, Timestamp};
 use hyalo_core::item::Item;
 use hyalo_core::places::Places;
 use hyalo_core::rank::{Ranked, rank};
+use hyalo_core::rates::Rates;
+use hyalo_core::{calculator, currency};
 
 /// The most rows the window lists.
 pub const MAX_ROWS: usize = 8;
+
+/// The answer for `query`, listed first: the calculator's when the query
+/// is arithmetic, else a currency conversion at `rates`, once there are
+/// any.
+pub fn answer(query: &str, rates: Option<&Rates>) -> Option<Item> {
+    calculator::answer(query).or_else(|| currency::answer(query, rates?))
+}
 
 /// One row of the list: an item, and the letters of its title the query
 /// matched, as ascending `char` indices, to highlight.
@@ -121,7 +130,6 @@ impl Results {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hyalo_core::calculator;
     use hyalo_core::item::{Action, ItemId, Kind};
 
     const NOW: Timestamp = Timestamp(1_700_000_000);
@@ -216,6 +224,30 @@ mod tests {
         let results = answered("2+2", &apps(&["2+2 Notes", "Paint"]));
         assert_eq!(titles(&results), ["4", "2+2 Notes"]);
         assert_eq!(picked(&results), Some("4"));
+    }
+
+    fn answer_title(query: &str, rates: Option<&Rates>) -> Option<String> {
+        answer(query, rates).map(|item| item.title)
+    }
+
+    #[test]
+    fn arithmetic_is_answered_by_the_calculator() {
+        let rates = crate::rates::tests::fixture();
+        assert_eq!(answer_title("2+2*2", Some(&rates)), Some("6".to_string()));
+        assert_eq!(answer_title("2+2*2", None), Some("6".to_string()));
+    }
+
+    #[test]
+    fn a_currency_is_converted_at_the_rates() {
+        let rates = crate::rates::tests::fixture();
+        let title = answer_title("100 usd", Some(&rates));
+        assert_eq!(title, Some("8\u{A0}275.36\u{A0}₽".to_string()));
+    }
+
+    #[test]
+    fn without_rates_a_currency_has_no_answer() {
+        assert_eq!(answer_title("100 usd", None), None);
+        assert_eq!(answer_title("notepad", None), None);
     }
 
     #[test]
