@@ -181,6 +181,32 @@ impl Index {
         Some(names.join("\\"))
     }
 
+    /// The entry at the full path `path`, such as `C:\Users\me`, names
+    /// compared regardless of case, as Windows compares them. Each name
+    /// costs one pass over the index.
+    pub fn find(&self, path: &str) -> Option<EntryId> {
+        let mut names = path.split('\\').filter(|name| !name.is_empty());
+        let mut at = self.child(NO_PARENT, names.next()?)?;
+        for name in names {
+            at = self.child(at, name)?;
+        }
+        Some(EntryId(at))
+    }
+
+    /// The live entry named `name` in the folder `parent`.
+    fn child(&self, parent: u32, name: &str) -> Option<u32> {
+        let lower = |text: &str| {
+            text.chars()
+                .flat_map(char::to_lowercase)
+                .collect::<String>()
+        };
+        let name = lower(name);
+        let named = |entry: &Entry| {
+            entry.parent == parent && entry.is_live() && lower(self.name_of(*entry)) == name
+        };
+        self.entries.iter().position(named).map(offset)
+    }
+
     /// The row a search lists for the entry.
     pub fn item(&self, id: EntryId) -> Option<Item> {
         Some(Item::file(self.path(id)?, self.is_folder(id)?))
@@ -449,6 +475,46 @@ mod tests {
         let windows = index.add(c, "Windows", true).unwrap();
         let system = index.add(windows, "System32", true).unwrap();
         (index, [c, users, me, notes, windows, system])
+    }
+
+    #[test]
+    fn finds_an_entry_by_its_full_path_in_any_case() {
+        let (index, [c, _, me, notes, _, system]) = drive();
+        assert_eq!(index.find("C:"), Some(c));
+        assert_eq!(index.find(r"c:\"), Some(c));
+        assert_eq!(index.find(r"C:\Users\Me"), Some(me));
+        assert_eq!(index.find(r"C:\USERS\me\NOTES.TXT"), Some(notes));
+        assert_eq!(index.find(r"C:\Windows\System32\"), Some(system));
+    }
+
+    #[test]
+    fn a_path_that_is_not_there_finds_nothing() {
+        let (mut index, [_, users, ..]) = drive();
+        let d = index.add_root("D:").unwrap();
+        index.add(d, "Elsewhere", true).unwrap();
+        for path in [
+            r"C:\Users\You",
+            r"C:\Elsewhere",
+            r"E:\Users",
+            r"Users\Me",
+            "",
+            r"C:\Users\Me\notes",
+        ] {
+            assert_eq!(index.find(path), None, "{path}");
+        }
+        index.remove(users).unwrap();
+        assert_eq!(index.find(r"C:\Users"), None, "removed");
+        assert_eq!(index.find(r"C:\Users\Me"), None, "removed with its folder");
+    }
+
+    #[test]
+    fn compares_letters_beyond_ascii_regardless_of_case_but_not_ё_as_е() {
+        let mut index = Index::default();
+        let c = index.add_root("C:").unwrap();
+        let tree = index.add(c, "Ёлка", true).unwrap();
+        index.add(c, "Елка", true).unwrap();
+        assert_eq!(index.find(r"C:\ЁЛКА"), Some(tree));
+        assert_eq!(index.find(r"c:\ёлка"), Some(tree));
     }
 
     #[test]
