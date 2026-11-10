@@ -396,22 +396,35 @@ fn stat_of(metadata: &fs::Metadata) -> Stat {
 
 /// Walks the folder at `path` again from nothing: whatever the index
 /// held under it goes, and what is there now comes in. Nothing, unless it
-/// is in the index and on disk a folder the walk enters: a junction made
-/// a moment ago is first told of as a plain folder.
+/// is in the index and, once listed, on disk a folder the walk enters: a
+/// junction made a moment ago is first told of as a plain folder, and a
+/// listing taken through it holds another folder's entries. A junction
+/// stays one, so a plain folder after the listing was one during it.
 fn walk_afresh(shared: &RwLock<Index>, path: &str, excluded: &Excluded) {
+    let folder = Path::new(path);
+    let children = listing(folder, false, &excluded.within(folder));
     if on_disk(path).map(|(kind, _)| kind) != Some(Kind::Folder) {
         return;
     }
-    let emptied = || {
+    let entered = {
         let mut index = write(shared);
-        let entry = index.find(path)?;
-        let (folder, name) = (index.parent(entry)?, index.name(entry)?.to_string());
-        index.remove(entry).ok()?;
-        index.add(folder, &name, true).ok()
+        let Some(entry) = emptied(&mut index, path) else {
+            return;
+        };
+        take_in(&mut index, folder, entry, children)
     };
-    if let Some(entry) = emptied() {
-        walk_under(Path::new(path), entry, false, shared, excluded);
+    for (below, entry) in entered {
+        walk_under(&below, entry, false, shared, excluded);
     }
+}
+
+/// The folder at `path`, put again in place of the one there, with
+/// nothing in it.
+fn emptied(index: &mut Index, path: &str) -> Option<EntryId> {
+    let entry = index.find(path)?;
+    let (folder, name) = (index.parent(entry)?, index.name(entry)?.to_string());
+    index.remove(entry).ok()?;
+    index.add(folder, &name, true).ok()
 }
 
 /// Takes what is excluded out of the index, with everything under it,
@@ -554,20 +567,36 @@ fn walk_under(
 ) {
     let mut folders = vec![(folder.to_path_buf(), id, at_root)];
     while let Some((folder, id, at_root)) = folders.pop() {
-        let left_out = excluded.within(&folder);
-        let children = listing(&folder, at_root, &left_out);
-        let mut index = write(into);
-        for child in children {
-            let Ok(entry) = index.add(id, &child.name, child.folder) else {
-                continue;
-            };
-            // Added just now, so it is there.
-            let _ = index.set_stat(entry, child.stat.size, child.stat.written);
-            if child.enter {
-                folders.push((folder.join(&child.name), entry, false));
-            }
+        let children = listing(&folder, at_root, &excluded.within(&folder));
+        let entered = take_in(&mut write(into), &folder, id, children);
+        folders.extend(
+            entered
+                .into_iter()
+                .map(|(below, entry)| (below, entry, false)),
+        );
+    }
+}
+
+/// Adds `children`, listed in `folder`, to its entry `id`; the folders
+/// among them the walk enters, with their entries.
+fn take_in(
+    index: &mut Index,
+    folder: &Path,
+    id: EntryId,
+    children: Vec<Child>,
+) -> Vec<(PathBuf, EntryId)> {
+    let mut entered = Vec::new();
+    for child in children {
+        let Ok(entry) = index.add(id, &child.name, child.folder) else {
+            continue;
+        };
+        // Added just now, so it is there.
+        let _ = index.set_stat(entry, child.stat.size, child.stat.written);
+        if child.enter {
+            entered.push((folder.join(&child.name), entry));
         }
     }
+    entered
 }
 
 /// A root's name in the index: `C:` for `C:\`, so paths join with one
