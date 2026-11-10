@@ -67,7 +67,7 @@ fn host(rest: &str) -> &str {
 /// `text` percent-encoded as RFC 3986 wants a query's words: the
 /// unreserved characters stay, every other byte becomes `%XX`.
 fn encoded(text: &str) -> String {
-    let mut out = String::with_capacity(text.len() * 3);
+    let mut out = String::new();
     for byte in text.bytes() {
         match byte.is_ascii_alphanumeric() || b"-._~".contains(&byte) {
             true => out.push(char::from(byte)),

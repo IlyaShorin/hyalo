@@ -240,9 +240,9 @@ fn take(array: &mut Array, at: usize) {
         .trailing()
         .as_str()
         .is_some_and(|rest| rest.trim().is_empty());
+    // toml_edit writes no trailing comma in an empty array.
     if array.is_empty() && blank {
         array.set_trailing("");
-        array.set_trailing_comma(false);
     }
 }
 
@@ -427,6 +427,15 @@ mod tests {
         assert!(after.contains(r"rank_higher = ['''D:\it's''']"), "{after}");
         let back = written(&after).expect("good settings");
         assert_eq!(back.list(List::RankHigher), [r"D:\it's"]);
+    }
+
+    #[test]
+    fn a_name_in_quotes_of_its_own_reads_back_as_it_was_typed() {
+        // In single quotes it would be `'''notes'''`, which TOML reads as
+        // a string of three quotes around `notes`, without the quotes.
+        let after = edited(DEFAULT, add(List::RankHigher, "''notes''"));
+        let back = written(&after).expect("good settings");
+        assert_eq!(back.list(List::RankHigher), ["''notes''"]);
     }
 
     #[test]
