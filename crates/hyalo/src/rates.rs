@@ -117,11 +117,12 @@ fn load(path: &Path) -> Option<Rates> {
     parsed(&fs::read(path).ok()?, &path.display().to_string())
 }
 
-/// The rates in `xml`; `None`, said, when it is not the bank's rates.
+/// The rates in `xml`, `what` holds; logged either way.
 fn parsed(xml: &[u8], what: &str) -> Option<Rates> {
     let rates = Rates::parse(xml);
-    if rates.is_none() {
-        eprintln!("hyalo: {what} is not the bank's rates");
+    match &rates {
+        Some(rates) => eprintln!("hyalo: rates of {} in {what}", rates.date()),
+        None => eprintln!("hyalo: {what} is not the bank's rates"),
     }
     rates
 }
