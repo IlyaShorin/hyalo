@@ -43,8 +43,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     PostQuitMessage, RegisterClassExW, SW_HIDE, SW_SHOW, SWP_NOACTIVATE, SetForegroundWindow,
     SetWindowPos, ShowWindow, TranslateMessage, WA_INACTIVE, WM_ACTIVATE, WM_APP, WM_CHAR,
     WM_CONTEXTMENU, WM_DESTROY, WM_HOTKEY, WM_KEYDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCCALCSIZE,
-    WM_NCHITTEST, WNDCLASSEXW, WS_CAPTION, WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOOLWINDOW,
-    WS_EX_TOPMOST, WS_POPUP, WS_THICKFRAME,
+    WM_NCHITTEST, WM_SYSCHAR, WM_SYSKEYUP, WNDCLASSEXW, WS_CAPTION, WS_EX_NOREDIRECTIONBITMAP,
+    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_THICKFRAME,
 };
 use windows::core::{BOOL, PCWSTR, Result, w};
 
@@ -790,8 +790,7 @@ fn on_message(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> Optio
             on_focus_lost(hwnd);
             Some(Ok(()))
         }
-        WM_KEYDOWN => Some(on_key(hwnd, VIRTUAL_KEY(wparam.0 as u16))),
-        WM_CHAR => Some(on_char(wparam.0 as u16)),
+        WM_KEYDOWN | WM_CHAR | WM_SYSCHAR | WM_SYSKEYUP => Some(on_keyboard(hwnd, message, wparam)),
         WM_MOUSEMOVE => Some(with_app(|app| app.hover(client_point(lparam))).unwrap_or(Ok(()))),
         WM_LBUTTONUP => Some(on_click(hwnd, client_point(lparam))),
         _ => on_app_message(hwnd, message, wparam, lparam),
@@ -1028,6 +1027,17 @@ fn on_key(hwnd: HWND, key: VIRTUAL_KEY) -> Result<()> {
 fn down(key: VIRTUAL_KEY) -> bool {
     // SAFETY: a plain call.
     unsafe { GetKeyState(i32::from(key.0)) < 0 }
+}
+
+/// What the keys do. The launcher has no menu, so an Alt key's letter,
+/// or Alt let go, is kept from Windows, which would only look for one
+/// and beep.
+fn on_keyboard(hwnd: HWND, message: u32, wparam: WPARAM) -> Result<()> {
+    match message {
+        WM_KEYDOWN => on_key(hwnd, VIRTUAL_KEY(wparam.0 as u16)),
+        WM_CHAR => on_char(wparam.0 as u16),
+        _ => Ok(()),
+    }
 }
 
 /// Which modifiers are down, as of the key message being handled.
@@ -2106,6 +2116,26 @@ mod tests {
                 assert!(!launcher.visible(), "message {message:#x} {wparam:#x}");
             });
         }
+    }
+
+    #[test]
+    fn an_alt_key_in_the_launcher_looks_for_no_menu() {
+        on_hidden_desktop(|| {
+            let launcher = Launcher::open();
+            let menu = windows::Win32::UI::Input::KeyboardAndMouse::VK_MENU;
+            // Asked of the launcher's own handling, never sent: Windows
+            // answers an Alt key's letter with a beep when there is no
+            // menu, on the user's speakers.
+            let keys = [
+                (WM_SYSCHAR, usize::from(b'k')),
+                (WM_SYSKEYUP, usize::from(menu.0)),
+            ];
+            for (message, key) in keys {
+                let handled = on_message(launcher.0, message, WPARAM(key), LPARAM(0));
+                assert!(handled.is_some(), "{message:#x}");
+            }
+            assert!(launcher.visible());
+        });
     }
 
     #[test]

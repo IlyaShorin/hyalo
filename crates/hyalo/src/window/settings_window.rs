@@ -57,6 +57,9 @@ pub(super) struct SettingsWindow {
     pub(super) laid: Laid,
     /// Whether Windows tells the window when the pointer leaves it.
     tracking: bool,
+    /// Whether the recorder took the last key pressed with Alt: the
+    /// character it makes is the recorder's too.
+    recorded: bool,
 }
 
 /// Opens the settings window, or brings the one open forward. Called
@@ -193,6 +196,7 @@ impl SettingsWindow {
             dpi,
             laid: Laid::default(),
             tracking: false,
+            recorded: false,
         };
         window.redraw()?;
         Ok(window)
@@ -313,24 +317,50 @@ impl SettingsWindow {
         }
     }
 
-    /// What the keyboard does. Alt and F10 come as system keys: while the
-    /// recorder listens they are keys like any other, not the way to the
-    /// window's menu.
+    /// What the keyboard does. Keys let go only matter to the recorder;
+    /// Alt or F10 let go would start the window's menu mode, and there is
+    /// no menu bar, so it is kept from Windows.
     fn keyboard(&mut self, message: u32, wparam: WPARAM) -> Outcome {
-        let (key, view) = (wparam.0 as u16, self.painter.view().1);
-        let listening = self.panel.listening();
+        let key = wparam.0 as u16;
         match message {
-            WM_KEYDOWN => Outcome::Changed(self.panel.key(key, mods(), &self.laid, view)),
-            WM_SYSKEYDOWN if listening => {
+            WM_KEYDOWN => {
+                let view = self.painter.view().1;
                 Outcome::Changed(self.panel.key(key, mods(), &self.laid, view))
             }
-            WM_KEYUP | WM_SYSKEYUP if listening => {
+            WM_SYSKEYDOWN => self.system_key(key),
+            WM_KEYUP | WM_SYSKEYUP => {
+                let listening = self.panel.listening();
                 self.panel.key_up(mods());
-                Outcome::Changed(None)
+                changed(listening)
             }
-            WM_SYSCHAR if listening => Outcome::Same,
+            WM_SYSCHAR => self.system_char(key),
             WM_CHAR => changed(self.panel.char(key)),
             _ => Outcome::Unhandled,
+        }
+    }
+
+    /// A key pressed with Alt, or F10: the recorder's while it listens, a
+    /// key like any other; else Windows' (Alt+F4 closes the window).
+    fn system_key(&mut self, key: u16) -> Outcome {
+        self.recorded = self.panel.listening();
+        match self.recorded {
+            true => {
+                let view = self.painter.view().1;
+                Outcome::Changed(self.panel.key(key, mods(), &self.laid, view))
+            }
+            false => Outcome::Unhandled,
+        }
+    }
+
+    /// The character a key pressed with Alt makes. Windows would look for
+    /// it in a menu bar there is none of, and beep: it is kept from
+    /// Windows, all but Alt+Space, which opens the window menu, unless the
+    /// recorder took the key that made it.
+    fn system_char(&mut self, unit: u16) -> Outcome {
+        let recorded = std::mem::take(&mut self.recorded);
+        match recorded || unit != u16::from(b' ') {
+            true => Outcome::Same,
+            false => Outcome::Unhandled,
         }
     }
 }
@@ -745,6 +775,18 @@ mod tests {
                 .collect()
         }
 
+        /// Whether the window keeps `message` from Windows' own handling.
+        /// Asked of the window's input directly: a test must never send
+        /// what Windows would answer with a beep, which the hidden desktop
+        /// plays on the user's speakers.
+        fn takes(&self, message: u32, wparam: usize) -> bool {
+            let window = |app: &mut App| {
+                let window = app.settings.as_mut().expect("open");
+                window.input(message, WPARAM(wparam), LPARAM(0)).is_some()
+            };
+            with_app(window).expect("app state")
+        }
+
         fn shows(&self, text: &str) -> bool {
             self.texts().iter().any(|shown| shown == text)
         }
@@ -913,13 +955,47 @@ mod tests {
             );
             assert!(settings.shows("{Alt}"));
             settings.send(WM_SYSKEYDOWN, usize::from(VK_K.0), 0);
-            assert_eq!(settings.send(WM_SYSCHAR, usize::from(b'k'), 0), LRESULT(0));
-            hold(&[]);
-            assert_eq!(
-                settings.send(WM_SYSKEYUP, usize::from(menu.0), 0),
-                LRESULT(0)
+            assert!(
+                settings.takes(WM_SYSCHAR, usize::from(b'k')),
+                "the K the recorder took"
             );
+            hold(&[]);
+            assert!(settings.takes(WM_SYSKEYUP, usize::from(menu.0)));
             assert_eq!(setup.keyboard.held(), ["Alt+K"]);
+        });
+    }
+
+    #[test]
+    fn an_alt_key_never_looks_for_a_menu_bar_there_is_none_of() {
+        on_hidden_desktop(|| {
+            let setup = set_up("settings-window-no-menu", DEFAULT, None);
+            let settings = setup.settings();
+            let menu = windows::Win32::UI::Input::KeyboardAndMouse::VK_MENU;
+            assert!(
+                settings.takes(WM_SYSCHAR, usize::from(b'k')),
+                "Alt+K, nothing recording"
+            );
+            assert!(
+                settings.takes(WM_SYSKEYUP, usize::from(menu.0)),
+                "Alt let go: no menu mode"
+            );
+            assert!(
+                !settings.takes(WM_SYSCHAR, usize::from(b' ')),
+                "Alt+Space opens the window menu"
+            );
+            settings.click(Target::Hotkey);
+            hold(&[menu]);
+            settings.send(WM_SYSKEYDOWN, usize::from(VK_SPACE.0), 0);
+            hold(&[]);
+            assert!(!settings.state(|window| window.panel.listening()), "heard");
+            assert!(
+                settings.takes(WM_SYSCHAR, usize::from(b' ')),
+                "the recorder's Alt+Space opens no menu"
+            );
+            assert!(
+                !settings.takes(WM_SYSCHAR, usize::from(b' ')),
+                "the next Alt+Space does"
+            );
         });
     }
 
