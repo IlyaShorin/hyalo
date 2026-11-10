@@ -56,7 +56,7 @@ pub(crate) fn written(value: f64, mark: char) -> String {
         // Adding 0 turns -0 into 0.
         false => (rounded + 0.0).to_string(),
     };
-    text.replace('.', mark.encode_utf8(&mut [0; 4]))
+    text.replace('.', &mark.to_string())
 }
 
 /// `written` with its whole part in groups of three digits, apart by a

@@ -170,19 +170,19 @@ fn sign(code: &Code) -> &str {
     sign.map_or(code.as_str(), |(sign, _)| sign)
 }
 
+/// The most decimals an amount shows; anything smaller shows as zero.
+const MOST_PLACES: f64 = 15.0;
+
 /// `value` with two decimals, or as many more as a value under one needs
 /// to keep three significant digits ("0.0125"), with `mark` before them.
 fn money(value: f64, mark: char) -> String {
-    let size = value.abs();
-    let places = match size > 0.0 && size < 1.0 {
-        true => (2.0 - size.log10().floor()) as usize,
-        false => 2,
-    };
+    let places = 2.0 - value.abs().log10().floor();
+    let places = places.clamp(2.0, MOST_PLACES) as usize;
     // Adding 0 turns -0 into 0.
     let text = format!("{:.places$}", value + 0.0);
     let (kept, more) = text.split_at(text.find('.').expect("decimals") + 3);
     let text = kept.to_string() + more.trim_end_matches('0');
-    text.replace('.', mark.encode_utf8(&mut [0; 4]))
+    text.replace('.', &mark.to_string())
 }
 
 #[cfg(test)]
@@ -384,6 +384,8 @@ mod tests {
         assert_eq!(title("0.08 rub"), shown("0.001 $"));
         assert_eq!(title("-1 rub"), shown("-0.0125 $"));
         assert_eq!(title("0.0001 rub"), shown("0.00000125 $"));
+        assert_eq!(title("0.00000000001 rub"), shown("0.000000000000125 $"));
+        assert_eq!(title("0.000000000000001 rub"), shown("0.00 $"), "too small");
     }
 
     #[test]

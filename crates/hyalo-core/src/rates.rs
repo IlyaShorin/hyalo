@@ -60,7 +60,7 @@ impl Date {
     /// The day in Moscow `unix_seconds` after 1970 began: the bank dates
     /// its rates by Moscow time, UTC+3 all year round since 2014.
     pub fn moscow(unix_seconds: u64) -> Date {
-        const MOSCOW: u64 = 3 * 3_600;
+        const MOSCOW: u64 = 10_800;
         civil((unix_seconds + MOSCOW) / 86_400)
     }
 }
