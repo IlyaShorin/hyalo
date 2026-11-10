@@ -185,9 +185,11 @@ fn top_down(rows: &[u8], width: usize, stride: usize, bottom_up: bool) -> Vec<u8
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::com::Com;
+    use crate::test_desktop::within;
+    use std::time::Duration;
     use windows::Win32::Graphics::Gdi::{
         BI_RGB, BITMAPINFO, BITMAPINFOHEADER, CreateBitmap, CreateDIBSection, DIB_RGB_COLORS,
     };
@@ -275,17 +277,34 @@ mod tests {
     const SETTINGS: &str =
         "windows.immersivecontrolpanel_cw5n1h2txyewy!microsoft.windows.immersivecontrolpanel";
 
+    /// How long a test waits for the shell. Eight copies of the slowest
+    /// tests here, run at once, took 8 s; a minute fails a stuck call
+    /// long before anyone would wonder about the run.
+    const SHELL: Duration = Duration::from_secs(60);
+
+    /// Runs `work` with COM on a thread of its own; the test fails if the
+    /// shell has not answered within `SHELL`. Under eight test suites at
+    /// once the shell has listed apps or drawn their icons and never
+    /// returned.
+    #[track_caller]
+    pub(crate) fn shell<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) -> T {
+        within(SHELL, || {
+            let _com = Com::init().expect("COM");
+            work()
+        })
+    }
+
     #[test]
     fn finds_file_explorer_among_many_apps() {
-        let _com = Com::init().expect("COM");
-        assert!(find().expect("list the apps").len() > 1);
-        assert_eq!(entry(EXPLORER).item.kind, Kind::App);
+        let (apps, explorer) =
+            shell(|| (find().expect("list the apps").len(), entry(EXPLORER).item));
+        assert!(apps > 1);
+        assert_eq!(explorer.kind, Kind::App);
     }
 
     #[test]
     fn an_icon_has_the_size_asked_for_and_something_on_it() {
-        let _com = Com::init().expect("COM");
-        let icon = entry(EXPLORER).icon(40).expect("the icon");
+        let icon = shell(|| entry(EXPLORER).icon(40).expect("the icon"));
         assert_eq!((icon.width, icon.height), (40, 40));
         assert_eq!(icon.bgra.len(), 40 * 40 * 4);
         let opaque = icon.bgra.chunks(4).filter(|pixel| pixel[3] == 255).count();
@@ -294,9 +313,8 @@ mod tests {
 
     #[test]
     fn icon_pixels_are_premultiplied() {
-        let _com = Com::init().expect("COM");
         for id in [EXPLORER, SETTINGS] {
-            let icon = entry(id).icon(48).expect("the icon");
+            let icon = shell(move || entry(id).icon(48).expect("the icon"));
             let pixels = icon.bgra.chunks(4);
             let mut colours = pixels.flat_map(|pixel| pixel[..3].iter().map(|c| (*c, pixel[3])));
             assert!(colours.all(|(colour, alpha)| colour <= alpha), "{id}");
