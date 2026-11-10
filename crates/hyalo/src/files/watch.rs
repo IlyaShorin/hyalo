@@ -128,7 +128,14 @@ fn watch(
         set = None;
         match ended {
             Ended::Broken => thread::sleep(PATIENCE),
-            Ended::Stopped | Ended::Refused => return,
+            Ended::Stopped => return,
+            Ended::Refused => {
+                eprintln!(
+                    "hyalo: cannot watch {}: walked at start alone",
+                    root.display()
+                );
+                return;
+            }
         }
     }
 }
