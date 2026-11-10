@@ -192,18 +192,19 @@ pub fn tidy_soon(exe: &Path, tries: u32, pause: Duration) -> bool {
 const TIDY_TRIES: u32 = 60;
 const TIDY_PAUSE: Duration = Duration::from_millis(500);
 
-/// What a start does about the last swap, once it knows whether its
-/// window opened (`started`) and whether it was started to `replace` the
-/// launcher that ran: a start that works tidies up, on a thread of its
-/// own; a new build that could not start puts the old one back and starts
-/// it with `start`.
+/// What a start that was to `replace` the launcher that ran does about
+/// the swap, once it knows whether its window opened (`started`): one
+/// that works tidies up, on a thread of its own; one that could not start
+/// puts the old build back and starts it with `start`. Any other start
+/// leaves the files alone: a `hyalo.exe.old` there is the user's.
 pub fn settle(exe: &Path, started: bool, replace: bool, start: &dyn Fn(&Path) -> io::Result<()>) {
+    if !replace {
+        return;
+    }
     if started {
         let exe = exe.to_path_buf();
         std::thread::spawn(move || tidy_soon(&exe, TIDY_TRIES, TIDY_PAUSE));
-        return;
-    }
-    if replace && let Err(error) = put_back(exe).and_then(|()| start(exe)) {
+    } else if let Err(error) = put_back(exe).and_then(|()| start(exe)) {
         eprintln!("hyalo: cannot go back to the old build: {error}");
     }
 }
@@ -596,10 +597,14 @@ mod tests {
     }
 
     #[test]
-    fn a_start_that_replaced_nothing_and_failed_leaves_the_files_alone() {
+    fn a_start_that_replaced_nothing_leaves_the_files_alone_whether_it_opened_or_not() {
+        // A hyalo.exe.old of the user's own, kept by hand before hyalo
+        // updated itself, is theirs: only an update's start tidies.
         let (folder, exe) = swapped("update-settle-plain");
         let (start, started) = starter();
         settle(&exe, false, false, &start);
+        settle(&exe, true, false, &start);
+        std::thread::sleep(Duration::from_millis(200));
         assert_eq!(
             files(&folder),
             named(&[("hyalo.exe", "new build"), ("hyalo.exe.old", "old build")])
