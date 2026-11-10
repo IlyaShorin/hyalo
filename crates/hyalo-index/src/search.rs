@@ -295,7 +295,7 @@ impl Scan<'_> {
             at,
             score,
             found: Some(Match::none()),
-            newer,
+            newer: Some(newer),
         });
     }
 
@@ -323,7 +323,7 @@ impl Scan<'_> {
             at,
             score,
             found,
-            newer: 0,
+            newer: None,
         });
     }
 
@@ -382,7 +382,7 @@ struct Hit {
     found: Option<Match>,
     /// When it was written, for ties among rows listed unmatched; none
     /// for a match, whose ties keep the order of the index.
-    newer: u32,
+    newer: Option<u32>,
 }
 
 /// The best hits so far, best first, at most `limit`.
@@ -720,6 +720,24 @@ mod tests {
             .rows;
         let paths: Vec<String> = rows.into_iter().map(|row| row.item.id.0).collect();
         assert_eq!(paths, [r"C:\Ёлка\toy.txt"]);
+    }
+
+    #[test]
+    fn folders_that_share_a_place_in_a_threads_memory_are_told_apart() {
+        let mut index = Index::default();
+        let c = index.add_root("C:").unwrap();
+        let target = index.add(c, "target", true).unwrap();
+        // Six hundred folders, every third in target, a file in each:
+        // folders 128 apart fall in the same of the 256 places remembered,
+        // and every third pair of them is one in target, one not.
+        for n in 0..600 {
+            let parent = if n % 3 == 0 { target } else { c };
+            let folder = index.add(parent, &format!("folder {n}"), true).unwrap();
+            index.add(folder, "file.txt", false).unwrap();
+        }
+        let query = Query::parse("in:target", CLOCK);
+        let found = index.search_with("", &query.filters, &Places::default(), 2000);
+        assert_eq!(found.rows.len(), 400, "200 folders and their files");
     }
 
     #[test]

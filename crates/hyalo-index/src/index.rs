@@ -1056,7 +1056,9 @@ mod tests {
 
     #[test]
     fn the_version_moves_with_every_change_and_only_then() {
+        assert_eq!(Index::default().version(), 0, "no change yet");
         let (mut index, [c, _, me, notes, windows, _]) = drive();
+        assert_eq!(index.version(), 6, "one for each entry added");
         let mut seen = vec![index.version()];
         let mut changed = |index: &Index| {
             let moved = !seen.contains(&index.version());
@@ -1167,7 +1169,12 @@ mod tests {
         let c = index.add_root("C:").unwrap();
         let ab = index.add(c, "ab", false).unwrap();
         index.add(c, "cdef", false).unwrap();
-        // Loaded, so nothing is given up yet: eight bytes of names.
+        assert_eq!(
+            (index.names.len(), index.garbage),
+            (8, 0),
+            "nothing given up"
+        );
+        // Loaded, so the arenas are exact: eight bytes of names.
         let mut bytes = Vec::new();
         index.save(&mut bytes).unwrap();
         let mut index = Index::load(&mut bytes.as_slice()).unwrap();
