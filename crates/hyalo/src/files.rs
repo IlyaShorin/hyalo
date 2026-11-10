@@ -154,8 +154,10 @@ const IDLE: Duration = Duration::from_secs(1);
 
 /// How often a changed index is saved: the snapshot only has to be good
 /// enough to start from, since every start walks again, and saving
-/// writes the whole index.
-const SAVE_EVERY: Duration = Duration::from_secs(30 * 60);
+/// writes the whole index (86 MB for two million names). Something always
+/// changes (browsers' caches, the snapshot itself), so this is how often
+/// it is written while hyalo runs.
+const SAVE_EVERY: Duration = Duration::from_secs(6 * 60 * 60);
 
 /// The folders a walk starts from: the fixed drives, or a stand-in.
 pub type Roots = Arc<dyn Fn() -> Vec<PathBuf> + Send + Sync>;
