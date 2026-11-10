@@ -4,7 +4,7 @@
 
 use hyalo_core::item::{Action, Item};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    VIRTUAL_KEY, VK_DOWN, VK_ESCAPE, VK_RETURN, VK_UP,
+    VIRTUAL_KEY, VK_DOWN, VK_ESCAPE, VK_F4, VK_RETURN, VK_UP,
 };
 
 /// A key that does something besides typing.
@@ -41,6 +41,13 @@ pub fn command(key: VIRTUAL_KEY, held: Held) -> Option<Command> {
         VK_RETURN => Some(enter(held)),
         _ => None,
     }
+}
+
+/// The command a key pressed with Alt gives (`WM_SYSKEYDOWN`): Alt+F4
+/// hides the launcher, as Esc does, rather than reach Windows, which
+/// would close it and so end hyalo. The other keys are Windows' own.
+pub fn alt_command(key: VIRTUAL_KEY) -> Option<Command> {
+    (key == VK_F4).then_some(Command::Hide)
 }
 
 /// Enter opens, Ctrl+Enter shows in the folder, Ctrl+Shift+Enter opens as
@@ -87,6 +94,15 @@ mod tests {
         assert_eq!(command(VK_ESCAPE, NONE), Some(Command::Hide));
         assert_eq!(command(VK_UP, NONE), Some(Command::Up));
         assert_eq!(command(VK_DOWN, NONE), Some(Command::Down));
+    }
+
+    #[test]
+    fn alt_f4_hides_and_other_keys_with_alt_are_windows_own() {
+        use windows::Win32::UI::Input::KeyboardAndMouse::{VK_F3, VK_SPACE, VK_TAB};
+        assert_eq!(alt_command(VK_F4), Some(Command::Hide));
+        for key in [VK_F3, VK_SPACE, VK_TAB, VK_RETURN, VK_ESCAPE] {
+            assert_eq!(alt_command(key), None, "{key:?}");
+        }
     }
 
     #[test]

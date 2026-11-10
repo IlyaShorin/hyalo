@@ -47,8 +47,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SetForegroundWindow, SetWindowPos, ShowWindow, TranslateMessage, WA_INACTIVE, WM_ACTIVATE,
     WM_APP, WM_CHAR, WM_CONTEXTMENU, WM_DESTROY, WM_HOTKEY, WM_KEYDOWN, WM_LBUTTONDBLCLK,
     WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCCALCSIZE, WM_NCHITTEST, WM_SETCURSOR,
-    WM_SYSCHAR, WM_SYSKEYUP, WNDCLASSEXW, WS_CAPTION, WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOOLWINDOW,
-    WS_EX_TOPMOST, WS_POPUP, WS_THICKFRAME,
+    WM_SYSCHAR, WM_SYSKEYDOWN, WM_SYSKEYUP, WNDCLASSEXW, WS_CAPTION, WS_EX_NOREDIRECTIONBITMAP,
+    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_THICKFRAME,
 };
 use windows::core::{BOOL, PCWSTR, Result, w};
 
@@ -1031,6 +1031,7 @@ fn on_message(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> Optio
             Some(Ok(()))
         }
         WM_KEYDOWN | WM_CHAR | WM_SYSCHAR | WM_SYSKEYUP => Some(on_keyboard(hwnd, message, wparam)),
+        WM_SYSKEYDOWN => on_alt_key(hwnd, VIRTUAL_KEY(wparam.0 as u16)),
         WM_MOUSEMOVE | WM_LBUTTONDOWN | WM_LBUTTONDBLCLK | WM_LBUTTONUP => {
             Some(on_mouse(hwnd, message, wparam, client_point(lparam)))
         }
@@ -1355,6 +1356,14 @@ fn on_field_key(hwnd: HWND, key: Option<field::Key>) -> Result<()> {
     }
 }
 
+/// A key pressed with Alt: Alt+F4 hides the launcher; `None` leaves the
+/// others to Windows.
+fn on_alt_key(hwnd: HWND, key: VIRTUAL_KEY) -> Option<Result<()>> {
+    keys::alt_command(key)?;
+    hide(hwnd);
+    Some(Ok(()))
+}
+
 /// Whether `key` is down, as of the key message being handled.
 fn down(key: VIRTUAL_KEY) -> bool {
     // SAFETY: a plain call.
@@ -1484,7 +1493,7 @@ mod tests {
     };
     use windows::Win32::UI::WindowsAndMessaging::{
         GetClientRect, GetCursor, GetWindowRect, IsWindow, PM_QS_POSTMESSAGE, PM_REMOVE,
-        PeekMessageW, SendMessageW, WA_ACTIVE, WM_NULL, WM_QUIT,
+        PeekMessageW, SendMessageW, WA_ACTIVE, WM_CLOSE, WM_NULL, WM_QUIT,
     };
 
     use super::*;
@@ -2026,7 +2035,7 @@ mod tests {
 
     /// Handles every message queued for this thread, as the message loop
     /// would, until none is left.
-    fn drain() {
+    pub(super) fn drain() {
         let mut message = MSG::default();
         while unsafe { PeekMessageW(&mut message, None, 0, 0, PM_REMOVE) }.as_bool() {
             unsafe {
@@ -2728,6 +2737,63 @@ mod tests {
             let quit = unsafe { PeekMessageW(&mut message, None, WM_QUIT, WM_QUIT, PM_REMOVE) };
             assert!(quit.as_bool());
             assert_eq!(message.wParam.0, 0, "exit code");
+        });
+    }
+
+    /// Alt+F4 as Windows sends it to the window with the focus: F4 down
+    /// with Alt held, which the context bit of lParam says too.
+    pub(super) fn alt_f4(hwnd: HWND) -> LRESULT {
+        let menu = windows::Win32::UI::Input::KeyboardAndMouse::VK_MENU;
+        let f4 = windows::Win32::UI::Input::KeyboardAndMouse::VK_F4;
+        hold(&[menu]);
+        let alt = LPARAM(1 << 29);
+        let answer =
+            unsafe { SendMessageW(hwnd, WM_SYSKEYDOWN, Some(WPARAM(f4.0.into())), Some(alt)) };
+        hold(&[]);
+        answer
+    }
+
+    #[test]
+    fn alt_f4_hides_the_launcher_and_hyalo_runs_on() {
+        on_hidden_desktop(|| {
+            let launcher = Launcher::open();
+            launcher.type_text("note");
+            alt_f4(launcher.0);
+            // Windows posts the close Alt+F4 asks for.
+            drain();
+            assert!(!launcher.visible());
+            assert!(
+                unsafe { IsWindow(Some(launcher.0)) }.as_bool(),
+                "not closed"
+            );
+            launcher.hotkey();
+            assert!(launcher.visible());
+            assert_eq!(launcher.query(), "", "hidden as Esc hides it");
+        });
+    }
+
+    #[test]
+    fn other_keys_with_alt_are_windows_own() {
+        on_hidden_desktop(|| {
+            let launcher = Launcher::open();
+            let space = windows::Win32::UI::Input::KeyboardAndMouse::VK_SPACE;
+            // Asked of the launcher's own handling, never sent.
+            for key in [space, VK_RETURN, VK_UP] {
+                let answer = on_message(launcher.0, WM_SYSKEYDOWN, WPARAM(key.0.into()), LPARAM(0));
+                assert!(answer.is_none(), "{key:?}");
+            }
+        });
+    }
+
+    #[test]
+    fn being_asked_to_close_still_closes_hyalo() {
+        on_hidden_desktop(|| {
+            let hwnd = open(services(listing(&[]).0, None).0, true).expect("open the launcher");
+            unsafe { SendMessageW(hwnd, WM_CLOSE, None, None) };
+            assert!(!unsafe { IsWindow(Some(hwnd)) }.as_bool());
+            let mut message = MSG::default();
+            let quit = unsafe { PeekMessageW(&mut message, None, WM_QUIT, WM_QUIT, PM_REMOVE) };
+            assert!(quit.as_bool());
         });
     }
 

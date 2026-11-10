@@ -1125,6 +1125,20 @@ mod tests {
     }
 
     #[test]
+    fn alt_f4_closes_the_settings_window_and_leaves_the_launcher() {
+        on_hidden_desktop(|| {
+            let setup = set_up("settings-window-alt-f4-closes", DEFAULT, None);
+            let settings = setup.settings();
+            settings.click(Target::Name(List::RankLower));
+            super::super::tests::alt_f4(settings.0);
+            // Windows posts the close Alt+F4 asks for.
+            super::super::tests::drain();
+            assert!(!settings.open());
+            assert!(unsafe { IsWindow(Some(setup.launcher.0)) }.as_bool());
+        });
+    }
+
+    #[test]
     fn alt_f4_while_recording_closes_the_window_and_takes_no_hotkey() {
         on_hidden_desktop(|| {
             let setup = set_up("settings-window-alt-f4", DEFAULT, None);
