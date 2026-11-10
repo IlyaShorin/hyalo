@@ -5,6 +5,7 @@ pub mod calculator;
 pub mod config;
 pub mod currency;
 pub mod expression;
+pub mod filter;
 pub mod frecency;
 pub mod hotkey;
 pub mod item;
