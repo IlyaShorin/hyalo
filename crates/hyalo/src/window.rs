@@ -55,7 +55,7 @@ use crate::layout::{self, Rect};
 use crate::query::Query;
 use crate::render::{Renderer, Row, Scene};
 use crate::results::{Listed, MAX_ROWS, Results};
-use crate::{launch, store};
+use crate::{http, launch, rates, store};
 
 const HOTKEY_TOGGLE: i32 = 1;
 
@@ -102,8 +102,8 @@ pub struct Services {
 
 impl Services {
     /// The apps; the files of the fixed drives, with their snapshot in
-    /// `%LOCALAPPDATA%\hyalo`; opened by the shell; picks in
-    /// `%APPDATA%\hyalo`.
+    /// `%LOCALAPPDATA%\hyalo`; the bank's rates, kept there too; opened by
+    /// the shell; picks in `%APPDATA%\hyalo`.
     fn real() -> Self {
         let (files, writer) = Files::new();
         let drives: Roots = Arc::new(files::fixed_drives);
@@ -117,6 +117,14 @@ impl Services {
                 Source {
                     provider: walk,
                     trusted: files::REFRESH_AFTER,
+                },
+                Source {
+                    provider: rates::provider(
+                        Arc::new(|| http::get(&rates::bank())),
+                        rates::default_cache(),
+                        Arc::new(rates::moscow_today),
+                    ),
+                    trusted: rates::REFRESH_AFTER,
                 },
             ],
             files,

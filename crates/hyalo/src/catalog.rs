@@ -6,6 +6,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use hyalo_core::item::{Item, ItemId};
+use hyalo_core::rates::Rates;
 use windows::core::Result;
 
 use crate::apps::{self, Icon};
@@ -21,6 +22,8 @@ pub enum Found {
     Files,
     /// Picked files and folders that are still there.
     Picked(Vec<Item>),
+    /// The newest exchange rates.
+    Rates(Rates),
 }
 
 /// What the window asks a provider for.
@@ -48,6 +51,8 @@ pub struct Catalog {
     /// Files and folders picked before, ranked with the items so that
     /// frecency lifts them however many files match as well.
     pub picked: Vec<Item>,
+    /// What currency answers convert with; `None` until found.
+    pub rates: Option<Rates>,
 }
 
 impl Catalog {
@@ -60,6 +65,7 @@ impl Catalog {
             }
             Found::Files => {}
             Found::Picked(items) => items.into_iter().for_each(|item| self.pick(item)),
+            Found::Rates(rates) => self.rates = Some(rates),
         }
     }
 
@@ -161,6 +167,14 @@ mod tests {
         let paint = ItemId("Paint".to_string());
         catalog.take(Found::Icon(paint.clone(), dot()));
         assert_eq!(catalog.icons.get(&paint), Some(&dot()));
+    }
+
+    #[test]
+    fn the_rates_found_last_are_kept() {
+        let mut catalog = Catalog::default();
+        catalog.take(Found::Rates(crate::rates::tests::dated("09.11.2026")));
+        catalog.take(Found::Rates(crate::rates::tests::fixture()));
+        assert_eq!(catalog.rates, Some(crate::rates::tests::fixture()));
     }
 
     #[test]

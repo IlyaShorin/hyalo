@@ -35,14 +35,19 @@ pub fn load(path: &Path) -> Frecency {
     })
 }
 
-/// Writes the picks whole or not at all: into a temporary file beside
-/// `path`, then renamed over it. Creates the folder the first time.
+/// Writes the picks whole or not at all.
 pub fn save(path: &Path, frecency: &Frecency) -> io::Result<()> {
+    replace(path, frecency.to_json().as_bytes())
+}
+
+/// Puts `bytes` at `path` whole or not at all: into a temporary file
+/// beside `path`, then renamed over it. Creates the folder the first time.
+pub fn replace(path: &Path, bytes: &[u8]) -> io::Result<()> {
     if let Some(folder) = path.parent() {
         fs::create_dir_all(folder)?;
     }
     let temporary = beside(path, ".tmp");
-    fs::write(&temporary, frecency.to_json())?;
+    fs::write(&temporary, bytes)?;
     fs::rename(&temporary, path)
 }
 
