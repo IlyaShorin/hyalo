@@ -179,13 +179,13 @@ pub fn tidy(exe: &Path) -> io::Result<()> {
 /// build that was swapped out may still be ending, and Windows keeps its
 /// exe until it has. Whether it all went.
 pub fn tidy_soon(exe: &Path, tries: u32, pause: Duration) -> bool {
-    (0..tries).any(|_| {
-        let gone = tidy(exe).is_ok();
-        if !gone {
-            std::thread::sleep(pause);
+    for _ in 0..tries {
+        if tidy(exe).is_ok() {
+            return true;
         }
-        gone
-    })
+        std::thread::sleep(pause);
+    }
+    false
 }
 
 /// How often, and how far apart, a start tries to remove the old build.
@@ -540,6 +540,25 @@ mod tests {
         });
         assert!(tidy_soon(&exe, 500, Duration::from_millis(10)));
         letting_go.join().expect("let go");
+        assert_eq!(files(&folder), named(&[("hyalo.exe", "new")]));
+    }
+
+    #[test]
+    fn tidying_soon_uses_every_try_and_does_not_wait_once_it_is_done() {
+        let folder = Scratch::new("update-tidy-once");
+        let exe = folder.0.join(EXE);
+        fs::write(&exe, b"new").expect("the exe");
+        fs::write(beside(&exe, OLD), b"old").expect("the old exe");
+        let began = std::time::Instant::now();
+        assert!(
+            tidy_soon(&exe, 1, Duration::from_secs(10)),
+            "one try is enough"
+        );
+        assert!(
+            began.elapsed() < Duration::from_secs(5),
+            "no pause after it"
+        );
+        assert!(!tidy_soon(&exe, 0, Duration::ZERO), "no try, so not done");
         assert_eq!(files(&folder), named(&[("hyalo.exe", "new")]));
     }
 

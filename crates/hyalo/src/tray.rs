@@ -322,6 +322,7 @@ mod tests {
         let install = entry(&lines, Command::Install);
         assert_eq!(install.label, "Install hyalo 0.0.2");
         assert!(install.enabled);
+        assert!(!install.checked, "a command, not a choice");
         assert_eq!(lines[1], Line::Entry(install), "right under Show");
         assert_eq!(lines.len(), 7);
         let installing = update(Progress::Installing);

@@ -1884,6 +1884,12 @@ mod tests {
         (provider, release)
     }
 
+    /// How long a test waits for what the launcher's threads hand over.
+    /// Under mutation testing eight suites run at once beside other
+    /// sessions' runs, four times slower than alone, and five seconds
+    /// were once not enough for a check and an install on threads.
+    const PATIENCE: Duration = Duration::from_secs(15);
+
     /// The launcher as a test drives it: through the messages Windows
     /// would send. Destroyed while the thread's app state is still alive.
     pub(super) struct Launcher(pub(super) HWND);
@@ -1935,9 +1941,10 @@ mod tests {
         }
 
         /// Handles queued messages until `done` holds, as the message loop
-        /// would; fails after five seconds.
+        /// would; fails after `PATIENCE`, naming the line that waited.
+        #[track_caller]
         pub(super) fn pump_until(&self, done: impl Fn(&App) -> bool) {
-            let deadline = Instant::now() + Duration::from_secs(5);
+            let deadline = Instant::now() + PATIENCE;
             while !with_app(|app| done(app)).expect("app state") {
                 assert!(Instant::now() < deadline, "timed out waiting");
                 let mut message = MSG::default();
@@ -3914,9 +3921,10 @@ mod tests {
     }
 
     /// Handles messages as the message loop would until the window is
-    /// gone; fails after five seconds.
+    /// gone; fails after `PATIENCE`.
+    #[track_caller]
     pub(super) fn pump_until_closed(hwnd: HWND) {
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + PATIENCE;
         while unsafe { IsWindow(Some(hwnd)) }.as_bool() {
             assert!(
                 Instant::now() < deadline,
@@ -4059,6 +4067,46 @@ mod tests {
                 "Install hyalo 0.0.2",
                 "to try again"
             );
+        });
+    }
+
+    #[test]
+    fn install_asked_again_while_it_installs_downloads_nothing_more() {
+        on_hidden_desktop(|| {
+            let latest = Ok(release_json("v0.0.2", ""));
+            let (mut updates, releases) = releasing("update-twice", latest, b"new build");
+            // The sum's download waits until the test lets it go.
+            let (go, gate) = channel::<()>();
+            let gate = Mutex::new(gate);
+            let asked = Arc::new(AtomicUsize::new(0));
+            let counted = asked.clone();
+            let download = updates.installer.download.clone();
+            let installer = update::Installer {
+                download: Arc::new(move |url: &str| {
+                    counted.fetch_add(1, Ordering::SeqCst);
+                    let _ = gate.lock().expect("the gate").recv();
+                    download(url)
+                }),
+                exe: releases.exe.clone(),
+                start: updates.installer.start.clone(),
+            };
+            updates.installer = Arc::new(installer);
+            let (launcher, taskbar, _scratch) = updating("update-twice-config", DEFAULT, updates);
+            launcher.pump_until(|app| app.update.is_some());
+            launcher.pick(&taskbar, tray::Command::Install);
+            launcher.pick(&taskbar, tray::Command::Install);
+            assert!(
+                with_app(|app| {
+                    app.update
+                        .as_ref()
+                        .is_some_and(|update| update.progress == Progress::Installing)
+                })
+                .expect("app state")
+            );
+            go.send(()).expect("let the sum go");
+            go.send(()).expect("let the exe go");
+            pump_until_closed(launcher.0);
+            assert_eq!(asked.load(Ordering::SeqCst), 2, "the sum and the exe, once");
         });
     }
 
