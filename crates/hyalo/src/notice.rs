@@ -73,6 +73,7 @@ impl Notice {
             id: ItemId("hyalo:notice".to_string()),
             title: self.said(language),
             subtitle: language.fill(Text::OpenSettings, &[&self.advice(language)]),
+            keywords: Vec::new(),
             kind: Kind::Notice,
             action: Action::Settings,
         }

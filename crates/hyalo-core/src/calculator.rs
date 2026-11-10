@@ -32,6 +32,7 @@ pub fn answer(query: &str, language: Language) -> Option<Item> {
         id: ItemId(ID.to_string()),
         title: grouped(&copied),
         subtitle: language.say(Text::Calculator).to_string(),
+        keywords: Vec::new(),
         kind: Kind::Calculator,
         action: Action::CopyText(copied),
     })

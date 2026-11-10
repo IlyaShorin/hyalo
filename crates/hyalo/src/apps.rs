@@ -33,6 +33,7 @@ pub fn item(name: &str, parsing_name: &str) -> Option<Item> {
         id: ItemId(parsing_name.to_string()),
         title: name.to_string(),
         subtitle: subtitle(parsing_name),
+        keywords: Vec::new(),
         kind: Kind::App,
         action: Action::Open(format!("{APPS_FOLDER}{parsing_name}")),
     })
@@ -207,6 +208,7 @@ pub(crate) mod tests {
                 id: ItemId(calculator.to_string()),
                 title: "Calculator".to_string(),
                 subtitle: String::new(),
+                keywords: Vec::new(),
                 kind: Kind::App,
                 action: Action::Open(format!("shell:AppsFolder\\{calculator}")),
             })

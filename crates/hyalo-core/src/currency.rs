@@ -95,6 +95,7 @@ pub fn answer(query: &str, rates: &Rates, language: Language) -> Option<Item> {
             Text::Currency,
             &[&asked, from, to, &rates.date().to_string()],
         ),
+        keywords: Vec::new(),
         kind: Kind::Calculator,
         action: Action::CopyText(copied),
     })

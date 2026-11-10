@@ -155,6 +155,7 @@ mod tests {
             id: ItemId("Microsoft.Windows.Explorer".to_string()),
             title: "File Explorer".to_string(),
             subtitle: "App".to_string(),
+            keywords: Vec::new(),
             kind: Kind::App,
             action: Action::Open(r"shell:AppsFolder\Microsoft.Windows.Explorer".to_string()),
         }

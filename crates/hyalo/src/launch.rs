@@ -18,13 +18,16 @@ use windows::core::{HSTRING, PCWSTR, Result, w};
 
 use crate::clipboard::copy;
 use crate::com::Com;
+use crate::system;
 
 /// Carries out a picked item's action. Waits for the shell, so call it
 /// off the UI thread.
 pub fn run(action: &Action, as_admin: bool) -> Result<()> {
     match action {
         Action::Open(target) => open(target, as_admin),
+        Action::Launch { program, arguments } => execute(program, Some(arguments), verb(as_admin)),
         Action::Reveal(path) => reveal(path),
+        Action::System(command) => system::run(*command, &system::System),
         Action::CopyText(text) => copy(text),
         Action::Edit(path) => edit(path),
         // The launcher opens its own window; there is nothing to run.
@@ -93,11 +96,15 @@ fn reveal(path: &str) -> Result<()> {
 /// until the shell has started it, so call it off the UI thread. Errors
 /// come back instead of a message box.
 fn open(target: &str, as_admin: bool) -> Result<()> {
-    let verb = match as_admin {
+    execute(target, None, verb(as_admin))
+}
+
+/// The verb that opens as administrator, or the usual one.
+fn verb(as_admin: bool) -> PCWSTR {
+    match as_admin {
         true => w!("runas"),
         false => PCWSTR::null(),
-    };
-    execute(target, None, verb)
+    }
 }
 
 /// Has the shell carry out `verb` (none: the usual one) on `file`, with
@@ -133,6 +140,21 @@ mod tests {
         let missing = r"shell:AppsFolder\hyalo.test.no-such-app";
         let error = run(&Action::Open(missing.to_string()), false).expect_err("no such app");
         assert_ne!(error.code(), E_NOTIMPL);
+    }
+
+    #[test]
+    fn a_program_that_is_not_there_fails_without_a_message_box() {
+        let missing = Action::Launch {
+            program: "hyalo-test-no-such-program.exe".to_string(),
+            arguments: "--never".to_string(),
+        };
+        let error = run(&missing, false).expect_err("no such program");
+        assert_eq!(error.code(), ERROR_FILE_NOT_FOUND.to_hresult());
+    }
+
+    #[test]
+    fn the_settings_window_is_the_launchers_to_open() {
+        assert_eq!(run(&Action::Settings, false), Ok(()));
     }
 
     #[test]
