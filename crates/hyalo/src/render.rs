@@ -14,52 +14,27 @@
 //! used only from the UI thread that created it.
 
 use std::collections::HashMap;
-use std::mem::ManuallyDrop;
 use std::ops::Range;
 
 use hyalo_core::item::ItemId;
 use windows::Win32::Foundation::HWND;
-use windows::Win32::Graphics::Direct2D::Common::{
-    D2D_RECT_F, D2D_SIZE_U, D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_COLOR_F, D2D1_GRADIENT_STOP,
-    D2D1_PIXEL_FORMAT,
-};
+use windows::Win32::Graphics::Direct2D::Common::{D2D_RECT_F, D2D_SIZE_U, D2D1_COLOR_F};
 use windows::Win32::Graphics::Direct2D::{
-    D2D1_BITMAP_OPTIONS_CANNOT_DRAW, D2D1_BITMAP_OPTIONS_NONE, D2D1_BITMAP_OPTIONS_TARGET,
-    D2D1_BITMAP_PROPERTIES1, D2D1_DEVICE_CONTEXT_OPTIONS_NONE,
-    D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT, D2D1_ELLIPSE, D2D1_EXTEND_MODE_CLAMP,
-    D2D1_FACTORY_TYPE_SINGLE_THREADED, D2D1_GAMMA_2_2, D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC,
-    D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES, D2D1_ROUNDED_RECT, D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE,
-    D2D1CreateFactory, ID2D1Bitmap1, ID2D1Brush, ID2D1DeviceContext, ID2D1Factory1,
-    ID2D1RenderTarget,
-};
-use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_HARDWARE;
-use windows::Win32::Graphics::Direct3D11::{
-    D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_SDK_VERSION, D3D11CreateDevice, ID3D11Device,
-};
-use windows::Win32::Graphics::DirectComposition::{
-    DCompositionCreateDevice, IDCompositionDevice, IDCompositionTarget, IDCompositionVisual,
+    D2D1_BITMAP_OPTIONS_NONE, D2D1_BITMAP_PROPERTIES1, D2D1_ELLIPSE,
+    D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC, D2D1_ROUNDED_RECT, ID2D1Bitmap1,
 };
 use windows::Win32::Graphics::DirectWrite::{
-    DWRITE_FACTORY_TYPE_SHARED, DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL,
-    DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_PARAGRAPH_ALIGNMENT_CENTER,
-    DWRITE_TEXT_METRICS, DWRITE_TEXT_RANGE, DWRITE_TRIMMING, DWRITE_TRIMMING_GRANULARITY_CHARACTER,
-    DWRITE_WORD_WRAPPING_NO_WRAP, DWriteCreateFactory, IDWriteFactory, IDWriteTextFormat,
-    IDWriteTextLayout,
+    DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_TEXT_METRICS,
+    DWRITE_TEXT_RANGE, IDWriteFactory, IDWriteTextFormat, IDWriteTextLayout,
 };
-use windows::Win32::Graphics::Dxgi::Common::{
-    DXGI_ALPHA_MODE_PREMULTIPLIED, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_UNKNOWN,
-    DXGI_SAMPLE_DESC,
-};
-use windows::Win32::Graphics::Dxgi::{
-    CreateDXGIFactory2, DXGI_CREATE_FACTORY_FLAGS, DXGI_PRESENT, DXGI_SCALING_STRETCH,
-    DXGI_SWAP_CHAIN_DESC1, DXGI_SWAP_CHAIN_FLAG, DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL,
-    DXGI_USAGE_RENDER_TARGET_OUTPUT, IDXGIDevice, IDXGIFactory2, IDXGISurface, IDXGISwapChain1,
-};
-use windows::core::{Interface, PCWSTR, Result, w};
+use windows::core::Result;
 use windows_numerics::Vector2;
 
 use crate::apps::Icon;
-use crate::layout::{BAR_HEIGHT, ICON_SIZE, ROW_HEIGHT, row_top, scale};
+use crate::layout::{BAR_HEIGHT, ICON_SIZE, ROW_HEIGHT, row_top};
+use crate::surface::{
+    DISPLAY_FONT, PREMULTIPLIED_BGRA, Surface, TEXT_FONT, rgba, text_format, trimmed,
+};
 
 /// What to draw.
 pub struct Scene<'a> {
@@ -100,7 +75,6 @@ const SUBTITLE_LINE: (f32, f32) = (25.0, 18.0);
 const SELECTION_INSET: f32 = 6.0;
 const SELECTION_RADIUS: f32 = 6.0;
 
-const TRANSPARENT: D2D1_COLOR_F = rgba(0.0, 0.0, 0.0, 0.0);
 /// Darkens the acrylic slightly so white text keeps its contrast.
 const TINT: D2D1_COLOR_F = rgba(0.06, 0.06, 0.08, 0.28);
 const TEXT: D2D1_COLOR_F = rgba(1.0, 1.0, 1.0, 0.95);
@@ -113,38 +87,9 @@ const TITLE_TEXT: D2D1_COLOR_F = rgba(1.0, 1.0, 1.0, 0.92);
 const MATCHED_TEXT: D2D1_COLOR_F = rgba(0.55, 0.76, 1.0, 1.0);
 const SUBTITLE_TEXT: D2D1_COLOR_F = rgba(1.0, 1.0, 1.0, 0.5);
 
-/// Present's sync interval: 0, do not wait for a vertical blank. A
-/// composition swap chain cannot tear, DWM composes at the display's pace
-/// anyway, and waiting made a burst of 120 redraws take 492 ms instead of
-/// 30 to 45 ms. No test pins this: under load (mutator's parallel
-/// workers), wall-clock time could not tell the two values apart.
-const SYNC_INTERVAL: u32 = 0;
-
-/// Every bitmap here, the swap chain's and the icons, holds premultiplied
-/// BGRA.
-const PREMULTIPLIED_BGRA: D2D1_PIXEL_FORMAT = D2D1_PIXEL_FORMAT {
-    format: DXGI_FORMAT_B8G8R8A8_UNORM,
-    alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED,
-};
-
-const fn rgba(r: f32, g: f32, b: f32, a: f32) -> D2D1_COLOR_F {
-    D2D1_COLOR_F { r, g, b, a }
-}
-
 pub struct Renderer {
-    swap_chain: IDXGISwapChain1,
-    dc: ID2D1DeviceContext,
-    dwrite: IDWriteFactory,
+    surface: Surface,
     fonts: Fonts,
-    // Kept alive so the composition tree stays attached to the window.
-    _composition: (
-        IDCompositionDevice,
-        IDCompositionTarget,
-        IDCompositionVisual,
-    ),
-    width: u32,
-    height: u32,
-    dpi: u32,
     /// Icons already on the GPU, by item.
     icons: HashMap<ItemId, ID2D1Bitmap1>,
 }
@@ -158,63 +103,27 @@ struct Fonts {
 
 impl Renderer {
     pub fn new(hwnd: HWND, width: u32, height: u32, dpi: u32) -> Result<Self> {
-        let d3d = create_d3d_device()?;
-        let dxgi_device: IDXGIDevice = d3d.cast()?;
-        let swap_chain = create_swap_chain(&d3d, width, height)?;
-        let dc = create_device_context(&dxgi_device)?;
-        // Grayscale: ClearType needs an opaque target, and this one is not.
-        unsafe { dc.SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE) };
-        let composition = compose(hwnd, &dxgi_device, &swap_chain)?;
-        let dwrite: IDWriteFactory = unsafe { DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED)? };
-        let fonts = Fonts::new(&dwrite)?;
-        let renderer = Self {
-            swap_chain,
-            dc,
-            dwrite,
+        let surface = Surface::new(hwnd, width, height, dpi)?;
+        let fonts = Fonts::new(&surface.dwrite)?;
+        Ok(Self {
+            surface,
             fonts,
-            _composition: composition,
-            width,
-            height,
-            dpi,
             icons: HashMap::new(),
-        };
-        renderer.bind_target()?;
-        Ok(renderer)
+        })
     }
 
     pub fn resize(&mut self, width: u32, height: u32, dpi: u32) -> Result<()> {
-        if (width, height, dpi) == (self.width, self.height, self.dpi) {
-            return Ok(());
-        }
-        unsafe {
-            self.dc.SetTarget(None);
-            self.swap_chain.ResizeBuffers(
-                0,
-                width,
-                height,
-                DXGI_FORMAT_UNKNOWN,
-                DXGI_SWAP_CHAIN_FLAG(0),
-            )?;
-        }
-        (self.width, self.height, self.dpi) = (width, height, dpi);
-        self.bind_target()
+        self.surface.resize(width, height, dpi)
     }
 
     pub fn draw(&mut self, scene: &Scene) -> Result<()> {
-        unsafe {
-            self.dc.BeginDraw();
-            self.dc.Clear(Some(&TRANSPARENT));
-        }
-        // EndDraw even when drawing failed, so the next frame can begin.
+        self.surface.begin();
         let drawn = self.draw_scene(scene);
-        unsafe { self.dc.EndDraw(None, None)? };
-        drawn?;
-        unsafe { self.swap_chain.Present(SYNC_INTERVAL, DXGI_PRESENT(0)).ok() }
+        self.surface.end(drawn)
     }
 
     fn draw_scene(&mut self, scene: &Scene) -> Result<()> {
-        let scale = scale(self.dpi);
-        let (w, h) = (self.width as f32 / scale, self.height as f32 / scale);
+        let (w, h) = self.surface.size();
         self.draw_glass(w, h)?;
         self.draw_search_icon()?;
         self.draw_query(scene.query)?;
@@ -225,26 +134,6 @@ impl Renderer {
         self.draw_selection(scene.selected, w)?;
         for (index, row) in scene.rows.iter().enumerate() {
             self.draw_row(row, row_top(index), w)?;
-        }
-        Ok(())
-    }
-
-    fn bind_target(&self) -> Result<()> {
-        let dpi = self.dpi as f32;
-        let props = D2D1_BITMAP_PROPERTIES1 {
-            pixelFormat: PREMULTIPLIED_BGRA,
-            dpiX: dpi,
-            dpiY: dpi,
-            bitmapOptions: D2D1_BITMAP_OPTIONS_TARGET | D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
-            colorContext: ManuallyDrop::new(None),
-        };
-        unsafe {
-            let surface: IDXGISurface = self.swap_chain.GetBuffer(0)?;
-            let bitmap = self
-                .dc
-                .CreateBitmapFromDxgiSurface(&surface, Some(&props))?;
-            self.dc.SetTarget(&bitmap);
-            self.dc.SetDpi(dpi, dpi);
         }
         Ok(())
     }
@@ -266,15 +155,23 @@ impl Renderer {
             radiusX: CORNER_RADIUS - 0.5,
             radiusY: CORNER_RADIUS - 0.5,
         };
-        let tint = self.solid(TINT)?;
-        let sheen =
-            self.vertical_gradient(h, rgba(1.0, 1.0, 1.0, 0.09), rgba(1.0, 1.0, 1.0, 0.0))?;
-        let rim_light =
-            self.vertical_gradient(h, rgba(1.0, 1.0, 1.0, 0.38), rgba(1.0, 1.0, 1.0, 0.10))?;
+        let tint = self.surface.solid(TINT)?;
+        let sheen = self.surface.vertical_gradient(
+            h,
+            rgba(1.0, 1.0, 1.0, 0.09),
+            rgba(1.0, 1.0, 1.0, 0.0),
+        )?;
+        let rim_light = self.surface.vertical_gradient(
+            h,
+            rgba(1.0, 1.0, 1.0, 0.38),
+            rgba(1.0, 1.0, 1.0, 0.10),
+        )?;
         unsafe {
-            self.dc.FillRectangle(&full, &tint);
-            self.dc.FillRectangle(&full, &sheen);
-            self.dc.DrawRoundedRectangle(&rim, &rim_light, 1.0, None);
+            self.surface.dc.FillRectangle(&full, &tint);
+            self.surface.dc.FillRectangle(&full, &sheen);
+            self.surface
+                .dc
+                .DrawRoundedRectangle(&rim, &rim_light, 1.0, None);
         }
         Ok(())
     }
@@ -297,10 +194,11 @@ impl Renderer {
             X: center.X + 11.0,
             Y: center.Y + 11.0,
         };
-        let brush = self.solid(ICON)?;
+        let brush = self.surface.solid(ICON)?;
         unsafe {
-            self.dc.DrawEllipse(&lens, &brush, 2.0, None);
-            self.dc
+            self.surface.dc.DrawEllipse(&lens, &brush, 2.0, None);
+            self.surface
+                .dc
                 .DrawLine(handle_start, handle_end, &brush, 2.4, None);
         }
         Ok(())
@@ -314,14 +212,18 @@ impl Renderer {
             "" => (PLACEHOLDER, PLACEHOLDER_TEXT),
             typed => (typed, TEXT),
         };
-        let layout = self.layout(text, &self.fonts.query, 0.0, BAR_HEIGHT)?;
-        self.draw_text(&layout, TEXT_LEFT, 0.0, color)?;
+        let layout = self
+            .surface
+            .layout(text, &self.fonts.query, 0.0, BAR_HEIGHT)?;
+        self.surface.draw_text(&layout, TEXT_LEFT, 0.0, color)?;
         let caret_x = TEXT_LEFT + self.typed_width(query)? + 1.0;
         self.draw_caret(caret_x)
     }
 
     fn typed_width(&self, query: &str) -> Result<f32> {
-        let layout = self.layout(query, &self.fonts.query, 0.0, BAR_HEIGHT)?;
+        let layout = self
+            .surface
+            .layout(query, &self.fonts.query, 0.0, BAR_HEIGHT)?;
         let mut metrics = DWRITE_TEXT_METRICS::default();
         unsafe { layout.GetMetrics(&mut metrics)? };
         Ok(metrics.widthIncludingTrailingWhitespace)
@@ -329,9 +231,9 @@ impl Renderer {
 
     fn draw_caret(&self, x: f32) -> Result<()> {
         let half = QUERY_SIZE * 0.55;
-        let brush = self.solid(CARET)?;
+        let brush = self.surface.solid(CARET)?;
         unsafe {
-            self.dc.DrawLine(
+            self.surface.dc.DrawLine(
                 Vector2 {
                     X: x,
                     Y: BAR_HEIGHT / 2.0 - half,
@@ -351,9 +253,9 @@ impl Renderer {
     /// A hairline between the bar and the list.
     fn draw_separator(&self, w: f32) -> Result<()> {
         let y = BAR_HEIGHT - 0.5;
-        let brush = self.solid(SEPARATOR)?;
+        let brush = self.surface.solid(SEPARATOR)?;
         unsafe {
-            self.dc.DrawLine(
+            self.surface.dc.DrawLine(
                 Vector2 { X: 0.0, Y: y },
                 Vector2 { X: w, Y: y },
                 &brush,
@@ -376,8 +278,8 @@ impl Renderer {
             radiusX: SELECTION_RADIUS,
             radiusY: SELECTION_RADIUS,
         };
-        let brush = self.solid(SELECTION)?;
-        unsafe { self.dc.FillRoundedRectangle(&selection, &brush) };
+        let brush = self.surface.solid(SELECTION)?;
+        unsafe { self.surface.dc.FillRoundedRectangle(&selection, &brush) };
         Ok(())
     }
 
@@ -387,12 +289,18 @@ impl Renderer {
         }
         let width = w - TEXT_LEFT - TEXT_RIGHT_PAD;
         let (title_top, title_height) = TITLE_LINE;
-        let title = self.layout(row.title, &self.fonts.title, width, title_height)?;
+        let title = self
+            .surface
+            .layout(row.title, &self.fonts.title, width, title_height)?;
         self.highlight(&title, &row.highlights)?;
-        self.draw_text(&title, TEXT_LEFT, top + title_top, TITLE_TEXT)?;
+        self.surface
+            .draw_text(&title, TEXT_LEFT, top + title_top, TITLE_TEXT)?;
         let (subtitle_top, subtitle_height) = SUBTITLE_LINE;
-        let subtitle = self.layout(row.subtitle, &self.fonts.subtitle, width, subtitle_height)?;
-        self.draw_text(&subtitle, TEXT_LEFT, top + subtitle_top, SUBTITLE_TEXT)
+        let subtitle =
+            self.surface
+                .layout(row.subtitle, &self.fonts.subtitle, width, subtitle_height)?;
+        self.surface
+            .draw_text(&subtitle, TEXT_LEFT, top + subtitle_top, SUBTITLE_TEXT)
     }
 
     /// The icon, centred in the row's height.
@@ -407,7 +315,8 @@ impl Renderer {
         };
         let smooth = D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC;
         unsafe {
-            self.dc
+            self.surface
+                .dc
                 .DrawBitmap(&bitmap, Some(&place), 1.0, smooth, None, None)
         };
         Ok(())
@@ -430,14 +339,18 @@ impl Renderer {
         let pixels = Some(icon.bgra.as_ptr().cast());
         // SAFETY: `pixels` holds `height` rows of `width * 4` bytes, which
         // CreateBitmap copies before it returns.
-        let bitmap = unsafe { self.dc.CreateBitmap(size, pixels, icon.width * 4, &props)? };
+        let bitmap = unsafe {
+            self.surface
+                .dc
+                .CreateBitmap(size, pixels, icon.width * 4, &props)?
+        };
         self.icons.insert(id.clone(), bitmap.clone());
         Ok(bitmap)
     }
 
     /// Marks the matched letters: semibold, in the accent colour.
     fn highlight(&self, layout: &IDWriteTextLayout, ranges: &[Range<u32>]) -> Result<()> {
-        let brush = self.solid(MATCHED_TEXT)?;
+        let brush = self.surface.solid(MATCHED_TEXT)?;
         for range in ranges {
             let range = DWRITE_TEXT_RANGE {
                 startPosition: range.start,
@@ -450,290 +363,39 @@ impl Renderer {
         }
         Ok(())
     }
-
-    fn draw_text(
-        &self,
-        layout: &IDWriteTextLayout,
-        x: f32,
-        y: f32,
-        color: D2D1_COLOR_F,
-    ) -> Result<()> {
-        let brush = self.solid(color)?;
-        let options = D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT;
-        unsafe {
-            self.dc
-                .DrawTextLayout(Vector2 { X: x, Y: y }, layout, &brush, options);
-        }
-        Ok(())
-    }
-
-    fn layout(
-        &self,
-        text: &str,
-        format: &IDWriteTextFormat,
-        max_width: f32,
-        height: f32,
-    ) -> Result<IDWriteTextLayout> {
-        let utf16: Vec<u16> = text.encode_utf16().collect();
-        unsafe {
-            self.dwrite
-                .CreateTextLayout(&utf16, format, max_width, height)
-        }
-    }
-
-    fn solid(&self, color: D2D1_COLOR_F) -> Result<ID2D1Brush> {
-        unsafe { self.dc.CreateSolidColorBrush(&color, None)?.cast() }
-    }
-
-    fn vertical_gradient(
-        &self,
-        h: f32,
-        top: D2D1_COLOR_F,
-        bottom: D2D1_COLOR_F,
-    ) -> Result<ID2D1Brush> {
-        let stops = [
-            D2D1_GRADIENT_STOP {
-                position: 0.0,
-                color: top,
-            },
-            D2D1_GRADIENT_STOP {
-                position: 1.0,
-                color: bottom,
-            },
-        ];
-        let line = D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES {
-            startPoint: Vector2 { X: 0.0, Y: 0.0 },
-            endPoint: Vector2 { X: 0.0, Y: h },
-        };
-        unsafe {
-            // The plain render-target overload; the device-context one wants
-            // colour spaces and buffer precision we do not need.
-            let stops = ID2D1RenderTarget::CreateGradientStopCollection(
-                &self.dc,
-                &stops,
-                D2D1_GAMMA_2_2,
-                D2D1_EXTEND_MODE_CLAMP,
-            )?;
-            self.dc
-                .CreateLinearGradientBrush(&line, None, &stops)?
-                .cast()
-        }
-    }
 }
 
 impl Fonts {
     fn new(dwrite: &IDWriteFactory) -> Result<Self> {
-        let display = w!("Segoe UI Variable Display");
-        let text = w!("Segoe UI Variable Text");
+        let normal = DWRITE_FONT_WEIGHT_NORMAL;
         Ok(Self {
-            query: text_format(dwrite, display, QUERY_SIZE)?,
-            title: trimmed(dwrite, text_format(dwrite, text, TITLE_SIZE)?)?,
-            subtitle: trimmed(dwrite, text_format(dwrite, text, SUBTITLE_SIZE)?)?,
+            query: text_format(dwrite, DISPLAY_FONT, QUERY_SIZE, normal)?,
+            title: trimmed(dwrite, text_format(dwrite, TEXT_FONT, TITLE_SIZE, normal)?)?,
+            subtitle: trimmed(
+                dwrite,
+                text_format(dwrite, TEXT_FONT, SUBTITLE_SIZE, normal)?,
+            )?,
         })
     }
 }
 
-/// One line of text, centred in the height of its layout.
-fn text_format(dwrite: &IDWriteFactory, family: PCWSTR, size: f32) -> Result<IDWriteTextFormat> {
-    unsafe {
-        let format = dwrite.CreateTextFormat(
-            family,
-            None,
-            DWRITE_FONT_WEIGHT_NORMAL,
-            DWRITE_FONT_STYLE_NORMAL,
-            DWRITE_FONT_STRETCH_NORMAL,
-            size,
-            w!(""),
-        )?;
-        format.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER)?;
-        format.SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP)?;
-        Ok(format)
-    }
-}
-
-/// Text that does not fit its layout's width ends in an ellipsis.
-fn trimmed(dwrite: &IDWriteFactory, format: IDWriteTextFormat) -> Result<IDWriteTextFormat> {
-    let trimming = DWRITE_TRIMMING {
-        granularity: DWRITE_TRIMMING_GRANULARITY_CHARACTER,
-        ..Default::default()
-    };
-    unsafe {
-        let ellipsis = dwrite.CreateEllipsisTrimmingSign(&format)?;
-        format.SetTrimming(&trimming, &ellipsis)?;
-    }
-    Ok(format)
-}
-
-fn create_d3d_device() -> Result<ID3D11Device> {
-    let mut device = None;
-    unsafe {
-        D3D11CreateDevice(
-            None,
-            D3D_DRIVER_TYPE_HARDWARE,
-            Default::default(),
-            D3D11_CREATE_DEVICE_BGRA_SUPPORT,
-            None,
-            D3D11_SDK_VERSION,
-            Some(&mut device),
-            None,
-            None,
-        )?;
-    }
-    device.ok_or_else(windows::core::Error::empty)
-}
-
-fn create_swap_chain(d3d: &ID3D11Device, width: u32, height: u32) -> Result<IDXGISwapChain1> {
-    let desc = DXGI_SWAP_CHAIN_DESC1 {
-        Width: width,
-        Height: height,
-        Format: DXGI_FORMAT_B8G8R8A8_UNORM,
-        SampleDesc: DXGI_SAMPLE_DESC {
-            Count: 1,
-            Quality: 0,
-        },
-        BufferUsage: DXGI_USAGE_RENDER_TARGET_OUTPUT,
-        BufferCount: 2,
-        Scaling: DXGI_SCALING_STRETCH,
-        SwapEffect: DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL,
-        AlphaMode: DXGI_ALPHA_MODE_PREMULTIPLIED,
-        ..Default::default()
-    };
-    unsafe {
-        let factory: IDXGIFactory2 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0))?;
-        factory.CreateSwapChainForComposition(d3d, &desc, None)
-    }
-}
-
-fn create_device_context(dxgi_device: &IDXGIDevice) -> Result<ID2D1DeviceContext> {
-    unsafe {
-        let factory: ID2D1Factory1 = D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, None)?;
-        factory
-            .CreateDevice(dxgi_device)?
-            .CreateDeviceContext(D2D1_DEVICE_CONTEXT_OPTIONS_NONE)
-    }
-}
-
-fn compose(
-    hwnd: HWND,
-    dxgi_device: &IDXGIDevice,
-    swap_chain: &IDXGISwapChain1,
-) -> Result<(
-    IDCompositionDevice,
-    IDCompositionTarget,
-    IDCompositionVisual,
-)> {
-    unsafe {
-        let device: IDCompositionDevice = DCompositionCreateDevice(dxgi_device)?;
-        let target = device.CreateTargetForHwnd(hwnd, true)?;
-        let visual = device.CreateVisual()?;
-        visual.SetContent(swap_chain)?;
-        target.SetRoot(&visual)?;
-        device.Commit()?;
-        Ok((device, target, visual))
-    }
-}
+#[cfg(test)]
+pub use crate::surface::Frame;
 
 #[cfg(test)]
-pub use readback::Frame;
-
-/// Reading frames back from the GPU, so tests can check what is drawn.
-#[cfg(test)]
-mod readback {
-    use windows::Win32::Graphics::Direct3D11::{
-        D3D11_CPU_ACCESS_READ, D3D11_MAP_READ, D3D11_MAPPED_SUBRESOURCE, D3D11_TEXTURE2D_DESC,
-        D3D11_USAGE_STAGING, ID3D11Device, ID3D11Texture2D,
-    };
-    use windows::core::Result;
-
-    use super::Renderer;
-
-    /// One frame: premultiplied BGRA pixels, row by row.
-    pub struct Frame {
-        pub width: usize,
-        pub height: usize,
-        bgra: Vec<u8>,
-    }
-
-    impl Frame {
-        /// Blue, green, red and alpha of one pixel.
-        pub fn pixel(&self, x: usize, y: usize) -> [u8; 4] {
-            let at = (y * self.width + x) * 4;
-            [
-                self.bgra[at],
-                self.bgra[at + 1],
-                self.bgra[at + 2],
-                self.bgra[at + 3],
-            ]
-        }
-    }
-
-    impl Renderer {
-        /// Copies the last presented frame to the CPU.
-        ///
-        /// In a flip-model swap chain buffer 0 is always the next back
-        /// buffer; with two buffers, buffer 1 is the one just presented.
-        /// `FLIP_SEQUENTIAL` keeps it readable.
-        pub fn read_frame(&self) -> Result<Frame> {
-            // One mip level, one array slice: the texture's only
-            // subresource, mapped and unmapped by this index.
-            let subresource = 0;
-            unsafe {
-                let buffer: ID3D11Texture2D = self.swap_chain.GetBuffer(1)?;
-                let device: ID3D11Device = self.swap_chain.GetDevice()?;
-                let staging = staging_copy(&device, &buffer)?;
-                let context = device.GetImmediateContext()?;
-                let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
-                context.Map(&staging, subresource, D3D11_MAP_READ, 0, Some(&mut mapped))?;
-                let (width, height) = (self.width as usize, self.height as usize);
-                let pitch = mapped.RowPitch as usize;
-                // SAFETY: Map succeeded, so until Unmap pData points to
-                // `height` rows of `pitch` bytes, each at least `width`
-                // pixels.
-                let row = |index: usize| {
-                    let start = mapped.pData.cast::<u8>().add(index * pitch);
-                    std::slice::from_raw_parts(start, width * 4)
-                };
-                let bgra = (0..height).flat_map(row).copied().collect();
-                context.Unmap(&staging, subresource);
-                Ok(Frame {
-                    width,
-                    height,
-                    bgra,
-                })
-            }
-        }
-    }
-
-    /// A CPU-readable copy of `texture`.
-    fn staging_copy(device: &ID3D11Device, texture: &ID3D11Texture2D) -> Result<ID3D11Texture2D> {
-        let mut desc = D3D11_TEXTURE2D_DESC::default();
-        let mut staging = None;
-        unsafe {
-            texture.GetDesc(&mut desc);
-            desc.Usage = D3D11_USAGE_STAGING;
-            desc.BindFlags = 0;
-            desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ.0 as u32;
-            desc.MiscFlags = 0;
-            device.CreateTexture2D(&desc, None, Some(&mut staging))?;
-            let staging = staging.ok_or_else(windows::core::Error::empty)?;
-            device
-                .GetImmediateContext()?
-                .CopyResource(&staging, texture);
-            Ok(staging)
-        }
+impl Renderer {
+    /// Copies the last presented frame to the CPU.
+    pub fn read_frame(&self) -> Result<Frame> {
+        self.surface.read_frame()
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use windows::Win32::Foundation::DCOMPOSITION_ERROR_WINDOW_ALREADY_COMPOSED;
-    use windows::Win32::UI::WindowsAndMessaging::{
-        CreateWindowExW, DestroyWindow, WS_EX_NOREDIRECTIONBITMAP, WS_POPUP,
-    };
-
     use super::*;
     use crate::highlight::utf16_ranges;
     use crate::reference::assert_looks_like;
+    use crate::surface::Canvas;
     use crate::test_desktop::on_hidden_desktop;
 
     impl Scene<'static> {
@@ -744,37 +406,6 @@ mod tests {
                 rows: Vec::new(),
                 selected: 0,
             }
-        }
-    }
-
-    /// A bare window for a renderer to draw into, destroyed after the test.
-    struct Canvas(HWND);
-
-    impl Canvas {
-        fn new() -> Self {
-            let hwnd = unsafe {
-                CreateWindowExW(
-                    WS_EX_NOREDIRECTIONBITMAP,
-                    w!("STATIC"),
-                    None,
-                    WS_POPUP,
-                    0,
-                    0,
-                    1,
-                    1,
-                    None,
-                    None,
-                    None,
-                    None,
-                )
-            };
-            Self(hwnd.expect("a window"))
-        }
-    }
-
-    impl Drop for Canvas {
-        fn drop(&mut self) {
-            let _ = unsafe { DestroyWindow(self.0) };
         }
     }
 
@@ -922,21 +553,6 @@ mod tests {
             };
             let frame = drawn(&scene, (720, 128), 96);
             assert_looks_like("currency-100", &frame);
-        });
-    }
-
-    #[test]
-    fn the_picture_is_composed_above_the_window_content() {
-        on_hidden_desktop(|| {
-            let canvas = Canvas::new();
-            let _renderer = Renderer::new(canvas.0, 720, 64, 96).expect("a renderer");
-            // A window has one topmost composition target; the renderer's
-            // should be it, so a second one is refused.
-            let device: IDCompositionDevice =
-                unsafe { DCompositionCreateDevice(None) }.expect("a composition device");
-            let second = unsafe { device.CreateTargetForHwnd(canvas.0, true) };
-            let refused = second.expect_err("the topmost target is taken");
-            assert_eq!(refused.code(), DCOMPOSITION_ERROR_WINDOW_ALREADY_COMPOSED);
         });
     }
 

@@ -20,6 +20,7 @@ mod render;
 mod results;
 mod settings;
 mod store;
+mod surface;
 mod tray;
 mod window;
 
