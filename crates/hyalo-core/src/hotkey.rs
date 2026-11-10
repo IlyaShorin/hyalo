@@ -103,6 +103,18 @@ impl Hotkey {
         checked(modifiers, key, text)
     }
 
+    /// The hotkey made of the keys a user pressed: `modifiers` as
+    /// `MOD_*` bits and the virtual-key code `key`, held to the rules a
+    /// name is held to. A key with no name here is refused.
+    pub fn from_keys(modifiers: u32, key: u16) -> Result<Hotkey, String> {
+        if !known(key) {
+            return Err("hyalo has no name for that key: choose another".to_string());
+        }
+        let modifiers = (modifiers & u32::from(ALT | CTRL | SHIFT | WIN)) as u8;
+        let name = Hotkey { modifiers, key }.to_string();
+        checked(modifiers, Some(key), &name)
+    }
+
     /// The `MOD_*` bits `RegisterHotKey` takes.
     pub fn modifiers(self) -> u32 {
         u32::from(self.modifiers)
@@ -186,6 +198,14 @@ fn function_code(number: &str) -> Option<u16> {
 /// Which of F1 to F24 `key` is, if it is one.
 fn function_key(key: u16) -> Option<u16> {
     (F1..F1 + 24).contains(&key).then(|| key - F1 + 1)
+}
+
+/// Whether `key` is one hyalo has a name for: a named key, a letter, a
+/// digit, F1 to F24.
+fn known(key: u16) -> bool {
+    let letter_or_digit =
+        u8::try_from(key).is_ok_and(|key| key.is_ascii_digit() || key.is_ascii_uppercase());
+    letter_or_digit || function_key(key).is_some() || NAMED.iter().any(|&(_, code)| code == key)
 }
 
 /// The name a key is shown by.
@@ -283,6 +303,48 @@ mod tests {
         assert!(refused("Ctrl+F25").contains("`F25`"));
         assert!(refused("Ctrl+F0").contains("`F0`"));
         assert!(refused("Ctrl+").contains("no key"));
+    }
+
+    fn heard(modifiers: u32, key: u16) -> Result<String, String> {
+        Hotkey::from_keys(modifiers, key).map(|hotkey| hotkey.to_string())
+    }
+
+    #[test]
+    fn the_keys_pressed_make_the_hotkey_that_name_reads_as() {
+        assert_eq!(
+            heard(CTRL as u32 | SHIFT as u32, 0x4B),
+            Ok("Ctrl+Shift+K".into())
+        );
+        assert_eq!(heard(0, 0x73), Ok("F4".into()));
+        assert_eq!(heard(WIN as u32, 0x70), Ok("Win+F1".into()));
+        assert_eq!(heard(ALT as u32, 0x20), Ok("Alt+Space".into()));
+        assert_eq!(heard(CTRL as u32, 0xC0), Ok("Ctrl+`".into()));
+        assert_eq!(heard(0xF, 0x39), Ok("Win+Ctrl+Alt+Shift+9".into()));
+        let pressed = Hotkey::from_keys(ALT as u32, 0x20).expect("a hotkey");
+        assert_eq!(pressed, Hotkey::default());
+    }
+
+    #[test]
+    fn keys_pressed_follow_the_rules_a_name_follows() {
+        let shift_k = heard(SHIFT as u32, 0x4B).expect_err("not a hotkey");
+        assert!(
+            shift_k.contains("`Shift+K` needs Ctrl, Alt or Win"),
+            "{shift_k}"
+        );
+        let space = heard(0, 0x20).expect_err("not a hotkey");
+        assert!(space.contains("`Space` needs"), "{space}");
+    }
+
+    #[test]
+    fn a_key_hyalo_has_no_name_for_is_refused() {
+        // Numpad 0, the Windows key itself, Shift itself.
+        for key in [0x60, 0x5B, 0x10, 0x00, 0x88] {
+            let refused = heard(CTRL as u32, key).expect_err("not a hotkey");
+            assert!(
+                refused.contains("no name for that key"),
+                "{key:#x}: {refused}"
+            );
+        }
     }
 
     #[test]
