@@ -11,6 +11,7 @@
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::{Duration, Instant, SystemTime};
@@ -33,14 +34,16 @@ use windows::Win32::Graphics::Gdi::{
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
 use windows::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, VIRTUAL_KEY, VK_CONTROL, VK_SHIFT};
+use windows::Win32::UI::Shell::{NIN_SELECT, NINF_KEY};
 use windows::Win32::UI::WindowsAndMessaging::{
-    AllowSetForegroundWindow, CW_USEDEFAULT, CreateWindowExW, DefWindowProcW, DispatchMessageW,
-    FindWindowW, GetCursorPos, GetMessageW, GetWindowThreadProcessId, HTCLIENT, HWND_TOPMOST,
-    IDC_ARROW, IsWindowVisible, LoadCursorW, MSG, PostMessageW, PostQuitMessage, RegisterClassExW,
-    SW_HIDE, SW_SHOW, SWP_NOACTIVATE, SetForegroundWindow, SetWindowPos, ShowWindow,
-    TranslateMessage, WA_INACTIVE, WM_ACTIVATE, WM_APP, WM_CHAR, WM_DESTROY, WM_HOTKEY, WM_KEYDOWN,
-    WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCCALCSIZE, WM_NCHITTEST, WNDCLASSEXW, WS_CAPTION,
-    WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_THICKFRAME,
+    AllowSetForegroundWindow, CW_USEDEFAULT, CreateWindowExW, DefWindowProcW, DestroyWindow,
+    DispatchMessageW, FindWindowW, GetCursorPos, GetMessageW, GetWindowThreadProcessId, HTCLIENT,
+    HWND_TOPMOST, IDC_ARROW, IsWindowVisible, LoadCursorW, MSG, PostMessageW, PostQuitMessage,
+    RegisterClassExW, SW_HIDE, SW_SHOW, SWP_NOACTIVATE, SetForegroundWindow, SetWindowPos,
+    ShowWindow, TranslateMessage, WA_INACTIVE, WM_ACTIVATE, WM_APP, WM_CHAR, WM_CONTEXTMENU,
+    WM_DESTROY, WM_HOTKEY, WM_KEYDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCCALCSIZE, WM_NCHITTEST,
+    WNDCLASSEXW, WS_CAPTION, WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    WS_THICKFRAME,
 };
 use windows::core::{BOOL, PCWSTR, Result, w};
 
@@ -54,6 +57,7 @@ use crate::layout::{self, Rect};
 use crate::query::Query;
 use crate::render::{Renderer, Row, Scene};
 use crate::results::{self, Listed, MAX_ROWS, Results};
+use crate::tray::{self, Tray};
 use crate::{http, launch, rates, store};
 
 /// The id the hotkey is registered with; a new hotkey takes the other
@@ -105,6 +109,10 @@ pub struct Services {
     pub picks: Option<PathBuf>,
     /// Registers the hotkey with Windows.
     pub hotkeys: Box<dyn Hotkeys>,
+    /// The notification area.
+    pub tray: Rc<dyn Tray>,
+    /// Where the config lives; `None` runs on the defaults.
+    pub config: Option<PathBuf>,
 }
 
 impl Services {
@@ -140,6 +148,8 @@ impl Services {
             run: Box::new(run_in_background),
             picks: store::default_path(),
             hotkeys: Box::new(hotkeys::System),
+            tray: Rc::new(tray::Shell),
+            config: store::ours("APPDATA", "config.toml"),
         }
     }
 }
@@ -176,6 +186,8 @@ struct App {
     pointer: Option<POINT>,
     /// The hotkey Windows holds for the launcher, and its id.
     hotkey: Option<(i32, Hotkey)>,
+    /// When the launcher last lost the focus while shown.
+    deactivated_at: Option<Instant>,
 }
 
 impl App {
@@ -194,6 +206,37 @@ impl App {
             self.services.hotkeys.unregister(self.hwnd, old);
         }
         Ok(())
+    }
+
+    /// The hotkey that shows the launcher now, if there is one.
+    fn hotkey(&self) -> Option<Hotkey> {
+        self.hotkey.map(|(_, hotkey)| hotkey)
+    }
+
+    /// Shows hyalo's icon in the tray with what it should say.
+    fn show_tray(&mut self) {
+        let tip = tray::tip(self.hotkey(), None);
+        self.services.tray.show(self.hwnd, &tip);
+    }
+
+    /// What the tray's menu holds now.
+    fn menu(&self) -> Vec<tray::Line> {
+        tray::menu(self.hotkey(), None)
+    }
+
+    /// Opens the config in the editor Windows has for it.
+    fn open_settings(&mut self) {
+        if let Some(path) = &self.services.config {
+            let path = path.to_string_lossy().into_owned();
+            (self.services.run)(&Action::Open(path), false);
+        }
+    }
+
+    /// Before the window goes: the tray icon goes too, and the picks are
+    /// saved.
+    fn close(&mut self) {
+        self.services.tray.remove(self.hwnd);
+        self.save_picks();
     }
 
     /// Sizes the window for the rows it lists and draws it.
@@ -286,13 +329,18 @@ impl App {
             return;
         }
         self.frecency.record(&item.id, self.query.text(), now());
+        self.save_picks();
+        if item.path().is_some() {
+            self.catalog.pick(item);
+        }
+    }
+
+    /// Writes the picks to the picks file, if there is one.
+    fn save_picks(&self) {
         if let Some(path) = &self.services.picks
             && let Err(error) = store::save(path, &self.frecency)
         {
             eprintln!("hyalo: cannot save picks to {}: {error}", path.display());
-        }
-        if item.path().is_some() {
-            self.catalog.pick(item);
         }
     }
 
@@ -463,12 +511,14 @@ fn open(services: Services) -> Result<HWND> {
             found: channel(),
             pointer: None,
             hotkey: None,
+            deactivated_at: None,
         };
         opened.find_picked();
         let hotkey = Hotkey::default();
         if let Err(error) = opened.bind(hotkey) {
             eprintln!("hyalo: {hotkey} is taken by another app: {error}");
         }
+        opened.show_tray();
         *app = Some(opened);
     });
     style_window(hwnd)?;
@@ -560,6 +610,7 @@ extern "system" fn wndproc(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPA
         // No WM_PAINT: the picture lives in the DirectComposition swap chain
         // and survives without one; DefWindowProc validates the window.
         WM_DESTROY => {
+            with_app(App::close);
             unsafe { PostQuitMessage(0) };
             handled(Ok(()))
         }
@@ -576,24 +627,98 @@ fn on_message(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> Optio
     match message {
         WM_HOTKEY => Some(toggle(hwnd)),
         WM_ACTIVATE if (wparam.0 & 0xFFFF) as u32 == WA_INACTIVE => {
-            hide(hwnd);
+            on_focus_lost(hwnd);
             Some(Ok(()))
         }
         WM_KEYDOWN => Some(on_key(hwnd, VIRTUAL_KEY(wparam.0 as u16))),
         WM_CHAR => Some(on_char(wparam.0 as u16)),
         WM_MOUSEMOVE => Some(with_app(|app| app.hover(client_point(lparam))).unwrap_or(Ok(()))),
         WM_LBUTTONUP => Some(on_click(hwnd, client_point(lparam))),
-        _ => on_app_message(hwnd, message),
+        _ => on_app_message(hwnd, message, wparam, lparam),
     }
 }
 
-/// What the launcher does with the messages its own threads and
-/// processes send it; `None` for the rest.
-fn on_app_message(hwnd: HWND, message: u32) -> Option<Result<()>> {
+/// What the launcher does with the messages its own threads, other
+/// processes and the shell send it; `None` for the rest.
+fn on_app_message(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> Option<Result<()>> {
     match message {
         WM_FOUND => Some(with_app(App::take_found).unwrap_or(Ok(()))),
         WM_SHOW => Some(show(hwnd)),
+        tray::WM_TRAY => Some(on_tray(hwnd, wparam, lparam)),
+        _ if message == tray::taskbar_created() => {
+            with_app(App::show_tray);
+            Some(Ok(()))
+        }
         _ => None,
+    }
+}
+
+/// How long after the launcher lost the focus a click on the tray icon
+/// counts as the click that took it.
+const FOCUS_CLICK: Duration = Duration::from_millis(500);
+
+/// Losing the focus hides the launcher, and notes when, if it was shown.
+fn on_focus_lost(hwnd: HWND) {
+    if unsafe { IsWindowVisible(hwnd) }.as_bool() {
+        with_app(|app| app.deactivated_at = Some(Instant::now()));
+    }
+    hide(hwnd);
+}
+
+/// The icon chosen with the keyboard: Enter or Space on it.
+const KEY_SELECT: u32 = NIN_SELECT | NINF_KEY;
+
+/// What the tray icon tells: a click, or Enter on the icon, shows or
+/// hides the launcher; a right click, or the menu key, opens the menu.
+fn on_tray(hwnd: HWND, wparam: WPARAM, lparam: LPARAM) -> Result<()> {
+    match (lparam.0 & 0xFFFF) as u32 {
+        NIN_SELECT | KEY_SELECT => on_tray_click(hwnd),
+        // Where the menu opens, in screen pixels, comes as a mouse
+        // message's point does, in wParam.
+        WM_CONTEXTMENU => on_tray_menu(hwnd, client_point(LPARAM(wparam.0 as isize))),
+        _ => Ok(()),
+    }
+}
+
+/// A click on the tray icon hides a shown launcher and shows a hidden
+/// one. While the launcher is up, the click takes the focus from it
+/// first, which hides it: that click must not show it again.
+fn on_tray_click(hwnd: HWND) -> Result<()> {
+    let visible = unsafe { IsWindowVisible(hwnd) }.as_bool();
+    let lost = with_app(|app| app.deactivated_at.take()).flatten();
+    match visible || lost.is_some_and(|at| at.elapsed() < FOCUS_CLICK) {
+        true => {
+            hide(hwnd);
+            Ok(())
+        }
+        false => show(hwnd),
+    }
+}
+
+/// Opens the tray's menu at `at` and carries out what is picked. The
+/// menu runs a message loop of its own, so the app state is not held
+/// while it is open.
+fn on_tray_menu(hwnd: HWND, at: POINT) -> Result<()> {
+    let Some((tray, lines)) = with_app(|app| (Rc::clone(&app.services.tray), app.menu())) else {
+        return Ok(());
+    };
+    match tray.menu(hwnd, &lines, at) {
+        Some(command) => on_command(hwnd, command),
+        None => Ok(()),
+    }
+}
+
+/// Carries out a command from the tray's menu. Exit destroys the window,
+/// which saves the picks, takes the icon away and ends the message loop.
+fn on_command(hwnd: HWND, command: tray::Command) -> Result<()> {
+    match command {
+        tray::Command::Show => show(hwnd),
+        tray::Command::Settings => {
+            with_app(App::open_settings);
+            Ok(())
+        }
+        tray::Command::StartWithWindows => Ok(()),
+        tray::Command::Exit => unsafe { DestroyWindow(hwnd) },
     }
 }
 
@@ -805,7 +930,7 @@ mod tests {
         SetKeyboardState, VK_A, VK_C, VK_DOWN, VK_ESCAPE, VK_RETURN, VK_UP,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
-        DestroyWindow, GetClientRect, GetWindowRect, PM_QS_POSTMESSAGE, PM_REMOVE, PeekMessageW,
+        GetClientRect, GetWindowRect, IsWindow, PM_QS_POSTMESSAGE, PM_REMOVE, PeekMessageW,
         SendMessageW, WA_ACTIVE, WM_NULL, WM_QUIT,
     };
 
@@ -879,6 +1004,32 @@ mod tests {
         }
     }
 
+    /// The notification area as a test keeps it: the tips shown, how
+    /// often the icon was taken away, the menus opened and where, and
+    /// what the user will pick from the next menu.
+    #[derive(Default)]
+    struct Taskbar {
+        tips: RefCell<Vec<String>>,
+        removed: RefCell<usize>,
+        menus: RefCell<Vec<(Vec<tray::Line>, POINT)>>,
+        pick: RefCell<Option<tray::Command>>,
+    }
+
+    impl Tray for Taskbar {
+        fn show(&self, _: HWND, tip: &str) {
+            self.tips.borrow_mut().push(tip.to_string());
+        }
+
+        fn remove(&self, _: HWND) {
+            *self.removed.borrow_mut() += 1;
+        }
+
+        fn menu(&self, _: HWND, lines: &[tray::Line], at: POINT) -> Option<tray::Command> {
+            self.menus.borrow_mut().push((lines.to_vec(), at));
+            self.pick.borrow_mut().take()
+        }
+    }
+
     impl Keyboard {
         /// The hotkeys the launcher holds now.
         fn held(&self) -> Vec<String> {
@@ -911,6 +1062,8 @@ mod tests {
             }),
             picks,
             hotkeys: Box::new(Rc::new(Keyboard::default())),
+            tray: Rc::new(Taskbar::default()),
+            config: None,
         };
         (services, ran)
     }
@@ -1104,6 +1257,20 @@ mod tests {
             self.send(WM_HOTKEY, HOTKEY_TOGGLE as usize);
         }
 
+        /// What the tray icon tells the window: `event`, with the point
+        /// (x, y) in screen pixels where a menu would open.
+        fn tray(&self, event: u32, (x, y): (i32, i32)) {
+            let at = WPARAM(((y as usize) << 16) | (x as usize & 0xFFFF));
+            let event = LPARAM((1 << 16) | event as isize);
+            unsafe { SendMessageW(self.0, tray::WM_TRAY, Some(at), Some(event)) };
+        }
+
+        /// Right-clicks the tray icon, and picks `command` from the menu.
+        fn pick(&self, taskbar: &Taskbar, command: tray::Command) {
+            *taskbar.pick.borrow_mut() = Some(command);
+            self.tray(WM_CONTEXTMENU, (0, 0));
+        }
+
         fn visible(&self) -> bool {
             unsafe { IsWindowVisible(self.0) }.as_bool()
         }
@@ -1245,6 +1412,120 @@ mod tests {
         });
     }
 
+    /// A launcher with a stand-in taskbar, the config at `config` and
+    /// picks in `picks`; also the taskbar and what it was asked to run.
+    fn in_the_tray(
+        config: Option<PathBuf>,
+        picks: Option<PathBuf>,
+    ) -> (Launcher, Rc<Taskbar>, Ran) {
+        let taskbar = Rc::new(Taskbar::default());
+        let (mut services, ran) = services(listing(&["Notepad"]).0, picks);
+        services.tray = taskbar.clone();
+        services.config = config;
+        let launcher = Launcher::serving(services);
+        launcher.pump_until(|app| !app.catalog.items.is_empty());
+        (launcher, taskbar, ran)
+    }
+
+    #[test]
+    fn opening_puts_the_icon_in_the_tray_with_the_hotkey_in_its_tip() {
+        on_hidden_desktop(|| {
+            let (_launcher, taskbar, _) = in_the_tray(None, None);
+            assert_eq!(*taskbar.tips.borrow(), ["hyalo · Alt+Space"]);
+        });
+    }
+
+    #[test]
+    fn a_click_on_the_tray_icon_shows_a_hidden_launcher_and_hides_a_shown_one() {
+        on_hidden_desktop(|| {
+            let (launcher, _, _) = in_the_tray(None, None);
+            launcher.press(VK_ESCAPE);
+            launcher.tray(NIN_SELECT, (0, 0));
+            assert!(launcher.visible());
+            launcher.tray(NIN_SELECT, (0, 0));
+            assert!(!launcher.visible());
+            launcher.tray(KEY_SELECT, (0, 0));
+            assert!(launcher.visible(), "Enter on the icon");
+        });
+    }
+
+    #[test]
+    fn the_click_that_took_the_focus_leaves_it_hidden() {
+        on_hidden_desktop(|| {
+            let (launcher, _, _) = in_the_tray(None, None);
+            launcher.send(WM_ACTIVATE, WA_INACTIVE as usize);
+            launcher.tray(NIN_SELECT, (0, 0));
+            assert!(!launcher.visible());
+            launcher.tray(NIN_SELECT, (0, 0));
+            assert!(launcher.visible(), "the next click shows it");
+        });
+    }
+
+    #[test]
+    fn a_right_click_opens_the_menu_where_the_tray_says() {
+        on_hidden_desktop(|| {
+            let (launcher, taskbar, _) = in_the_tray(None, None);
+            launcher.tray(WM_CONTEXTMENU, (1500, 1040));
+            let menus = taskbar.menus.borrow();
+            let (lines, at) = &menus[0];
+            assert_eq!(*lines, tray::menu(Some(Hotkey::default()), None));
+            assert_eq!((at.x, at.y), (1500, 1040));
+            assert!(launcher.visible(), "nothing picked");
+        });
+    }
+
+    #[test]
+    fn show_from_the_menu_shows_it() {
+        on_hidden_desktop(|| {
+            let (launcher, taskbar, _) = in_the_tray(None, None);
+            launcher.press(VK_ESCAPE);
+            launcher.pick(&taskbar, tray::Command::Show);
+            assert!(launcher.visible());
+        });
+    }
+
+    #[test]
+    fn settings_from_the_menu_opens_the_config() {
+        on_hidden_desktop(|| {
+            let config = PathBuf::from(r"C:\nowhere\hyalo\config.toml");
+            let (launcher, taskbar, ran) = in_the_tray(Some(config), None);
+            launcher.pick(&taskbar, tray::Command::Settings);
+            let opened = Action::Open(r"C:\nowhere\hyalo\config.toml".to_string());
+            assert_eq!(*ran.borrow(), [(opened, false)]);
+        });
+    }
+
+    #[test]
+    fn exit_takes_the_icon_away_saves_the_picks_and_quits() {
+        let picks = PicksFile::new("exit");
+        let path = picks.0.clone();
+        on_hidden_desktop(move || {
+            let (launcher, taskbar, _) = in_the_tray(None, Some(path.clone()));
+            launcher.type_text("note");
+            launcher.press(VK_RETURN);
+            std::fs::remove_file(&path).expect("the pick was saved");
+            launcher.pick(&taskbar, tray::Command::Exit);
+            assert!(
+                !unsafe { IsWindow(Some(launcher.0)) }.as_bool(),
+                "destroyed"
+            );
+            assert_eq!(*taskbar.removed.borrow(), 1);
+            assert!(path.exists(), "saved again");
+            let mut message = MSG::default();
+            let quit = unsafe { PeekMessageW(&mut message, None, WM_QUIT, WM_QUIT, PM_REMOVE) };
+            assert!(quit.as_bool());
+        });
+    }
+
+    #[test]
+    fn the_icon_comes_back_when_explorer_restarts() {
+        on_hidden_desktop(|| {
+            let (launcher, taskbar, _) = in_the_tray(None, None);
+            launcher.send(tray::taskbar_created(), 0);
+            assert_eq!(taskbar.tips.borrow().len(), 2);
+        });
+    }
+
     #[test]
     fn escape_enter_and_losing_focus_each_hide_it() {
         let hiders = [
@@ -1345,6 +1626,7 @@ mod tests {
             (WM_HOTKEY, HOTKEY_TOGGLE as usize),
             (WM_FOUND, 0),
             (WM_SHOW, 0),
+            (tray::WM_TRAY, 0),
         ];
         on_hidden_desktop(move || {
             let launcher = Launcher::open();

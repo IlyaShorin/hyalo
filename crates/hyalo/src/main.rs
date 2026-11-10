@@ -17,6 +17,7 @@ mod rates;
 mod render;
 mod results;
 mod store;
+mod tray;
 mod window;
 
 #[cfg(test)]
