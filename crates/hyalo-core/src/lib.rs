@@ -9,3 +9,4 @@ pub mod keyboard;
 pub mod matcher;
 pub mod places;
 pub mod rank;
+pub mod rates;
