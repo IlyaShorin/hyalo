@@ -380,6 +380,41 @@ impl Index {
         Some(Item::file(self.path(id)?, self.is_folder(id)?))
     }
 
+    /// Puts the roots of `fresh`, with everything under them, in place of
+    /// this index's roots by the same names: what a walk of one root found
+    /// again replaces what was known of it. Other roots stay as they are.
+    pub fn replace(&mut self, fresh: &Index) {
+        for root in fresh.children(NO_PARENT) {
+            let name = fresh.name_at(root);
+            let old: Vec<u32> = self.children(NO_PARENT).collect();
+            if let Some(&old) = old.iter().find(|&&at| same(self.name_at(at), name)) {
+                // Found just now among the roots.
+                let _ = self.remove(EntryId(old));
+            }
+            self.graft(fresh, root);
+        }
+    }
+
+    /// Copies the root `root` of `fresh`, with everything under it, sizes
+    /// and times too, as a root of this index.
+    fn graft(&mut self, fresh: &Index, root: u32) {
+        // Its names were taken by `fresh`, so they are taken here.
+        let Ok(top) = self.add_root(fresh.name_at(root)) else {
+            return;
+        };
+        let mut copying = vec![(root, top.0)];
+        while let Some((from, to)) = copying.pop() {
+            let (from_at, to_at) = (from as usize, to as usize);
+            (self.sizes[to_at], self.times[to_at]) = (fresh.sizes[from_at], fresh.times[from_at]);
+            for child in fresh.children(from) {
+                let entry = fresh.entries[child as usize];
+                if let Ok(copy) = self.add(EntryId(to), fresh.name_of(entry), entry.is_folder()) {
+                    copying.push((child, copy.0));
+                }
+            }
+        }
+    }
+
     /// Gives back the room kept for growth: after a walk, the arenas can
     /// hold up to twice what they use.
     pub fn shrink_to_fit(&mut self) {
@@ -1077,6 +1112,51 @@ mod tests {
         assert_eq!(index.version(), before, "the same");
         index.set_stat(notes, 0, 10).unwrap();
         assert_ne!(index.version(), before);
+    }
+
+    /// A fresh walk of C: alone: Users\Me\todo.md, 7 bytes, and Temp.
+    fn walked_again() -> Index {
+        let mut fresh = Index::default();
+        let c = fresh.add_root("C:").unwrap();
+        let users = fresh.add(c, "Users", true).unwrap();
+        let me = fresh.add(users, "Me", true).unwrap();
+        let todo = fresh.add(me, "todo.md", false).unwrap();
+        fresh.set_stat(todo, 7, 1_794_310_200).unwrap();
+        fresh.add(c, "Temp", true).unwrap();
+        fresh
+    }
+
+    #[test]
+    fn a_root_walked_again_takes_the_place_of_the_one_there() {
+        let (mut index, _) = drive();
+        let d = index.add_root("D:").unwrap();
+        let data = index.add(d, "Data", false).unwrap();
+        index.replace(&walked_again());
+        assert_eq!(
+            index.find(r"C:\Users\Me\notes.txt"),
+            None,
+            "what the walk did not find"
+        );
+        assert_eq!(index.find(r"C:\Windows"), None);
+        let todo = index.find(r"C:\Users\Me\todo.md").expect("what it found");
+        assert_eq!(index.stat(todo), Some((7, 1_794_310_200)));
+        assert!(index.find(r"C:\Temp").is_some());
+        assert_eq!(
+            index.path(data).as_deref(),
+            Some(r"D:\Data"),
+            "another root untouched"
+        );
+        assert_eq!(index.len(), 1 + 4 + 2, "C:, its four, D: and its one");
+    }
+
+    #[test]
+    fn a_root_walked_for_the_first_time_joins_the_others() {
+        let mut index = Index::default();
+        let d = index.add_root("D:").unwrap();
+        index.replace(&walked_again());
+        assert!(index.find(r"C:\Users\Me\todo.md").is_some());
+        assert_eq!(index.parent(d), None);
+        assert_eq!(index.len(), 6);
     }
 
     #[test]
