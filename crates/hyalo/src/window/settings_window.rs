@@ -161,14 +161,13 @@ fn style(hwnd: HWND) -> Result<()> {
     unsafe { DwmExtendFrameIntoClientArea(hwnd, &sheet) }
 }
 
-/// The size of `hwnd`'s client area, in pixels; at least one each way,
-/// as a swap chain must be.
+/// The size of `hwnd`'s client area, in pixels: a client rectangle
+/// starts at 0, 0.
 fn client_size(hwnd: HWND) -> (u32, u32) {
     let mut rect = RECT::default();
     // SAFETY: a plain call into a live RECT.
     let _ = unsafe { GetClientRect(hwnd, &mut rect) };
-    let side = |length: i32| length.max(1) as u32;
-    (side(rect.right - rect.left), side(rect.bottom - rect.top))
+    (rect.right as u32, rect.bottom as u32)
 }
 
 /// The modifier keys held, as of the key message being handled.
@@ -244,7 +243,7 @@ impl SettingsWindow {
             cbSize: size_of::<TRACKMOUSEEVENT>() as u32,
             dwFlags: TME_LEAVE,
             hwndTrack: self.hwnd,
-            dwHoverTime: 0,
+            ..Default::default()
         };
         // SAFETY: a plain call with a live TRACKMOUSEEVENT.
         self.tracking = unsafe { TrackMouseEvent(&mut leave) }.is_ok();
@@ -1156,6 +1155,139 @@ mod tests {
         });
     }
 
+    /// Makes the settings window small, so the page outgrows it.
+    fn shrink(settings: &Settings) {
+        let flags = SWP_NOZORDER | SWP_NOACTIVATE;
+        unsafe { SetWindowPos(settings.0, None, 0, 0, 600, 420, flags) }.expect("make it small");
+    }
+
+    #[test]
+    fn the_wheel_stops_at_the_bottom_and_a_click_finds_the_control_scrolled_under_it() {
+        on_hidden_desktop(|| {
+            let setup = set_up("settings-window-scrolled", DEFAULT, None);
+            let settings = setup.settings();
+            shrink(&settings);
+            let far = (-12000_i16 as u16 as usize) << 16;
+            settings.send(WM_MOUSEWHEEL, far, 0);
+            let (scroll, page, view) = settings.state(|window| {
+                (
+                    window.panel.scroll(),
+                    window.laid.height,
+                    window.painter.view().1,
+                )
+            });
+            assert_eq!(scroll, page - view, "the bottom of the page");
+            settings.click(Target::Pick(List::RankHigher));
+            assert_eq!(*setup.chooser.asked.borrow(), ["Rank a folder higher"]);
+        });
+    }
+
+    #[test]
+    fn tab_brings_a_control_below_into_a_short_window() {
+        on_hidden_desktop(|| {
+            let setup = set_up("settings-window-reveal", DEFAULT, None);
+            let settings = setup.settings();
+            shrink(&settings);
+            hold(&[VK_SHIFT]);
+            settings.press(VK_TAB);
+            hold(&[]);
+            let (scroll, bottom, view) = settings.state(|window| {
+                let last = window
+                    .laid
+                    .area(Target::OpenConfig)
+                    .expect("the last control");
+                (
+                    window.panel.scroll(),
+                    last.bottom(),
+                    window.painter.view().1,
+                )
+            });
+            assert_eq!(scroll, bottom + 12.0 - view);
+        });
+    }
+
+    #[test]
+    fn either_windows_key_is_win() {
+        on_hidden_desktop(|| {
+            let setup = set_up("settings-window-win", DEFAULT, None);
+            let settings = setup.settings();
+            let f = |n: u16| VIRTUAL_KEY(0x6F + n);
+            for (win, key, name) in [(VK_LWIN, f(2), "Win+F2"), (VK_RWIN, f(3), "Win+F3")] {
+                settings.click(Target::Hotkey);
+                hold(&[win]);
+                settings.press(key);
+                hold(&[]);
+                assert_eq!(setup.keyboard.held(), [name]);
+            }
+        });
+    }
+
+    #[test]
+    fn a_config_that_cannot_be_read_is_shown_as_a_problem() {
+        on_hidden_desktop(|| {
+            let scratch =
+                Scratch::new("settings-window-unreadable").with(&["hyalo\\config.toml\\"]);
+            let (mut services, _) = services(listing(&[]).0, None);
+            let taskbar = Rc::new(Taskbar::default());
+            services.tray = taskbar.clone();
+            services.config = Some(scratch.0.join("hyalo").join("config.toml"));
+            let launcher = Launcher::serving(services);
+            launcher.pick(&taskbar, tray::Command::Settings);
+            let settings = Settings::find();
+            assert!(settings.shows("config.toml has a problem"));
+            assert!(settings.shows("Line 1: config.toml cannot be read"));
+        });
+    }
+
+    #[test]
+    fn coming_to_the_front_shows_whether_hyalo_starts_with_windows_now() {
+        on_hidden_desktop(|| {
+            let keys = autostart::tests::Keys::new("settings-window-activate");
+            let exe = r"C:\Programs\hyalo\hyalo.exe";
+            let setup = set_up(
+                "settings-window-activate",
+                DEFAULT,
+                Some(keys.autostart(exe)),
+            );
+            let settings = setup.settings();
+            let on = || {
+                let marks = settings.state(|window| window.laid.marks.clone());
+                marks
+                    .iter()
+                    .any(|mark| matches!(mark.what, What::Toggle { on: true, .. }))
+            };
+            keys.autostart(exe).set(true).expect("on, elsewhere");
+            settings.send(WM_ACTIVATE, WA_INACTIVE as usize, 0);
+            assert!(!on(), "losing the focus asks nothing");
+            settings.send(
+                WM_ACTIVATE,
+                windows::Win32::UI::WindowsAndMessaging::WA_ACTIVE as usize,
+                0,
+            );
+            assert!(on(), "coming to the front asks again");
+        });
+    }
+
+    #[test]
+    fn the_pointer_is_watched_for_leaving_on_every_visit() {
+        on_hidden_desktop(|| {
+            let setup = set_up("settings-window-leave", DEFAULT, None);
+            let settings = setup.settings();
+            let target = Target::Pick(List::RankHigher);
+            let left = |app: &App| {
+                let window = app.settings.as_ref();
+                window.is_some_and(|window| !window.panel.look(target).hovered)
+            };
+            // The pointer is never over a window of the hidden desktop: once
+            // asked to watch, Windows says at once that it left.
+            for _visit in 0..2 {
+                settings.send(WM_MOUSEMOVE, 0, settings.point(target));
+                assert!(settings.state(|window| window.panel.look(target).hovered));
+                setup.launcher.pump_until(left);
+            }
+        });
+    }
+
     #[test]
     fn the_pointer_lights_the_control_it_is_over() {
         on_hidden_desktop(|| {
@@ -1181,8 +1313,15 @@ mod tests {
                 bottom: 20 + 1200,
             };
             let dpi = 144 | 144 << 16;
-            settings.send(WM_DPICHANGED, dpi, (&raw const suggested) as isize);
+            let answer = settings.send(WM_DPICHANGED, dpi, (&raw const suggested) as isize);
+            assert_eq!(answer, LRESULT(0), "handled");
             assert_eq!(settings.state(|window| window.dpi), 144);
+            let mut placed = RECT::default();
+            unsafe {
+                windows::Win32::UI::WindowsAndMessaging::GetWindowRect(settings.0, &mut placed)
+            }
+            .expect("its rect");
+            assert_eq!(placed, suggested, "where Windows suggests");
             let (width, height) = client_size(settings.0);
             let frame = settings.frame();
             assert_eq!(
@@ -1200,7 +1339,8 @@ mod tests {
             let setup = set_up("settings-window-least", DEFAULT, None);
             let settings = setup.settings();
             let mut info = MINMAXINFO::default();
-            settings.send(WM_GETMINMAXINFO, 0, (&raw mut info) as isize);
+            let answer = settings.send(WM_GETMINMAXINFO, 0, (&raw mut info) as isize);
+            assert_eq!(answer, LRESULT(0), "handled");
             let dpi = settings.state(|window| window.dpi);
             let (width, height) = layout::settings_least(layout::scale(dpi));
             assert_eq!(

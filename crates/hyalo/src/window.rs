@@ -616,12 +616,19 @@ thread_local! {
 /// Opens the launcher, shown, in the tray, or with its settings window
 /// open, and runs until the window closes.
 pub fn run(start: Start) -> Result<()> {
-    let hwnd = open(Services::real(), false)?;
-    // Through the message loop, as a second start asks: showing, or
-    // opening the settings, then has every message it needs.
-    ask(hwnd, start);
+    begin(Services::real(), start)?;
     message_loop();
     Ok(())
+}
+
+/// Opens the launcher with `services`, in the tray, and asks it, as a
+/// second start would, to show or to open its settings when `start`
+/// says so: through the message loop, where showing a window has every
+/// message it needs.
+fn begin(services: Services, start: Start) -> Result<HWND> {
+    let hwnd = open(services, false)?;
+    ask(hwnd, start);
+    Ok(hwnd)
 }
 
 /// Creates the launcher window on this thread, with the picks saved
@@ -1631,6 +1638,45 @@ mod tests {
             ask(launcher.0, Start::Shown);
             launcher.pump_until(|_| unsafe { IsWindowVisible(launcher.0) }.as_bool());
         });
+    }
+
+    /// Handles every message queued for this thread, as the message loop
+    /// would, until none is left.
+    fn drain() {
+        let mut message = MSG::default();
+        while unsafe { PeekMessageW(&mut message, None, 0, 0, PM_REMOVE) }.as_bool() {
+            unsafe {
+                let _ = TranslateMessage(&message);
+                DispatchMessageW(&message);
+            }
+        }
+    }
+
+    #[test]
+    fn a_first_start_shows_stays_in_the_tray_or_opens_the_settings_as_asked() {
+        let starts = [
+            (Start::Shown, true, false),
+            (Start::Hidden, false, false),
+            (Start::Settings, false, true),
+        ];
+        for (start, shown, settings) in starts {
+            on_hidden_desktop(move || {
+                let (_scratch, config) = config_file(&format!("window-begin-{start:?}"), "");
+                let (mut services, _) = services(listing(&[]).0, None);
+                services.tray = Rc::new(Taskbar::default());
+                services.config = Some(config);
+                hold(&[]);
+                let launcher = Launcher(begin(services, start).expect("begin"));
+                assert!(
+                    !launcher.visible(),
+                    "{start:?}: nothing shown before the loop"
+                );
+                drain();
+                assert_eq!(launcher.visible(), shown, "{start:?}");
+                let open = with_app(|app| app.settings.is_some()).expect("app state");
+                assert_eq!(open, settings, "{start:?}");
+            });
+        }
     }
 
     #[test]

@@ -125,6 +125,8 @@ impl Area {
 pub struct Mark {
     pub at: Area,
     pub what: What,
+    /// It is on a card whose settings cannot be changed now: drawn dim.
+    pub muted: bool,
 }
 
 /// What a mark is.
@@ -134,7 +136,6 @@ pub enum What {
     Header(String),
     Card {
         alarm: bool,
-        muted: bool,
     },
     /// The hairline between two strips of a card.
     Divider,
@@ -292,12 +293,18 @@ impl Out<'_> {
             width: self.width,
             height,
         };
-        self.marks.push(Mark { at, what });
+        self.mark(at, what);
         self.y += height;
     }
 
+    /// A mark at `at`; the card it is on, if any, says whether it is
+    /// muted.
     fn mark(&mut self, at: Area, what: What) {
-        self.marks.push(Mark { at, what });
+        self.marks.push(Mark {
+            at,
+            what,
+            muted: false,
+        });
     }
 
     fn section(&mut self, section: &Section) {
@@ -314,8 +321,8 @@ impl Out<'_> {
     fn card(&mut self, card: &Card) {
         let at = self.marks.len();
         let top = self.y;
-        let (alarm, muted) = (card.alarm, card.muted);
-        self.put(0.0, What::Card { alarm, muted });
+        let alarm = card.alarm;
+        self.put(0.0, What::Card { alarm });
         for (index, strip) in card.strips.iter().enumerate() {
             // A paragraph reads on from the strip above it.
             if index > 0 && !matches!(strip, Strip::Text { .. }) {
@@ -330,6 +337,9 @@ impl Out<'_> {
             self.strip(strip);
         }
         self.marks[at].at.height = self.y - top;
+        for mark in &mut self.marks[at..] {
+            mark.muted = card.muted;
+        }
         self.y += CARD_GAP;
     }
 
@@ -517,17 +527,15 @@ const REVEAL_MARGIN: f32 = 12.0;
 /// `view` high; up to the top of the page when it fits in the view with
 /// the top.
 pub fn reveal(scroll: f32, area: Area, view: f32) -> f32 {
-    if area.y - REVEAL_MARGIN < scroll {
-        let with_the_top = area.bottom() + REVEAL_MARGIN <= view;
-        return match with_the_top {
+    let (top, bottom) = (area.y - REVEAL_MARGIN, area.bottom() + REVEAL_MARGIN);
+    if top < scroll {
+        return match bottom <= view {
             true => 0.0,
-            false => (area.y - REVEAL_MARGIN).max(0.0),
+            false => top.max(0.0),
         };
     }
-    if area.bottom() + REVEAL_MARGIN > scroll + view {
-        return area.bottom() + REVEAL_MARGIN - view;
-    }
-    scroll
+    // Down only as far as the control's bottom needs.
+    scroll.max(bottom - view)
 }
 
 #[cfg(test)]
@@ -629,11 +637,31 @@ mod tests {
         assert_eq!(cards[0], area(24.0, 132.0, 552.0, 68.0));
         let list = 68.0 + 44.0 + 44.0 + 56.0;
         assert_eq!(cards[1], area(24.0, 204.0, 552.0, list));
-        let muted = laid
+        let muted: Vec<&What> = laid
             .marks
             .iter()
-            .filter(|mark| matches!(mark.what, What::Card { muted: true, .. }));
-        assert_eq!(muted.count(), 1);
+            .filter(|mark| mark.muted)
+            .map(|mark| &mark.what)
+            .collect();
+        assert_eq!(
+            muted[0],
+            &What::Card { alarm: false },
+            "the card and all on it"
+        );
+        assert_eq!(
+            muted.len(),
+            1 + 3 + 2 * 2 + 2 + 3,
+            "the card, a setting, two entries, a field, three hairlines"
+        );
+        let after = laid
+            .marks
+            .iter()
+            .position(|mark| mark.muted)
+            .expect("muted marks");
+        assert!(
+            laid.marks[..after].iter().all(|mark| !mark.muted),
+            "the title, header and first card are not"
+        );
         assert_eq!(laid.height, 204.0 + list + 24.0);
     }
 
@@ -692,10 +720,8 @@ mod tests {
         assert_eq!(names[0].width, 552.0 - 32.0);
         assert!(laid.marks.contains(&Mark {
             at: area(24.0, 84.0, 552.0, 68.0),
-            what: What::Card {
-                alarm: true,
-                muted: false
-            },
+            what: What::Card { alarm: true },
+            muted: false,
         }));
     }
 
@@ -884,6 +910,28 @@ mod tests {
             reveal(0.0, area(0.0, 0.0, 10.0, 378.0), 400.0),
             0.0,
             "just fits"
+        );
+    }
+
+    #[test]
+    fn a_control_in_view_keeps_the_scroll_however_near_an_edge() {
+        let at_the_margin = area(0.0, 112.0, 10.0, 10.0);
+        assert_eq!(
+            reveal(100.0, at_the_margin, 300.0),
+            100.0,
+            "just in view, below the top"
+        );
+        let at_the_bottom = area(0.0, 378.0, 10.0, 10.0);
+        assert_eq!(
+            reveal(100.0, at_the_bottom, 300.0),
+            100.0,
+            "just in view, above the bottom"
+        );
+        let inside_the_margin = area(0.0, 105.0, 10.0, 10.0);
+        assert_eq!(
+            reveal(100.0, inside_the_margin, 400.0),
+            0.0,
+            "too near the top: the top"
         );
     }
 

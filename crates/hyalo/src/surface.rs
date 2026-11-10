@@ -91,7 +91,10 @@ pub struct Surface {
 }
 
 impl Surface {
+    /// A picture `width` by `height` pixels, at least one each way: a
+    /// minimized window has no size, and a swap chain must have one.
     pub fn new(hwnd: HWND, width: u32, height: u32, dpi: u32) -> Result<Self> {
+        let (width, height) = (width.max(1), height.max(1));
         let d3d = create_d3d_device()?;
         let dxgi_device: IDXGIDevice = d3d.cast()?;
         let swap_chain = create_swap_chain(&d3d, width, height)?;
@@ -114,6 +117,7 @@ impl Surface {
     }
 
     pub fn resize(&mut self, width: u32, height: u32, dpi: u32) -> Result<()> {
+        let (width, height) = (width.max(1), height.max(1));
         if (width, height, dpi) == (self.width, self.height, self.dpi) {
             return Ok(());
         }
@@ -361,7 +365,7 @@ mod readback {
         D3D11_USAGE_STAGING, ID3D11Device, ID3D11Texture2D,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
-        CreateWindowExW, DestroyWindow, WS_EX_NOREDIRECTIONBITMAP, WS_POPUP,
+        CW_USEDEFAULT, CreateWindowExW, DestroyWindow, WS_EX_NOREDIRECTIONBITMAP, WS_POPUP,
     };
     use windows::core::{Result, w};
 
@@ -454,10 +458,12 @@ mod readback {
                     w!("STATIC"),
                     None,
                     WS_POPUP,
-                    0,
-                    0,
-                    1,
-                    1,
+                    // Where it is and how big do not matter: the surface
+                    // has a size of its own.
+                    CW_USEDEFAULT,
+                    CW_USEDEFAULT,
+                    CW_USEDEFAULT,
+                    CW_USEDEFAULT,
                     None,
                     None,
                     None,
@@ -516,6 +522,20 @@ mod tests {
                 [0, 0, 0, 0],
                 "cleared to transparent"
             );
+        });
+    }
+
+    #[test]
+    fn a_surface_asked_for_no_size_keeps_one_pixel_each_way() {
+        on_hidden_desktop(|| {
+            let canvas = Canvas::new();
+            let mut surface = Surface::new(canvas.0, 0, 0, 96).expect("a surface");
+            assert_eq!(surface.size(), (1.0, 1.0));
+            surface.resize(300, 200, 96).expect("resize");
+            surface.resize(0, 0, 96).expect("minimized");
+            assert_eq!(surface.size(), (1.0, 1.0));
+            surface.begin();
+            surface.end(Ok(())).expect("a frame");
         });
     }
 

@@ -121,8 +121,9 @@ impl Painter {
             unsafe { layout.GetMetrics(&mut metrics)? };
             Ok(metrics.widthIncludingTrailingWhitespace)
         };
-        // Without DirectWrite's answer, a guess on the wide side.
-        width().unwrap_or(text.chars().count() as f32 * 9.0)
+        // Without DirectWrite's answer, nothing: a button keeps its least
+        // width.
+        width().unwrap_or_default()
     }
 
     /// Draws `laid` scrolled down by `scroll`, each control as `look`
@@ -140,33 +141,27 @@ impl Painter {
             let moved = Matrix3x2::translation(0.0, -scroll);
             self.surface.dc.SetTransform(&moved);
         }
-        // What is on a muted card is drawn dim: the card comes before what
-        // is on it.
-        let mut muted = false;
         for mark in &laid.marks {
-            if let What::Card { muted: card, .. } = mark.what {
-                muted = card;
-            }
-            self.draw_mark(mark, muted, look)?;
+            self.draw_mark(mark, look)?;
         }
         unsafe { self.surface.dc.SetTransform(&Matrix3x2::identity()) };
         self.draw_scrollbar(laid.height, scroll)
     }
 
-    fn draw_mark(&self, mark: &Mark, muted: bool, look: &dyn Fn(Target) -> Look) -> Result<()> {
+    fn draw_mark(&self, mark: &Mark, look: &dyn Fn(Target) -> Look) -> Result<()> {
         match mark.what.target() {
             Some(target) => self.draw_control(mark, look(target)),
-            None => self.draw_text(mark, muted),
+            None => self.draw_text(mark),
         }
     }
 
     /// A mark that only shows: text, a card, a hairline.
-    fn draw_text(&self, mark: &Mark, muted: bool) -> Result<()> {
+    fn draw_text(&self, mark: &Mark) -> Result<()> {
         match &mark.what {
             What::Title(title) => self.draw_title(title, mark.at),
             What::Card { alarm, .. } => self.draw_card(mark.at, *alarm),
             What::Divider => self.fill(mark.at, DIVIDER),
-            what => match self.words(what, muted) {
+            what => match self.words(what, mark.muted) {
                 Some((text, format, color)) => self.write(text, format, mark.at, color),
                 None => Ok(()),
             },
@@ -239,9 +234,10 @@ impl Painter {
                 .dc
                 .DrawLine(handle.0, handle.1, &brush, 3.0, None);
         }
+        // The title is short and never cut: its line may run past the
+        // page's edge.
         let text = Area {
             x: at.x + 40.0,
-            width: (at.width - 40.0).max(0.0),
             ..at
         };
         self.write(title, &self.fonts.title, text, TEXT)
@@ -257,12 +253,12 @@ impl Painter {
     }
 
     fn draw_button(&self, label: &str, at: Area, look: Look) -> Result<()> {
-        let fill = match (look.enabled, look.pressed, look.hovered) {
-            (false, _, _) => CONTROL_PRESSED,
-            (true, true, _) => CONTROL_PRESSED,
-            (true, false, true) => CONTROL_HOVER,
-            (true, false, false) => CONTROL,
+        let rest = if look.enabled {
+            CONTROL
+        } else {
+            CONTROL_PRESSED
         };
+        let fill = lit(look).unwrap_or(rest);
         self.round(at, CONTROL_RADIUS, Some(fill), Some(CONTROL_EDGE))?;
         let color = if look.enabled { TEXT } else { FAINT };
         self.write(label, &self.fonts.label, at, color)?;
@@ -305,9 +301,9 @@ impl Painter {
         let end = self.draw_caps(caps, at, color)?;
         if listening {
             let hint = if caps.is_empty() { LISTENING } else { "…" };
+            // A word or an ellipsis, never cut.
             let rest = Area {
                 x: end + FIELD_INSET / 2.0 - CAP_GAP,
-                width: (at.x + at.width - end).max(0.0),
                 ..at
             };
             self.write(hint, &self.fonts.plain, rest, DIM)?;
@@ -335,27 +331,33 @@ impl Painter {
         Ok(x)
     }
 
-    /// The × that removes an entry: a square button, lit when pointed at.
+    /// The × that removes an entry: a square button, lit when pointed at,
+    /// with the diagonals of a small square in its middle.
     fn draw_remove(&self, at: Area, look: Look) -> Result<()> {
-        let fill = match (look.enabled, look.pressed, look.hovered) {
-            (true, true, _) => Some(CONTROL_PRESSED),
-            (true, false, true) => Some(CONTROL_HOVER),
-            _ => None,
-        };
-        self.round(at, CONTROL_RADIUS, fill, None)?;
+        self.round(at, CONTROL_RADIUS, lit(look), None)?;
         let (x, y) = at.middle();
         let arm = 5.0;
-        let brush = self
-            .surface
-            .solid(if look.enabled { TEXT } else { FAINT })?;
-        let point = |dx: f32, dy: f32| Vector2 {
-            X: x + dx,
-            Y: y + dy,
-        };
+        let cross = rect(Area {
+            x: x - arm,
+            y: y - arm,
+            width: 2.0 * arm,
+            height: 2.0 * arm,
+        });
+        let color = if look.enabled { TEXT } else { FAINT };
+        let brush = self.surface.solid(color)?;
+        let point = |x: f32, y: f32| Vector2 { X: x, Y: y };
         unsafe {
             let dc = &self.surface.dc;
-            dc.DrawLine(point(-arm, -arm), point(arm, arm), &brush, 1.25, None);
-            dc.DrawLine(point(-arm, arm), point(arm, -arm), &brush, 1.25, None);
+            let (top_left, bottom_right) = (
+                point(cross.left, cross.top),
+                point(cross.right, cross.bottom),
+            );
+            let (bottom_left, top_right) = (
+                point(cross.left, cross.bottom),
+                point(cross.right, cross.top),
+            );
+            dc.DrawLine(top_left, bottom_right, &brush, 1.25, None);
+            dc.DrawLine(bottom_left, top_right, &brush, 1.25, None);
         }
         self.ring(at, CONTROL_RADIUS, look)
     }
@@ -497,6 +499,16 @@ impl Painter {
     }
 }
 
+/// What a button or a × is lit with, when it may be used: pressed, or
+/// under the pointer.
+fn lit(look: Look) -> Option<D2D1_COLOR_F> {
+    match (look.enabled, look.pressed, look.hovered) {
+        (true, true, _) => Some(CONTROL_PRESSED),
+        (true, false, true) => Some(CONTROL_HOVER),
+        _ => None,
+    }
+}
+
 /// What a field or the recorder is filled with: darker while it takes
 /// keys (`typing`), lighter under the pointer when it may be used.
 fn fill(look: Look, typing: bool) -> D2D1_COLOR_F {
@@ -591,6 +603,7 @@ mod tests {
             let mut panel = Panel::new(Ok(written(DEFAULT)), None);
             let problem = config::written("\nhotkye = 1\n").expect_err("a problem");
             panel.reload(Err(problem));
+            panel.press(Some(Target::Fix));
             let frame = painted(&mut panel, (640, 400), 96);
             assert_looks_like("settings-problem-100", &frame);
         });
@@ -603,7 +616,8 @@ mod tests {
             let mut panel = Panel::new(Ok(written(text)), Some(false));
             panel.press(Some(Target::Name(List::RankLower)));
             panel.release(Some(Target::Name(List::RankLower)));
-            for unit in "vendor".encode_utf16() {
+            let long = r"D:\Projects\a folder whose name is far too long for the field it is typed in, and longer still";
+            for unit in long.encode_utf16() {
                 panel.char(unit);
             }
             panel.press(Some(Target::Hotkey));
@@ -631,6 +645,27 @@ mod tests {
             panel.wheel(-1200, 2000.0, 400.0);
             let frame = painted(&mut panel, (800, 500), 120);
             assert_looks_like("settings-typing-125", &frame);
+        });
+    }
+
+    #[test]
+    fn a_page_as_tall_as_the_view_has_no_scrollbar() {
+        on_hidden_desktop(|| {
+            let canvas = Canvas::new();
+            let painter = Painter::new(canvas.0, 640, 300, 96).expect("a painter");
+            let bar = |height: f32| {
+                let laid = Laid {
+                    marks: Vec::new(),
+                    height,
+                };
+                painter
+                    .draw(&laid, 0.0, &|_| Look::default())
+                    .expect("draw");
+                let frame = painter.read_frame().expect("read the frame back");
+                (0..300).any(|y| frame.pixel(635, y)[3] > 0)
+            };
+            assert!(!bar(300.0));
+            assert!(bar(301.0));
         });
     }
 

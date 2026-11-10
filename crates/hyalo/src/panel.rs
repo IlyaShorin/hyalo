@@ -282,7 +282,8 @@ impl Panel {
         let at = self
             .focus
             .and_then(|focus| order.iter().position(|&target| target == focus));
-        let next = at.map_or(0, |at| (at + 1) % order.len().max(1));
+        // `at` is a place in `order`, which so is not empty.
+        let next = at.map_or(0, |at| (at + 1) % order.len());
         self.focus = order.get(next).copied();
         self.ring = true;
         if let Some(area) = self.focus.and_then(|focus| laid.area(focus)) {
@@ -737,7 +738,7 @@ mod tests {
         let muted = |panel: &Panel| {
             let marks = laid(panel).marks.into_iter();
             let cards = marks.filter_map(|mark| match mark.what {
-                What::Card { alarm, muted } => Some((alarm, muted)),
+                What::Card { alarm } => Some((alarm, mark.muted)),
                 _ => None,
             });
             cards.collect::<Vec<_>>()
@@ -885,6 +886,56 @@ mod tests {
             texts(&panel).iter().all(|text| !text.starts_with('!')),
             "a new try"
         );
+    }
+
+    /// The help line under the setting named `name`.
+    fn help_of(panel: &Panel, name: &str) -> What {
+        let marks = laid(panel).marks;
+        let at = marks
+            .iter()
+            .position(|mark| mark.what == What::Name(name.to_string()));
+        let after = &marks[at.expect("the setting") + 1..];
+        let help = after
+            .iter()
+            .find(|mark| matches!(mark.what, What::Help { .. }));
+        help.expect("its help").what.clone()
+    }
+
+    #[test]
+    fn what_went_wrong_shows_by_its_own_setting_only() {
+        let mut panel = panel();
+        let why = "Ctrl+K is taken by another app".to_string();
+        let change = Change::Hotkey(Hotkey::parse("Ctrl+K").expect("a hotkey"));
+        panel.refused(&change, why.clone());
+        let warned = What::Help {
+            text: why.clone(),
+            alarm: true,
+        };
+        assert_eq!(help_of(&panel, "Hotkey"), warned);
+        assert!(matches!(
+            help_of(&panel, "Rank lower"),
+            What::Help { alarm: false, .. }
+        ));
+        let change = Change::Add(List::RankLower, "x".to_string());
+        panel.refused(&change, why.clone());
+        assert_eq!(help_of(&panel, "Rank lower"), warned);
+        assert!(matches!(
+            help_of(&panel, "Hotkey"),
+            What::Help { alarm: false, .. }
+        ));
+        assert!(matches!(
+            help_of(&panel, "Rank higher"),
+            What::Help { alarm: false, .. }
+        ));
+    }
+
+    #[test]
+    fn the_list_of_full_paths_has_no_field_for_a_name() {
+        let panel = panel();
+        for target in [Target::Name(List::Exclude), Target::AddName(List::Exclude)] {
+            assert!(!panel.look(target).enabled, "{target:?}");
+        }
+        assert!(panel.look(Target::Name(List::RankLower)).enabled);
     }
 
     #[test]
