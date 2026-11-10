@@ -16,7 +16,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use hyalo_core::item::{Item, ItemId};
-use hyalo_core::places::Places;
+use hyalo_core::places::{self, Places};
 use hyalo_core::rank::Ranked;
 use hyalo_index::Index;
 use windows::Win32::Storage::FileSystem::{GetDriveTypeW, GetLogicalDriveStringsW};
@@ -321,10 +321,10 @@ pub fn picked<'a>(ids: impl IntoIterator<Item = &'a ItemId>) -> Vec<Item> {
     rows.flatten().collect()
 }
 
-/// Whether `text` starts like a full path on a drive: `C:\`.
+/// Whether `text` is the full path of something on a drive, not the
+/// drive itself: `C:\` and more.
 fn full_path(text: &str) -> bool {
-    let bytes = text.as_bytes();
-    bytes.len() > 3 && bytes[0].is_ascii_alphabetic() && bytes[1..3] == *b":\\"
+    text.len() > 3 && places::full_path(text)
 }
 
 #[cfg(test)]

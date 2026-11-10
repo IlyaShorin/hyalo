@@ -26,42 +26,103 @@ const BURIED: [&str; 6] = [
     "windows",
 ];
 
-fn buried(folder: &str) -> bool {
-    folder.starts_with('.') || BURIED.contains(&folder)
+/// A folder whose contents rank higher or lower: a name, wherever a
+/// folder of that name is (`target`), or a full path (`D:\old`). Names
+/// compare folded, as `matcher::folded` folds them.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Place(Where);
+
+#[derive(Debug, Clone, PartialEq)]
+enum Where {
+    /// A folder name, folded.
+    Named(String),
+    /// A path from the drive down, every name folded.
+    Under(Vec<String>),
 }
 
-/// The user's folders, whose contents rank a little higher.
-#[derive(Debug, Clone, Default, PartialEq)]
+impl Place {
+    /// `text` as a place: a folder name with no backslash, or a full path
+    /// from a drive (`C:\` and on), with backslashes or slashes. `None`
+    /// for anything else: an empty name, a path from no drive.
+    pub fn parse(text: &str) -> Option<Place> {
+        let text = text.trim().replace('/', "\\");
+        match (full_path(&text), text.contains(['\\', ':'])) {
+            (true, _) => Some(Place::under(&text)),
+            (false, false) if !text.is_empty() => Some(Place(Where::Named(matcher::folded(&text)))),
+            _ => None,
+        }
+    }
+
+    /// The folder at the full path `path`.
+    fn under(path: &str) -> Place {
+        let folded = matcher::folded(path);
+        let names = folded.split('\\').filter(|name| !name.is_empty());
+        Place(Where::Under(names.map(String::from).collect()))
+    }
+
+    /// Whether something in the folder whose folded path from the drive
+    /// down is `folders` lives in this place.
+    fn holds(&self, folders: &[&str]) -> bool {
+        match &self.0 {
+            Where::Named(name) => folders.contains(&name.as_str()),
+            Where::Under(path) => {
+                let mut pairs = path.iter().zip(folders);
+                path.len() <= folders.len() && pairs.all(|(one, other)| one == other)
+            }
+        }
+    }
+}
+
+/// Whether `text` starts like a full path on a drive: `C:\`.
+pub fn full_path(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    bytes.len() >= 3 && bytes[0].is_ascii_alphabetic() && bytes[1..3] == *b":\\"
+}
+
+/// The places whose contents rank higher, and lower.
+#[derive(Debug, Clone, PartialEq)]
 pub struct Places {
-    /// Each a path from the drive down, every name folded.
-    favoured: Vec<Vec<String>>,
+    favoured: Vec<Place>,
+    buried: Vec<Place>,
+}
+
+impl Default for Places {
+    /// No favoured folders; tool output, caches and the system buried.
+    fn default() -> Self {
+        let named = |name: &&str| Place(Where::Named(name.to_string()));
+        Self {
+            favoured: Vec::new(),
+            buried: BURIED.iter().map(named).collect(),
+        }
+    }
 }
 
 impl Places {
     /// `favoured` are full paths, such as `C:\Users\me\Desktop`.
     pub fn new(favoured: &[&str]) -> Self {
-        let split = |path: &&str| {
-            let folded = matcher::folded(path);
-            let names = folded.split('\\').filter(|name| !name.is_empty());
-            names.map(String::from).collect()
-        };
         Self {
-            favoured: favoured.iter().map(split).collect(),
+            favoured: favoured.iter().map(|path| Place::under(path)).collect(),
+            ..Self::default()
         }
+    }
+
+    /// These places with `higher` favoured too and `lower` buried too.
+    pub fn with(mut self, higher: &[Place], lower: &[Place]) -> Self {
+        self.favoured.extend_from_slice(higher);
+        self.buried.extend_from_slice(lower);
+        self
     }
 
     /// Points for something in the folder whose path from the drive down
     /// is `folders`, each name folded as `matcher::folded` folds it.
     pub fn points(&self, folders: &[&str]) -> f64 {
-        let under = |place: &Vec<String>| {
-            let mut pairs = place.iter().zip(folders);
-            place.len() <= folders.len() && pairs.all(|(one, other)| one == other)
-        };
-        let boost = match self.favoured.iter().any(under) {
+        let holds = |place: &Place| place.holds(folders);
+        let boost = match self.favoured.iter().any(holds) {
             true => BOOST,
             false => 0.0,
         };
-        let penalty = match folders.iter().any(|folder| buried(folder)) {
+        let dotted = folders.iter().any(|folder| folder.starts_with('.'));
+        let penalty = match dotted || self.buried.iter().any(holds) {
             true => PENALTY,
             false => 0.0,
         };
@@ -137,6 +198,78 @@ mod tests {
     fn a_buried_folder_under_a_favoured_one_still_loses() {
         let folders = ["c:", "users", "me", "desktop", "app", "node_modules"];
         assert_eq!(desktop().points(&folders), BOOST - PENALTY);
+    }
+
+    fn place(text: &str) -> Place {
+        Place::parse(text).expect("a place")
+    }
+
+    #[test]
+    fn a_name_is_a_place_wherever_a_folder_has_it() {
+        let target = place("Target");
+        assert!(target.holds(&["c:", "code", "app", "target"]));
+        assert!(target.holds(&["c:", "target", "debug", "deps"]));
+        assert!(!target.holds(&["c:", "code", "targets"]));
+        assert!(!target.holds(&[]));
+        assert!(place("ЁЛКА").holds(&["d:", "елка"]), "folded");
+    }
+
+    #[test]
+    fn a_full_path_is_a_place_from_its_drive_down() {
+        let old = place(r"D:\Old\");
+        assert!(old.holds(&["d:", "old"]));
+        assert!(old.holds(&["d:", "old", "photos"]));
+        assert!(!old.holds(&["c:", "old"]));
+        assert!(!old.holds(&["d:", "older"]));
+        assert!(!old.holds(&["d:"]));
+        assert_eq!(place("d:/old/"), old, "slashes as backslashes");
+        assert!(place(r"C:\").holds(&["c:", "x"]), "a whole drive");
+    }
+
+    #[test]
+    fn neither_a_name_nor_a_full_path_is_no_place() {
+        let texts = [
+            "",
+            "  ",
+            r"old\stuff",
+            "old/stuff",
+            "C:",
+            r"\\server\share",
+            r"\old",
+            ":",
+        ];
+        for text in texts {
+            assert_eq!(Place::parse(text), None, "{text:?}");
+        }
+        assert_eq!(place(" target "), place("target"), "spaces around it go");
+    }
+
+    #[test]
+    fn places_added_rank_higher_or_lower_beside_the_built_in_ones() {
+        let higher = [place("notes"), place(r"D:\work")];
+        let places = desktop().with(&higher, &[place("target")]);
+        assert_eq!(places.points(&["c:", "a", "notes", "b"]), BOOST);
+        assert_eq!(places.points(&["d:", "work"]), BOOST);
+        assert_eq!(places.points(&["c:", "code", "app", "target"]), -PENALTY);
+        assert_eq!(places.points(&["c:", "users", "me", "desktop"]), BOOST);
+        assert_eq!(places.points(&["c:", "x", "node_modules"]), -PENALTY);
+        assert_eq!(places.points(&["c:", "x", ".git"]), -PENALTY);
+        assert_eq!(places.points(&["c:", "x"]), 0.0);
+    }
+
+    #[test]
+    fn a_full_path_starts_with_a_drive_letter_a_colon_and_a_backslash() {
+        assert!(full_path(r"C:\"));
+        assert!(full_path(r"z:\a"));
+        for text in ["C:", r"1:\a", "C:/a", r"\\a\b", r"CC:\a", ""] {
+            assert!(!full_path(text), "{text:?}");
+        }
+    }
+
+    #[test]
+    fn being_in_two_favoured_places_boosts_once() {
+        let places = desktop().with(&[place("desktop")], &[]);
+        assert_eq!(places.points(&["c:", "users", "me", "desktop"]), BOOST);
     }
 
     #[test]
