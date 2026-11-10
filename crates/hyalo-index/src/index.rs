@@ -664,12 +664,14 @@ pub(crate) fn offset(at: usize) -> u32 {
 /// Whether two names are the same to Windows, which compares them letter
 /// by letter in any case: `Ё` as `ё`, never as `е`.
 pub(crate) fn same(one: &str, other: &str) -> bool {
-    let lower = |name: &str| {
-        name.chars()
-            .flat_map(char::to_lowercase)
-            .collect::<Vec<_>>()
-    };
-    one == other || lower(one) == lower(other)
+    // Letter by letter, so names that differ early (most of a folder's)
+    // cost a letter or two, and nothing is allocated.
+    one == other || lower(one).eq(lower(other))
+}
+
+/// A name's letters in small letters, one by one.
+fn lower(name: &str) -> impl Iterator<Item = char> + '_ {
+    name.chars().flat_map(char::to_lowercase)
 }
 
 /// The name folded, if it can be a name: not empty, not too long either
