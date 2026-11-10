@@ -36,6 +36,7 @@ The launcher never runs elevated. Only the indexer service does, because MFT acc
 - Inline calculator
 - Currency conversion as a calculator answer: any currency but the rouble converts to roubles (`100 usd`, `50 eur`), roubles convert to dollars (`400 rub`), and `in` or `в` names the target (`10 usd in eur`). Codes, symbols and words all work: `$100`, `100$`, `€`, `₽`, `руб`, `долларов`. Rates are the Bank of Russia's official daily rates (free, no key), cached on disk and refreshed daily, so it works offline with the last known rates and shows their date. Enter copies the result
 - TOML config with hot reload, tray icon, autostart
+- Installs for the current user without admin rights and updates itself from GitHub Releases: a quiet "new version" notice in the launcher and the tray menu, with the release notes; one click downloads the new build, checks it, swaps it in and restarts hyalo
 
 **v0.2**
 - Windows Settings pages (`ms-settings:`) and Control Panel items
