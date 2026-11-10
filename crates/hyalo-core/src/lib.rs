@@ -2,6 +2,7 @@
 //! and how they are ranked. No Win32 here; everything is tested directly.
 
 pub mod calculator;
+pub mod config;
 pub mod currency;
 pub mod expression;
 pub mod frecency;
