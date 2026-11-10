@@ -1810,7 +1810,10 @@ notes
     #[test]
     fn where_hyalo_does_not_update_itself_there_is_no_updates_section() {
         let panel = panel();
-        assert_eq!(headers(&panel), ["Launcher", "Folders", "config.toml"]);
+        assert_eq!(
+            headers(&panel),
+            ["Launcher", "Folders", "Web search", "config.toml"]
+        );
         assert_eq!(switch(&panel, Target::CheckUpdates), None);
         assert!(laid(&panel).area(Target::Install).is_none());
     }
@@ -1820,7 +1823,16 @@ notes
         let mut panel = panel();
         panel.set_updates(Some(newest()));
         let headers = headers(&panel);
-        assert_eq!(headers, ["Launcher", "Folders", "Updates", "config.toml"]);
+        assert_eq!(
+            headers,
+            [
+                "Launcher",
+                "Folders",
+                "Web search",
+                "Updates",
+                "config.toml"
+            ]
+        );
         assert_eq!(switch(&panel, Target::CheckUpdates), Some(true));
         let help = "You have hyalo 0.0.1; GitHub is asked once a day, nothing installs by itself";
         assert_eq!(
@@ -1842,7 +1854,13 @@ notes
         )));
         assert_eq!(
             headers(&panel),
-            ["Updates", "Launcher", "Folders", "config.toml"]
+            [
+                "Updates",
+                "Launcher",
+                "Folders",
+                "Web search",
+                "config.toml"
+            ]
         );
         let shown = texts(&panel);
         let at = shown.iter().position(|text| text == "hyalo 0.0.2 is out");
