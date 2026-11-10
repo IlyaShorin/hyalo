@@ -16,6 +16,7 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::{Duration, Instant, SystemTime};
 
 use hyalo_core::frecency::{Frecency, Timestamp};
+use hyalo_core::hotkey::Hotkey;
 use hyalo_core::item::{Action, Item, ItemId, Kind};
 use hyalo_core::places::Places;
 use hyalo_core::rank::Ranked;
@@ -31,9 +32,7 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
-use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetKeyState, MOD_ALT, MOD_NOREPEAT, RegisterHotKey, VIRTUAL_KEY, VK_CONTROL, VK_SHIFT, VK_SPACE,
-};
+use windows::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, VIRTUAL_KEY, VK_CONTROL, VK_SHIFT};
 use windows::Win32::UI::WindowsAndMessaging::{
     AllowSetForegroundWindow, CW_USEDEFAULT, CreateWindowExW, DefWindowProcW, DispatchMessageW,
     FindWindowW, GetCursorPos, GetMessageW, GetWindowThreadProcessId, HTCLIENT, HWND_TOPMOST,
@@ -49,6 +48,7 @@ use crate::apps::Icon;
 use crate::catalog::{self, Catalog, FileIcons, Found, Provider, Request};
 use crate::files::{self, Files, Roots};
 use crate::highlight::utf16_ranges;
+use crate::hotkeys::{self, Hotkeys};
 use crate::keys::{self, Command, Held};
 use crate::layout::{self, Rect};
 use crate::query::Query;
@@ -56,7 +56,10 @@ use crate::render::{Renderer, Row, Scene};
 use crate::results::{self, Listed, MAX_ROWS, Results};
 use crate::{http, launch, rates, store};
 
+/// The id the hotkey is registered with; a new hotkey takes the other
+/// one, so the old one is freed only once Windows took the new one.
 const HOTKEY_TOGGLE: i32 = 1;
+const HOTKEY_NEXT: i32 = 2;
 
 /// Posted by the provider's thread each time it hands over a piece.
 const WM_FOUND: u32 = WM_APP + 1;
@@ -100,6 +103,8 @@ pub struct Services {
     pub run: Runner,
     /// Where picks are kept between runs; `None` keeps them in memory.
     pub picks: Option<PathBuf>,
+    /// Registers the hotkey with Windows.
+    pub hotkeys: Box<dyn Hotkeys>,
 }
 
 impl Services {
@@ -134,6 +139,7 @@ impl Services {
             places: files::places(),
             run: Box::new(run_in_background),
             picks: store::default_path(),
+            hotkeys: Box::new(hotkeys::System),
         }
     }
 }
@@ -168,9 +174,28 @@ struct App {
     /// Where the pointer was last seen, in client pixels; `None` when not
     /// known.
     pointer: Option<POINT>,
+    /// The hotkey Windows holds for the launcher, and its id.
+    hotkey: Option<(i32, Hotkey)>,
 }
 
 impl App {
+    /// Makes `hotkey` show and hide the launcher in place of the one it
+    /// has, if Windows lets it; when Windows refuses, the one it has stays.
+    fn bind(&mut self, hotkey: Hotkey) -> Result<()> {
+        if self.hotkey.map(|(_, held)| held) == Some(hotkey) {
+            return Ok(());
+        }
+        let id = match self.hotkey {
+            Some((HOTKEY_TOGGLE, _)) => HOTKEY_NEXT,
+            _ => HOTKEY_TOGGLE,
+        };
+        self.services.hotkeys.register(self.hwnd, id, hotkey)?;
+        if let Some((old, _)) = self.hotkey.replace((id, hotkey)) {
+            self.services.hotkeys.unregister(self.hwnd, old);
+        }
+        Ok(())
+    }
+
     /// Sizes the window for the rows it lists and draws it.
     fn present(&mut self) -> Result<()> {
         let rect = self.placement.rect(self.results.rows().len());
@@ -424,7 +449,7 @@ fn open(services: Services) -> Result<HWND> {
         .unwrap_or_default();
     let sources = services.sources.len();
     APP.with_borrow_mut(|app| {
-        let opened = App {
+        let mut opened = App {
             hwnd,
             query: Query::default(),
             renderer: None,
@@ -437,12 +462,16 @@ fn open(services: Services) -> Result<HWND> {
             asked: HashSet::new(),
             found: channel(),
             pointer: None,
+            hotkey: None,
         };
         opened.find_picked();
+        let hotkey = Hotkey::default();
+        if let Err(error) = opened.bind(hotkey) {
+            eprintln!("hyalo: {hotkey} is taken by another app: {error}");
+        }
         *app = Some(opened);
     });
     style_window(hwnd)?;
-    register_hotkey(hwnd);
     show(hwnd)?;
     Ok(hwnd)
 }
@@ -509,15 +538,6 @@ fn set_attribute<T>(hwnd: HWND, attribute: DWMWINDOWATTRIBUTE, value: &T) -> Res
             (value as *const T).cast(),
             size_of::<T>() as u32,
         )
-    }
-}
-
-fn register_hotkey(hwnd: HWND) {
-    let modifiers = MOD_ALT | MOD_NOREPEAT;
-    let registered =
-        unsafe { RegisterHotKey(Some(hwnd), HOTKEY_TOGGLE, modifiers, u32::from(VK_SPACE.0)) };
-    if let Err(error) = registered {
-        eprintln!("hyalo: Alt+Space is taken by another app: {error}");
     }
 }
 
@@ -834,6 +854,39 @@ mod tests {
     /// What the launcher was asked to run, and whether as administrator.
     type Ran = Rc<RefCell<Vec<(Action, bool)>>>;
 
+    /// Hotkeys as a test keeps them: what the launcher holds, by id, and
+    /// the keys other apps hold.
+    #[derive(Default)]
+    struct Keyboard {
+        held: RefCell<Vec<(i32, Hotkey)>>,
+        taken: RefCell<Vec<Hotkey>>,
+    }
+
+    impl Hotkeys for Rc<Keyboard> {
+        fn register(&self, _: HWND, id: i32, hotkey: Hotkey) -> Result<()> {
+            let held = self.held.borrow().iter().any(|&(_, held)| held == hotkey);
+            if held || self.taken.borrow().contains(&hotkey) {
+                return Err(windows::core::Error::from_hresult(windows::core::HRESULT(
+                    0x80070581_u32 as i32,
+                )));
+            }
+            self.held.borrow_mut().push((id, hotkey));
+            Ok(())
+        }
+
+        fn unregister(&self, _: HWND, id: i32) {
+            self.held.borrow_mut().retain(|&(held, _)| held != id);
+        }
+    }
+
+    impl Keyboard {
+        /// The hotkeys the launcher holds now.
+        fn held(&self) -> Vec<String> {
+            let held = self.held.borrow();
+            held.iter().map(|(_, hotkey)| hotkey.to_string()).collect()
+        }
+    }
+
     /// Services for a test: `provider`, no files, red icons for files, a
     /// runner that only notes what it is asked to run, and `picks` as the
     /// picks file.
@@ -857,6 +910,7 @@ mod tests {
                 noted.borrow_mut().push((action.clone(), as_admin));
             }),
             picks,
+            hotkeys: Box::new(Rc::new(Keyboard::default())),
         };
         (services, ran)
     }
@@ -1154,6 +1208,17 @@ mod tests {
                 DWMSBT_TRANSIENTWINDOW.0
             );
             assert_eq!(launcher.dwm(DWMWA_WINDOW_CORNER_PREFERENCE), DWMWCP_ROUND.0);
+        });
+    }
+
+    #[test]
+    fn opening_takes_alt_space_as_the_hotkey() {
+        on_hidden_desktop(|| {
+            let keyboard = Rc::new(Keyboard::default());
+            let (mut services, _) = services(listing(&[]).0, None);
+            services.hotkeys = Box::new(keyboard.clone());
+            let _launcher = Launcher::serving(services);
+            assert_eq!(keyboard.held(), ["Alt+Space"]);
         });
     }
 

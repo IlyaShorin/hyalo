@@ -6,6 +6,7 @@ mod catalog;
 mod com;
 mod files;
 mod highlight;
+mod hotkeys;
 mod http;
 mod instance;
 mod keys;
