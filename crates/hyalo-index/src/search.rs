@@ -114,7 +114,7 @@ impl Index {
                 hits: Vec::new(),
             },
             seen: vec![(u32::MAX, 0.0); SEEN],
-            under: vec![(u32::MAX, false); SEEN],
+            under: vec![None; SEEN],
             scored: 0,
         };
         for at in slice {
@@ -124,7 +124,8 @@ impl Index {
     }
 
     /// The folders `folders` names: by a full path, the one there; by a
-    /// name, every folder so named.
+    /// name, every entry so named (a file or an entry removed is no one's
+    /// folder, so taking them in changes nothing).
     fn folders_named(&self, folders: &[String]) -> HashSet<u32> {
         let mut found = HashSet::new();
         for folder in folders {
@@ -137,10 +138,7 @@ impl Index {
             }
             let folded = matcher::folded(folder);
             let named = |entry: &Entry| {
-                let folder_named = entry.is_live() && entry.is_folder();
-                folder_named
-                    && self.folded_of(*entry) == folded
-                    && same(self.name_of(*entry), folder)
+                self.folded_of(*entry) == folded && same(self.name_of(*entry), folder)
             };
             let all = self.entries.iter().enumerate();
             found.extend(
@@ -268,7 +266,7 @@ struct Scan<'a> {
     /// `(folder, points of its place)`, each folder in slot `folder % SEEN`.
     seen: Vec<(u32, f64)>,
     /// `(folder, whether it is under a folder `in:` names)`, the same way.
-    under: Vec<(u32, bool)>,
+    under: Vec<Option<(u32, bool)>>,
     /// Names that got past their ceilings.
     scored: usize,
 }
@@ -336,11 +334,14 @@ impl Scan<'_> {
             return true;
         };
         let slot = folder as usize % SEEN;
-        if self.under[slot].0 != folder {
-            let under = self.index.ancestry(folder).any(|at| within.contains(&at));
-            self.under[slot] = (folder, under);
+        match self.under[slot] {
+            Some((seen, under)) if seen == folder => under,
+            _ => {
+                let under = self.index.ancestry(folder).any(|at| within.contains(&at));
+                self.under[slot] = Some((folder, under));
+                under
+            }
         }
-        self.under[slot].1
     }
 
     /// The points of the place of what is in `folder`.
@@ -689,8 +690,9 @@ mod tests {
     fn neither_words_nor_filters_list_nothing() {
         let index = drive();
         assert!(found(&index, "").is_empty());
-        let rows = index.search("", &Places::default(), 10).rows;
-        assert!(rows.is_empty());
+        let none = index.search("", &Places::default(), 10);
+        assert!(none.rows.is_empty());
+        assert_eq!(none.scored, 0);
     }
 
     #[test]
@@ -702,6 +704,22 @@ mod tests {
             .rows;
         assert_eq!(rows[0].item.title, "report.docx");
         assert!(rows[0].found.positions.is_empty());
+    }
+
+    #[test]
+    fn a_folder_is_named_letter_by_letter_in_any_case_but_not_ё_as_е() {
+        let mut index = Index::default();
+        let c = index.add_root("C:").unwrap();
+        for folder in ["Ёлка", "Елка"] {
+            let folder = index.add(c, folder, true).unwrap();
+            index.add(folder, "toy.txt", false).unwrap();
+        }
+        let query = Query::parse("in:ЁЛКА", CLOCK);
+        let rows = index
+            .search_with("", &query.filters, &Places::default(), 10)
+            .rows;
+        let paths: Vec<String> = rows.into_iter().map(|row| row.item.id.0).collect();
+        assert_eq!(paths, [r"C:\Ёлка\toy.txt"]);
     }
 
     #[test]

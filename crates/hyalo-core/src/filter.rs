@@ -490,6 +490,7 @@ mod tests {
     #[test]
     fn a_size_that_does_not_read_stays_a_word() {
         for bad in [
+            "size:16777216tb",
             "size:",
             "size:>",
             "size:-1mb",

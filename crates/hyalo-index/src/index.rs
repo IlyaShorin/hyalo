@@ -80,12 +80,23 @@ impl Entry {
     /// The same entry, its names at `name` and `folded` in the arenas,
     /// with the lengths given.
     fn named(self, name: u32, name_len: usize, folded: u32, folded_len: usize) -> Entry {
-        let lengths = name_len as u32 | (folded_len as u32) << LENGTH_BITS;
+        Entry::of(
+            self.parent,
+            self.flags(),
+            (name, name_len),
+            (folded, folded_len),
+        )
+    }
+
+    /// An entry in the folder `parent` with these flags, its name and
+    /// folded name at these places in the arenas, of these lengths.
+    fn of(parent: u32, flags: u32, name: (u32, usize), folded: (u32, usize)) -> Entry {
+        let lengths = name.1 as u32 | (folded.1 as u32) << LENGTH_BITS;
         Entry {
-            name,
-            folded,
-            lengths: lengths | self.flags() << (2 * LENGTH_BITS),
-            ..self
+            parent,
+            name: name.0,
+            folded: folded.0,
+            lengths: lengths | flags << (2 * LENGTH_BITS),
         }
     }
 
@@ -459,10 +470,6 @@ impl Index {
             times: parts.times,
             ..Index::default()
         };
-        let beside = |length: usize| length == index.entries.len();
-        if !(beside(index.sizes.len()) && beside(index.times.len())) {
-            return None;
-        }
         let sound = index.entries.iter().all(|&entry| index.sound(entry));
         let whole = sound && index.rooted() && index.free_is_removed();
         if !(whole && index.rebuild(Fold::Again)) {
@@ -642,17 +649,12 @@ impl Index {
             true => FOLDER,
             false => 0,
         };
-        let entry = Entry {
+        let names = (offset(self.names.len()), name.len());
+        let entry = Entry::of(
             parent,
-            name: 0,
-            folded: 0,
-            lengths: flags << (2 * LENGTH_BITS),
-        };
-        let entry = entry.named(
-            offset(self.names.len()),
-            name.len(),
-            offset(self.folded.len()),
-            folded.len(),
+            flags,
+            names,
+            (offset(self.folded.len()), folded.len()),
         );
         self.names.push_str(name);
         self.folded.push_str(folded);
@@ -1157,6 +1159,24 @@ mod tests {
         assert!(index.find(r"C:\Users\Me\todo.md").is_some());
         assert_eq!(index.parent(d), None);
         assert_eq!(index.len(), 6);
+    }
+
+    #[test]
+    fn names_are_reclaimed_once_more_than_half_of_them_are_given_up() {
+        let mut index = Index::default();
+        let c = index.add_root("C:").unwrap();
+        let ab = index.add(c, "ab", false).unwrap();
+        index.add(c, "cdef", false).unwrap();
+        // Loaded, so nothing is given up yet: eight bytes of names.
+        let mut bytes = Vec::new();
+        index.save(&mut bytes).unwrap();
+        let mut index = Index::load(&mut bytes.as_slice()).unwrap();
+        assert_eq!((index.names.len(), index.garbage), (8, 0));
+        let cdef = index.find(r"C:\cdef").unwrap();
+        index.remove(cdef).unwrap();
+        assert_eq!((index.names.len(), index.garbage), (8, 4), "half: kept");
+        index.remove(ab).unwrap();
+        assert_eq!((index.names.len(), index.garbage), (2, 0), "more: rebuilt");
     }
 
     #[test]
