@@ -17,6 +17,7 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::{Duration, Instant, SystemTime};
 
 use hyalo_core::config::{Config, Problem};
+use hyalo_core::filter::{Clock, Filters, Query};
 use hyalo_core::frecency::{Frecency, Timestamp};
 use hyalo_core::hotkey::Hotkey;
 use hyalo_core::item::{Action, Item, ItemId, Kind};
@@ -37,6 +38,7 @@ use windows::Win32::Graphics::Gdi::{
     ScreenToClient,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::System::Time::{GetTimeZoneInformation, TIME_ZONE_INFORMATION};
 use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetDoubleClickTime, GetKeyState, ReleaseCapture, SetCapture, VIRTUAL_KEY, VK_CONTROL, VK_SHIFT,
@@ -861,21 +863,38 @@ impl App {
 
     /// The rows for the query: its answer, if it has one, then the best
     /// items and files.
+    /// The words match apps and names; the filters among them narrow the
+    /// files and folders alone, picked ones too. A query of filters alone
+    /// lists files and folders by place. The answer reads the whole text.
     fn listed(&self) -> Results {
-        let query = self.query.text();
-        let catalog = &self.catalog;
-        let items = catalog
-            .items
-            .iter()
-            .chain(&catalog.system)
-            .chain(&catalog.picked);
-        let (frecency, places) = (&self.frecency, &self.places);
-        let found = Results::search(query, items, self.file_hits(), frecency, places, now());
-        let answer = match query.is_empty() {
+        let text = self.query.text();
+        let query = Query::parse(text, clock());
+        let picked = self.picked(&query.filters);
+        let (frecency, places, files) = (&self.frecency, &self.places, self.file_hits(&query));
+        let found = match query.words.is_empty() && !query.filters.is_empty() {
+            true => Results::filtered(text, picked, files, frecency, places, now()),
+            false => {
+                let catalog = &self.catalog;
+                let items = catalog.items.iter().chain(&catalog.system).chain(picked);
+                Results::search(&query.words, items, files, frecency, places, now())
+            }
+        };
+        let answer = match text.is_empty() {
             true => self.notice_row(),
-            false => results::answer(query, self.catalog.rates.as_ref(), self.language()),
+            false => results::answer(text, self.catalog.rates.as_ref(), self.language()),
         };
         found.answered(answer)
+    }
+
+    /// The picked files and folders `filters` lets through.
+    fn picked(&self, filters: &Filters) -> Vec<&Item> {
+        match filters.is_empty() {
+            true => self.catalog.picked.iter().collect(),
+            false => self
+                .services
+                .files
+                .let_through(filters, &self.catalog.picked),
+        }
     }
 
     /// The notice's row, when there is a config the settings window can
@@ -887,13 +906,13 @@ impl App {
 
     /// The files and folders the index finds for the query: enough to
     /// fill the list even when every picked file is among them.
-    fn file_hits(&self) -> Vec<Ranked> {
-        let query = self.query.text();
-        if query.is_empty() {
+    fn file_hits(&self, query: &Query) -> Vec<Ranked> {
+        if query.words.is_empty() && query.filters.is_empty() {
             return Vec::new();
         }
         let enough = MAX_ROWS + self.catalog.picked.len();
-        self.services.files.search(query, &self.places, enough)
+        let files = &self.services.files;
+        files.search(&query.words, &query.filters, &self.places, enough)
     }
 
     /// Asks for the icons of the files and folders listed that have none
@@ -1012,6 +1031,28 @@ fn system_rows(language: Language, hibernates: bool) -> Vec<Item> {
     let mut rows = system_settings::items(language);
     rows.extend(system_commands::items(language, hibernates));
     rows
+}
+
+/// What `GetTimeZoneInformation` answers in summer time
+/// (`TIME_ZONE_ID_DAYLIGHT`, in a module of its own in the windows crate).
+const DAYLIGHT: u32 = 2;
+
+/// Now, and how far local time is ahead of UTC, for filters such as
+/// `mod:today`.
+fn clock() -> Clock {
+    let mut zone = TIME_ZONE_INFORMATION::default();
+    // SAFETY: Windows fills the struct, which is ours.
+    let daylight = unsafe { GetTimeZoneInformation(&mut zone) } == DAYLIGHT;
+    let extra = if daylight {
+        zone.DaylightBias
+    } else {
+        zone.StandardBias
+    };
+    Clock {
+        now: now().0 as i64,
+        // UTC is local time plus the bias, in minutes.
+        offset: -i64::from(zone.Bias + extra) * 60,
+    }
 }
 
 /// The time frecency counts in.
@@ -3976,6 +4017,44 @@ mod tests {
             let (second, _) = Launcher::finding(&tree.0, Some(path));
             second.pump_until(|app| !app.catalog.picked.is_empty());
             second.search_for("notes", MAX_ROWS);
+        });
+    }
+
+    #[test]
+    fn filters_narrow_the_files_listed_and_alone_list_files_by_themselves() {
+        on_hidden_desktop(|| {
+            let tree = Scratch::new("window-filters").with(&[
+                "report.pdf",
+                "report.txt",
+                "deep\\",
+                "deep\\scan.pdf",
+            ]);
+            let (launcher, _) = Launcher::finding(&tree.0, None);
+            launcher.search_for("report", 2);
+            launcher.type_text(" ext:pdf");
+            launcher.pump_until(|app| titles(app) == ["report.pdf"]);
+            drop(launcher);
+            let (launcher, _) = Launcher::finding(&tree.0, None);
+            launcher.search_for("in:deep", 1);
+            assert_eq!(listed(), ["scan.pdf"]);
+        });
+    }
+
+    #[test]
+    fn a_picked_file_the_filters_leave_out_is_not_listed() {
+        let picks = PicksFile::new("filtered");
+        let path = picks.0.clone();
+        on_hidden_desktop(move || {
+            let tree = Scratch::new("window-picked-filtered").with(&["notes.txt", "notes.md"]);
+            let (first, _) = Launcher::finding(&tree.0, Some(path.clone()));
+            first.search_for("notes.txt", 1);
+            first.press(VK_RETURN);
+            drop(first);
+            let (second, _) = Launcher::finding(&tree.0, Some(path));
+            second.pump_until(|app| !app.catalog.picked.is_empty());
+            second.search_for("notes", 2);
+            second.type_text(" ext:md");
+            second.pump_until(|app| titles(app) == ["notes.md"]);
         });
     }
 

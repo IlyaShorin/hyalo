@@ -12,7 +12,7 @@ use std::thread;
 
 use hyalo_core::filter::Filters;
 use hyalo_core::item::Kind;
-use hyalo_core::matcher::{self, Ceiling, Layout, Match, Pattern, Strength};
+use hyalo_core::matcher::{self, Ceiling, Match, Pattern};
 use hyalo_core::places::{self, Places};
 use hyalo_core::rank::{self, Ranked};
 
@@ -281,16 +281,11 @@ impl Scan<'_> {
     /// Offers the entry at `at` by its place alone, the newer first.
     fn list(&mut self, at: u32, entry: Entry) {
         let score = rank::score(0.0, kind_of(entry), self.place(entry.parent), 0.0);
-        let none = Match {
-            strength: Strength::Substring,
-            layout: Layout::AsTyped,
-            positions: Vec::new(),
-        };
         let newer = self.index.times[at as usize];
         self.best.offer(Hit {
             at,
             score,
-            found: Some(none),
+            found: Some(Match::none()),
             newer,
         });
     }

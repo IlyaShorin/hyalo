@@ -55,41 +55,61 @@ pub enum Action {
     MovedTo,
 }
 
+/// How many bytes a name holds and when it was last written, in seconds
+/// since 1970.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Stat {
+    pub size: u64,
+    pub written: i64,
+}
+
 /// One thing a watch reports: what happened to the name at the full path
-/// `path`, and what it is.
+/// `path`, what it is, and its size and time then.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Record {
     pub action: Action,
     pub path: String,
     pub kind: Kind,
+    pub stat: Stat,
 }
 
 /// One change to make in the index.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Change {
-    Added(String, Kind),
+    Added(String, Kind, Stat),
     Removed(String),
     /// From the first path to the second.
-    Moved(String, String, Kind),
+    Moved(String, String, Kind, Stat),
+    /// Its size or time changed.
+    Touched(String, Stat),
 }
 
 /// The changes `records` make, in their order: an old name and the new
 /// name after it are one move; an old name alone is a name gone where the
 /// watch does not see, a new name alone one come from there. A change
-/// just like the one before it is made once.
+/// just like the one before it is made once, and of two changes of size
+/// or time to one name in a row, the later.
 pub fn changes(records: &[Record]) -> Vec<Change> {
     let mut changes: Vec<Change> = Vec::new();
     let mut records = records.iter().peekable();
     while let Some(record) = records.next() {
         let change = match record.action {
-            Action::Added | Action::MovedTo => Change::Added(record.path.clone(), record.kind),
+            Action::Added | Action::MovedTo => {
+                Change::Added(record.path.clone(), record.kind, record.stat)
+            }
             Action::Removed => Change::Removed(record.path.clone()),
-            Action::Modified => continue,
+            Action::Modified => Change::Touched(record.path.clone(), record.stat),
             Action::MovedFrom => match records.next_if(|next| next.action == Action::MovedTo) {
-                Some(to) => Change::Moved(record.path.clone(), to.path.clone(), to.kind),
+                Some(to) => Change::Moved(record.path.clone(), to.path.clone(), to.kind, to.stat),
                 None => Change::Removed(record.path.clone()),
             },
         };
+        if let (Some(Change::Touched(before, _)), Change::Touched(path, _)) =
+            (changes.last(), &change)
+            && before == path
+        {
+            changes.pop();
+        }
         if changes.last() != Some(&change) {
             changes.push(change);
         }
@@ -101,26 +121,39 @@ pub fn changes(records: &[Record]) -> Vec<Change> {
 /// whose contents the index has not seen.
 pub fn apply(index: &mut Index, change: &Change, excluded: &Excluded) -> Option<String> {
     match change {
-        Change::Added(path, kind) => add(index, path, *kind, excluded),
+        Change::Added(path, kind, stat) => add(index, path, *kind, *stat, excluded),
         Change::Removed(path) => {
             remove(index, path);
             None
         }
-        Change::Moved(from, to, kind) => match below_root(index, from) {
+        Change::Moved(from, to, kind, stat) => match below_root(index, from) {
             Some(entry) => {
-                move_to(index, entry, to, excluded);
+                move_to(index, entry, to, *stat, excluded);
                 None
             }
-            None => add(index, to, *kind, excluded),
+            None => add(index, to, *kind, *stat, excluded),
         },
+        Change::Touched(path, stat) => {
+            if let Some(entry) = below_root(index, path) {
+                set(index, entry, *stat);
+            }
+            None
+        }
     }
 }
 
 /// Puts the name at `path` in the index if the walk would list it; a
 /// folder it would enter is to be walked.
-fn add(index: &mut Index, path: &str, kind: Kind, excluded: &Excluded) -> Option<String> {
+fn add(
+    index: &mut Index,
+    path: &str,
+    kind: Kind,
+    stat: Stat,
+    excluded: &Excluded,
+) -> Option<String> {
     let (folder, name) = listed(index, path, excluded)?;
-    index.put(folder, name, kind.folder()).ok()?;
+    let entry = index.put(folder, name, kind.folder()).ok()?;
+    set(index, entry, stat);
     (kind == Kind::Folder).then(|| path.to_string())
 }
 
@@ -133,13 +166,21 @@ fn remove(index: &mut Index, path: &str) {
 
 /// Moves `entry` to `path`, or takes it out if the walk would not list
 /// it there: it went where the index does not look.
-fn move_to(index: &mut Index, entry: EntryId, path: &str, excluded: &Excluded) {
+fn move_to(index: &mut Index, entry: EntryId, path: &str, stat: Stat, excluded: &Excluded) {
     let moved = listed(index, path, excluded)
         .is_some_and(|(folder, name)| index.rename(entry, folder, name).is_ok());
-    if !moved {
+    if moved {
+        set(index, entry, stat);
+    } else {
         // Found just now, so it is there to remove.
         let _ = index.remove(entry);
     }
+}
+
+/// Gives `entry`, found or put just now, its size and time.
+fn set(index: &mut Index, entry: EntryId, stat: Stat) {
+    // Found or put just now, so it is there.
+    let _ = index.set_stat(entry, stat.size, stat.written);
 }
 
 /// The entry at `path`, unless it is a root, which no change removes.
@@ -209,6 +250,7 @@ mod tests {
             action,
             path: path.to_string(),
             kind: Kind::File,
+            stat: Stat::default(),
         }
     }
 
@@ -220,7 +262,12 @@ mod tests {
         ];
         assert_eq!(
             changes(&records),
-            [Change::Moved(r"C:\a".into(), r"C:\b".into(), Kind::File)]
+            [Change::Moved(
+                r"C:\a".into(),
+                r"C:\b".into(),
+                Kind::File,
+                Stat::default()
+            )]
         );
     }
 
@@ -235,8 +282,8 @@ mod tests {
             changes(&records),
             [
                 Change::Removed(r"C:\a".into()),
-                Change::Added(r"C:\c".into(), Kind::File),
-                Change::Added(r"C:\b".into(), Kind::File),
+                Change::Added(r"C:\c".into(), Kind::File, Stat::default()),
+                Change::Added(r"C:\b".into(), Kind::File, Stat::default()),
             ]
         );
     }
@@ -245,7 +292,6 @@ mod tests {
     fn a_change_just_like_the_one_before_is_made_once() {
         let records = [
             record(Action::Added, r"C:\a"),
-            record(Action::Modified, r"C:\a"),
             record(Action::Added, r"C:\a"),
             record(Action::Removed, r"C:\a"),
             record(Action::Removed, r"C:\a"),
@@ -254,9 +300,35 @@ mod tests {
         assert_eq!(
             changes(&records),
             [
-                Change::Added(r"C:\a".into(), Kind::File),
+                Change::Added(r"C:\a".into(), Kind::File, Stat::default()),
                 Change::Removed(r"C:\a".into()),
-                Change::Added(r"C:\a".into(), Kind::File),
+                Change::Added(r"C:\a".into(), Kind::File, Stat::default()),
+            ]
+        );
+    }
+
+    fn touched(path: &str, size: u64) -> Record {
+        Record {
+            stat: Stat { size, written: 7 },
+            ..record(Action::Modified, path)
+        }
+    }
+
+    #[test]
+    fn of_two_changes_of_size_or_time_in_a_row_to_one_name_the_later_is_made() {
+        let records = [
+            touched(r"C:\a", 1),
+            touched(r"C:\a", 2),
+            touched(r"C:\b", 3),
+            touched(r"C:\a", 4),
+        ];
+        let stat = |size| Stat { size, written: 7 };
+        assert_eq!(
+            changes(&records),
+            [
+                Change::Touched(r"C:\a".into(), stat(2)),
+                Change::Touched(r"C:\b".into(), stat(3)),
+                Change::Touched(r"C:\a".into(), stat(4)),
             ]
         );
     }
@@ -279,7 +351,7 @@ mod tests {
     }
 
     fn added(path: &str, kind: Kind) -> Change {
-        Change::Added(path.to_string(), kind)
+        Change::Added(path.to_string(), kind, Stat::default())
     }
 
     fn there(index: &Index, path: &str) -> bool {
@@ -355,7 +427,7 @@ mod tests {
     }
 
     fn moved(from: &str, to: &str, kind: Kind) -> Change {
-        Change::Moved(from.to_string(), to.to_string(), kind)
+        Change::Moved(from.to_string(), to.to_string(), kind, Stat::default())
     }
 
     #[test]
@@ -393,6 +465,33 @@ mod tests {
         assert_eq!(walks, [r"C:\Users\me\back", r"C:\Users\me\root"]);
         assert!(there(&index, r"C:\Users\me\x.txt"));
         assert!(there(&index, "C:"), "a root is never moved");
+    }
+
+    #[test]
+    fn a_name_keeps_the_size_and_time_it_came_or_moved_with_or_was_touched_to() {
+        let mut index = drive();
+        let stat = |size| Stat {
+            size,
+            written: 1_794_310_200,
+        };
+        let changes = [
+            Change::Added(r"C:\Users\me\new.txt".into(), Kind::File, stat(1)),
+            Change::Touched(r"C:\Users\me\notes.txt".into(), stat(2)),
+            Change::Moved(
+                r"C:\Users\me\code".into(),
+                r"C:\Users\code".into(),
+                Kind::Folder,
+                stat(3),
+            ),
+            Change::Touched(r"C:\Users\me\gone.txt".into(), stat(4)),
+            Change::Touched("C:".into(), stat(5)),
+        ];
+        made(&mut index, &changes, &Excluded::default());
+        let stat_at = |path: &str| index.find(path).and_then(|entry| index.stat(entry));
+        assert_eq!(stat_at(r"C:\Users\me\new.txt"), Some((1, 1_794_310_200)));
+        assert_eq!(stat_at(r"C:\Users\me\notes.txt"), Some((2, 1_794_310_200)));
+        assert_eq!(stat_at(r"C:\Users\code"), Some((3, 1_794_310_200)));
+        assert_eq!(stat_at("C:"), Some((0, 0)), "a root is never touched");
     }
 
     #[test]

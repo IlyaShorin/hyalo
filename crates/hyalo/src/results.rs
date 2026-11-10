@@ -4,8 +4,9 @@ use std::collections::HashSet;
 
 use hyalo_core::frecency::{Frecency, Timestamp};
 use hyalo_core::item::{Action, Item, Kind};
+use hyalo_core::matcher::Match;
 use hyalo_core::places::Places;
-use hyalo_core::rank::{Ranked, rank};
+use hyalo_core::rank::{self, Ranked, rank};
 use hyalo_core::rates::Rates;
 use hyalo_core::system_commands::Command;
 use hyalo_core::text::{Language, Text};
@@ -86,6 +87,37 @@ impl Results {
         }
         let mut ranked = rank(query, items, frecency, places, now);
         ranked.extend(files);
+        Self::merged(ranked)
+    }
+
+    /// The rows for a query of filters alone, `text` as typed: the `files`
+    /// the index let through, by kind and place, the newest first, and
+    /// the `picked` ones (that the filters let through too), lifted by how
+    /// often they were picked for `text`. Something listed both ways is
+    /// listed once.
+    pub fn filtered<'a>(
+        text: &str,
+        picked: impl IntoIterator<Item = &'a Item>,
+        files: Vec<Ranked>,
+        frecency: &Frecency,
+        places: &Places,
+        now: Timestamp,
+    ) -> Self {
+        let lifted = picked.into_iter().map(|item| {
+            let place = item.path().map_or(0.0, |path| places.of_path(path));
+            let picks = frecency.score(&item.id, text, now);
+            Ranked {
+                score: rank::score(0.0, item.kind, place, picks),
+                item: item.clone(),
+                found: Match::none(),
+            }
+        });
+        Self::merged(files.into_iter().chain(lifted).collect())
+    }
+
+    /// `ranked` best first, equal scores in their order, each item once,
+    /// `MAX_ROWS` at most, the first selected.
+    fn merged(mut ranked: Vec<Ranked>) -> Self {
         ranked.sort_by(|one, other| other.score.total_cmp(&one.score));
         let mut listed = HashSet::new();
         let ranked = ranked
@@ -246,6 +278,43 @@ mod tests {
             titles(&results),
             ["Notes", "notes", "Sticky Notes", "my notes.md"]
         );
+    }
+
+    /// A row the index lists for filters alone, scored `score`.
+    fn unmatched(path: &str, score: f64) -> Ranked {
+        Ranked {
+            item: file(path),
+            found: Match::none(),
+            score,
+        }
+    }
+
+    #[test]
+    fn filters_alone_list_the_files_let_through_in_their_order_picked_ones_lifted() {
+        let files = vec![
+            unmatched(r"C:\new.pdf", 0.0),
+            unmatched(r"C:\old.pdf", 0.0),
+            unmatched(r"C:\picked.pdf", 0.0),
+        ];
+        let picked = file(r"C:\picked.pdf");
+        let mut frecency = Frecency::default();
+        frecency.record(&picked.id, "ext:pdf", NOW);
+        let places = Places::default();
+        let listed = |text: &str| {
+            let picked = std::slice::from_ref(&picked);
+            Results::filtered(text, picked, files.clone(), &frecency, &places, NOW)
+        };
+        assert_eq!(
+            titles(&listed("ext:pdf")),
+            ["picked.pdf", "new.pdf", "old.pdf"]
+        );
+        assert_eq!(
+            titles(&listed("ext:docx")),
+            ["new.pdf", "old.pdf", "picked.pdf"],
+            "picked for another query"
+        );
+        let none = Results::filtered("ext:pdf", [], Vec::new(), &frecency, &places, NOW);
+        assert!(none.rows().is_empty());
     }
 
     #[test]

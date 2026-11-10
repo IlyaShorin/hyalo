@@ -1,5 +1,6 @@
 //! Watching a root: Windows tells of every name added, removed or moved
-//! anywhere under it, with its attributes, and the watch hands each batch
+//! anywhere under it, and every file written, with its attributes, size
+//! and time, and the watch hands each batch
 //! to the files worker as records. No admin rights: this is the
 //! directory's own change notification, not the NTFS journal.
 
@@ -16,9 +17,9 @@ use windows::Win32::Storage::FileSystem::{
     CreateFileW, FILE_ACTION, FILE_ACTION_ADDED, FILE_ACTION_MODIFIED, FILE_ACTION_REMOVED,
     FILE_ACTION_RENAMED_NEW_NAME, FILE_ACTION_RENAMED_OLD_NAME, FILE_FLAG_BACKUP_SEMANTICS,
     FILE_FLAG_OVERLAPPED, FILE_LIST_DIRECTORY, FILE_NOTIFY_CHANGE, FILE_NOTIFY_CHANGE_DIR_NAME,
-    FILE_NOTIFY_CHANGE_FILE_NAME, FILE_NOTIFY_EXTENDED_INFORMATION, FILE_SHARE_DELETE,
-    FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING, ReadDirectoryChangesExW,
-    ReadDirectoryNotifyExtendedInformation,
+    FILE_NOTIFY_CHANGE_FILE_NAME, FILE_NOTIFY_CHANGE_LAST_WRITE, FILE_NOTIFY_CHANGE_SIZE,
+    FILE_NOTIFY_EXTENDED_INFORMATION, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    OPEN_EXISTING, ReadDirectoryChangesExW, ReadDirectoryNotifyExtendedInformation,
 };
 use windows::Win32::System::IO::{
     CancelIoEx, GetOverlappedResult, GetOverlappedResultEx, OVERLAPPED,
@@ -26,8 +27,8 @@ use windows::Win32::System::IO::{
 use windows::Win32::System::Threading::CreateEventW;
 use windows::core::{HRESULT, HSTRING};
 
-use super::changes::{Action, Kind, Record};
-use super::root_name;
+use super::changes::{Action, Kind, Record, Stat};
+use super::{root_name, unix_seconds};
 
 /// What a watch tells the files worker.
 #[derive(Debug, PartialEq, Eq)]
@@ -43,9 +44,14 @@ pub enum Event {
 /// than this is lost track of.
 const BUFFER: usize = 1 << 20;
 
-/// What the watch asks to be told of: names, of files and of folders.
-const NAMES: FILE_NOTIFY_CHANGE =
-    FILE_NOTIFY_CHANGE(FILE_NOTIFY_CHANGE_FILE_NAME.0 | FILE_NOTIFY_CHANGE_DIR_NAME.0);
+/// What the watch asks to be told of: names, of files and of folders,
+/// and sizes and times, for `size:` and `mod:`.
+const WATCHED: FILE_NOTIFY_CHANGE = FILE_NOTIFY_CHANGE(
+    FILE_NOTIFY_CHANGE_FILE_NAME.0
+        | FILE_NOTIFY_CHANGE_DIR_NAME.0
+        | FILE_NOTIFY_CHANGE_SIZE.0
+        | FILE_NOTIFY_CHANGE_LAST_WRITE.0,
+);
 
 /// How long a watch waits before it looks whether it is to stop, and
 /// before it tries again to open a root it could not.
@@ -209,7 +215,7 @@ impl Directory {
                 buffer.as_mut_ptr().cast(),
                 size_of_val(buffer) as u32,
                 true,
-                NAMES,
+                WATCHED,
                 None,
                 Some(&raw mut overlapped),
                 None,
@@ -325,6 +331,16 @@ fn records(bytes: &[u8], top: &str) -> Vec<Record> {
 /// far on the next one starts (0: none); `None` if it is cut short.
 fn record(entry: &[u8], top: &str) -> Option<(Option<Record>, usize)> {
     let field = |at: usize| Some(u32::from_ne_bytes(*entry.get(at..at + 4)?.as_array()?));
+    let wide = |at: usize| Some(i64::from_ne_bytes(*entry.get(at..at + 8)?.as_array()?));
+    let size = wide(offset_of!(FILE_NOTIFY_EXTENDED_INFORMATION, FileSize))?;
+    let written = wide(offset_of!(
+        FILE_NOTIFY_EXTENDED_INFORMATION,
+        LastModificationTime
+    ))?;
+    let stat = Stat {
+        size: size.max(0) as u64,
+        written: unix_seconds(written),
+    };
     let next = field(offset_of!(
         FILE_NOTIFY_EXTENDED_INFORMATION,
         NextEntryOffset
@@ -346,6 +362,7 @@ fn record(entry: &[u8], top: &str) -> Option<(Option<Record>, usize)> {
             action,
             path: format!("{top}\\{name}"),
             kind: Kind::of(attributes, tag),
+            stat,
         });
     Some((record, next as usize))
 }
@@ -406,11 +423,28 @@ mod tests {
             offset_of!(FILE_NOTIFY_EXTENDED_INFORMATION, FileNameLength),
             2 * name.len() as u32,
         );
+        let wide = |at: usize, value: i64, bytes: &mut Vec<u8>| {
+            bytes[at..at + 8].copy_from_slice(&value.to_ne_bytes())
+        };
+        wide(
+            offset_of!(FILE_NOTIFY_EXTENDED_INFORMATION, FileSize),
+            42,
+            &mut bytes,
+        );
+        wide(
+            offset_of!(FILE_NOTIFY_EXTENDED_INFORMATION, LastModificationTime),
+            NOVEMBER,
+            &mut bytes,
+        );
         for (at, unit) in name.iter().enumerate() {
             bytes[NAME + 2 * at..NAME + 2 * at + 2].copy_from_slice(&unit.to_ne_bytes());
         }
         bytes
     }
+
+    /// 2026-11-10 11:30 UTC as Windows counts time: hundreds of
+    /// nanoseconds since 1601.
+    const NOVEMBER: i64 = (1_794_310_200 + 11_644_473_600) * 10_000_000;
 
     fn utf16(text: &str) -> Vec<u16> {
         text.encode_utf16().collect()
@@ -441,6 +475,10 @@ mod tests {
             action,
             path: path.to_string(),
             kind,
+            stat: Stat {
+                size: 42,
+                written: 1_794_310_200,
+            },
         };
         assert_eq!(
             found,
@@ -482,14 +520,52 @@ mod tests {
         seen
     }
 
+    /// What `events` tell of names; sizes and times aside.
     fn records_of(events: &[Event]) -> Vec<(Action, String, Kind)> {
+        let records = touches(events)
+            .into_iter()
+            .filter(|record| record.action != Action::Modified);
+        records
+            .map(|record| (record.action, record.path, record.kind))
+            .collect()
+    }
+
+    fn touches(events: &[Event]) -> Vec<Record> {
         let records = events.iter().flat_map(|event| match event {
             Event::Changed(records) => records.clone(),
             Event::Lost => Vec::new(),
         });
-        records
-            .map(|record| (record.action, record.path, record.kind))
-            .collect()
+        records.collect()
+    }
+
+    #[test]
+    fn a_watch_tells_of_a_file_written_with_its_size_and_time() {
+        let folder = Scratch::new("watch-written").with(&["kept.txt"]);
+        let (watch, events) = watching(&folder.0);
+        let path = folder.0.join("kept.txt");
+        fs::write(&path, b"three").expect("write");
+        let written = |seen: &[Event]| {
+            let touched = touches(seen)
+                .into_iter()
+                .filter(|record| record.action == Action::Modified);
+            touched
+                .rev()
+                .find(|record| record.path == folder.path("kept.txt"))
+        };
+        let seen = gathered(&events, |seen| {
+            written(seen).is_some_and(|record| record.stat.size == 5)
+        });
+        drop(watch);
+        let record = written(&seen).expect("told of");
+        assert_eq!(record.stat.size, 5);
+        let on_disk = fs::metadata(&path)
+            .expect("there")
+            .modified()
+            .expect("a time");
+        let on_disk = on_disk
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("after 1970");
+        assert_eq!(record.stat.written, on_disk.as_secs() as i64);
     }
 
     #[test]

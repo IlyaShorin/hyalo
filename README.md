@@ -4,7 +4,7 @@ A fast, glassy Spotlight-style launcher for Windows 11. Press a hotkey, type a f
 
 *hyalo* comes from Greek ὕαλος, "glass".
 
-> **Status:** early prototype: finds and opens apps, files and folders, Windows' own settings pages and Control Panel items, answers arithmetic, converts currencies, locks, restarts or shuts down the PC (asking first); lives in the tray, with a TOML config applied as you save it and a settings window that edits it; speaks English or Russian; updates itself from GitHub Releases. Installing it the first time is still a copy of `hyalo.exe` into `%LOCALAPPDATA%\Programs\hyalo` by hand.
+> **Status:** early prototype: finds and opens apps, files and folders (kept current as they change, narrowed by filters), Windows' own settings pages and Control Panel items, answers arithmetic, converts currencies, locks, restarts or shuts down the PC (asking first); lives in the tray, with a TOML config applied as you save it and a settings window that edits it; speaks English or Russian; updates itself from GitHub Releases. Installing it the first time is still a copy of `hyalo.exe` into `%LOCALAPPDATA%\Programs\hyalo` by hand.
 
 ## Goals
 
@@ -91,6 +91,17 @@ What the prototype does:
 - The rates come from cbr.ru (one small request, user agent `hyalo/<version>`, through the system's proxy settings) and are kept in `%LOCALAPPDATA%\hyalo\rates.xml`, so a start without a network converts with the last rates. A start, and showing the launcher at most hourly, asks the bank again when the rates are older than today, once a day when it has nothing newer (weekends, holidays).
 - Files and folders from every fixed drive are listed too, with their shell icons and their folder as the second line. Apps rank above files that match as well; files under Desktop, Documents, Downloads and the project folders in your profile (`code`, `projects`, `source`, `src`, `dev`, `repos`, `git`) rank a little higher, files under `node_modules`, `AppData`, caches, `Windows` and folders whose names start with a dot (`.git`, `.vscode`) lower.
 - The files come from a walk of the fixed drives with your own rights (no admin), and stay current: each drive is watched from before the walk with its own change notifications (`ReadDirectoryChangesExW` over the whole drive: names, with their attributes), so a file or folder made, renamed, moved or deleted shows up, or goes, within a second. A folder moved in whole is walked; one renamed takes its files along. A watch that falls behind (a burst of changes too big for its megabyte of room) or loses its drive says so, and the drives are walked again. The first walk fills the list as it goes; the index is saved to `%LOCALAPPDATA%\hyalo\files.idx` after each walk, at most every half hour while files change, and when hyalo stops searching it, so the next start finds files at once, then walks again for what changed while hyalo was not running. Junctions and symbolic links are listed but never followed; `$Recycle.Bin`, `System Volume Information` and the other `$` folders at a drive's root are left out, and so is what the config excludes.
+- Filters narrow the files and folders listed. They go anywhere among the words, which match names as before (`report ext:pdf`, `ext:pdf in:Downloads q3`); a query of filters alone lists what they let through, files in your folders first, then those you picked for that query, then the newest. Apps and the calculator take no notice of them.
+
+  | Filter | Lists |
+  |---|---|
+  | `ext:pdf`, `ext:pdf,docx` | Files with one of those extensions (`ext:.pdf` works too) |
+  | `in:Downloads`, `in:C:\Users\me\code`, `in:"My files"` | What is anywhere under a folder of that name, or under that full path |
+  | `size:>10mb`, `size:<1kb`, `size:>=1gb`, `size:<=100`, `size:1mb..5mb`, `size:5mb` | Files of that size: `b`, `kb`, `mb`, `gb`, `tb` (or `k`, `m`, `g`, `t`), 1024 apiece, decimals with a point or a comma. A size alone is about that much: `size:5mb` from 5 MB to under 6 |
+  | `mod:today`, `mod:yesterday`, `mod:3h`, `mod:7d`, `mod:2w`, `mod:2026`, `mod:2026-11`, `mod:2026-11-10` | What was last written then, in your time zone: a day, a month, a year, or since so many hours, days or weeks |
+  | `mod:>2026-01-01`, `mod:>=`, `mod:<`, `mod:<=`, `mod:2026-01..2026-03` | After a day, month or year, from its start, before it, until its end, or from one to the end of another (`mod:<7d`: longer ago than a week) |
+
+  A filter given twice narrows further (`size:>1kb size:<1mb`), but more extensions or folders add choices (`in:code in:projects`). Extensions and sizes are files' alone, so they leave folders out. A filter that does not read (`size:big`, `mod:2026-13`) is a word like any other.
 - Up and Down move the selection, or point at a row; Enter or a click opens it, Ctrl+Shift+Enter opens it as administrator, Ctrl+Enter shows a file or folder in its folder, Ctrl+C with no text selected in the bar copies its full path, Esc hides the launcher.
 - Picks are remembered per query (frecency) in `%APPDATA%\hyalo\frecency.json`, so what you open often rises, files included.
 

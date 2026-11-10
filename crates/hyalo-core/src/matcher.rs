@@ -54,6 +54,15 @@ pub struct Match {
 }
 
 impl Match {
+    /// A match of no letters: a row filters alone list.
+    pub fn none() -> Match {
+        Match {
+            strength: Strength::Substring,
+            layout: Layout::AsTyped,
+            positions: Vec::new(),
+        }
+    }
+
     /// How good the match is; more is better.
     pub fn points(&self) -> f64 {
         points(self.strength, self.layout)

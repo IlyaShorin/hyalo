@@ -11,13 +11,14 @@
 
 use std::fs::{self, DirEntry, File};
 use std::io::{self, BufReader, BufWriter, Write};
-use std::os::windows::fs::FileTypeExt;
+use std::os::windows::fs::{FileTypeExt, MetadataExt};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard, TryLockError};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use hyalo_core::filter::Filters;
 use hyalo_core::item::{Item, ItemId};
 use hyalo_core::places::{self, Places};
 use hyalo_core::rank::Ranked;
@@ -36,7 +37,7 @@ use crate::store;
 mod changes;
 mod watch;
 
-use changes::{Change, Kind, Record};
+use changes::{Change, Kind, Record, Stat};
 use watch::{Event, Watch};
 
 /// The file index the window searches.
@@ -54,9 +55,30 @@ impl Files {
         (Files(Arc::clone(&shared)), Writer(shared))
     }
 
-    /// The `limit` best files and folders for `query`.
-    pub fn search(&self, query: &str, places: &Places, limit: usize) -> Vec<Ranked> {
-        read(&self.0).search(query, places, limit).rows
+    /// The `limit` best files and folders for `words`, among those
+    /// `filters` lets through.
+    pub fn search(
+        &self,
+        words: &str,
+        filters: &Filters,
+        places: &Places,
+        limit: usize,
+    ) -> Vec<Ranked> {
+        read(&self.0)
+            .search_with(words, filters, places, limit)
+            .rows
+    }
+
+    /// Those of `items` that are files or folders `filters` lets through.
+    pub fn let_through<'a>(
+        &self,
+        filters: &Filters,
+        items: impl IntoIterator<Item = &'a Item>,
+    ) -> Vec<&'a Item> {
+        let index = read(&self.0);
+        let sieve = index.sieve(filters);
+        let passes = |item: &&Item| item.path().is_some_and(|path| sieve.lets_through(path));
+        items.into_iter().filter(passes).collect()
     }
 }
 
@@ -101,6 +123,12 @@ impl Excluded {
         let here = split.filter(|(parent, _)| lowercase(parent) == folder);
         here.map(|(_, name)| lowercase(name)).collect()
     }
+}
+
+/// Windows' time, hundreds of nanoseconds since 1601 (UTC), in seconds
+/// since 1970.
+fn unix_seconds(filetime: i64) -> i64 {
+    filetime.div_euclid(10_000_000) - 11_644_473_600
 }
 
 /// `text` lowercased, as Windows compares names.
@@ -272,7 +300,10 @@ impl Walk<'_> {
         }
         prune(shared, self.excluded, report);
         let back = seen.iter().filter(|path| !now.contains(path));
-        let back = back.filter_map(|path| Some(Change::Added(path.clone(), on_disk(path)?)));
+        let back = back.filter_map(|path| {
+            let (kind, stat) = on_disk(path)?;
+            Some(Change::Added(path.clone(), kind, stat))
+        });
         self.make(shared, &back.collect::<Vec<_>>());
         *seen = now;
     }
@@ -324,14 +355,25 @@ impl Mark {
     }
 }
 
-/// What the walk would take the name at `path` for, if it is there.
-fn on_disk(path: &str) -> Option<Kind> {
-    let kind = fs::symlink_metadata(path).ok()?.file_type();
-    Some(match (kind.is_dir(), kind.is_symlink_dir()) {
+/// What the walk would take the name at `path` for, if it is there, and
+/// its size and time.
+fn on_disk(path: &str) -> Option<(Kind, Stat)> {
+    let metadata = fs::symlink_metadata(path).ok()?;
+    let kind = metadata.file_type();
+    let kind = match (kind.is_dir(), kind.is_symlink_dir()) {
         (true, _) => Kind::Folder,
         (false, true) => Kind::Link,
         (false, false) => Kind::File,
-    })
+    };
+    Some((kind, stat_of(&metadata)))
+}
+
+/// The size and last write that `metadata` gives: a folder holds none.
+fn stat_of(metadata: &fs::Metadata) -> Stat {
+    Stat {
+        size: metadata.file_size(),
+        written: unix_seconds(metadata.last_write_time() as i64),
+    }
 }
 
 /// Walks the folder at `path` again from nothing: whatever the index
@@ -339,7 +381,7 @@ fn on_disk(path: &str) -> Option<Kind> {
 /// is in the index and on disk a folder the walk enters: a junction made
 /// a moment ago is first told of as a plain folder.
 fn walk_afresh(shared: &RwLock<Index>, path: &str, excluded: &Excluded) {
-    if on_disk(path) != Some(Kind::Folder) {
+    if on_disk(path).map(|(kind, _)| kind) != Some(Kind::Folder) {
         return;
     }
     let emptied = || {
@@ -501,6 +543,8 @@ fn walk_under(
             let Ok(entry) = index.add(id, &child.name, child.folder) else {
                 continue;
             };
+            // Added just now, so it is there.
+            let _ = index.set_stat(entry, child.stat.size, child.stat.written);
             if child.enter {
                 folders.push((folder.join(&child.name), entry, false));
             }
@@ -520,6 +564,7 @@ struct Child {
     folder: bool,
     /// Whether the walk goes into it: a folder, not a link to one.
     enter: bool,
+    stat: Stat,
 }
 
 /// What the walk keeps of a folder's entries, but for the names
@@ -541,9 +586,12 @@ fn listing(folder: &Path, at_root: bool, left_out: &[String]) -> Vec<Child> {
 fn child(entry: DirEntry, at_root: bool) -> Option<Child> {
     let name = entry.file_name().into_string().ok()?;
     let kind = entry.file_type().ok()?;
+    // Read with the name, so it costs nothing more.
+    let stat = entry.metadata().map(|metadata| stat_of(&metadata));
     kept(&name, at_root).then(|| Child {
         folder: kind.is_dir() || kind.is_symlink_dir(),
         enter: kind.is_dir(),
+        stat: stat.unwrap_or_default(),
         name,
     })
 }
@@ -653,6 +701,17 @@ mod tests {
     }
 
     #[test]
+    fn windows_time_reads_in_seconds_since_1970() {
+        assert_eq!(unix_seconds(116_444_736_000_000_000), 0);
+        assert_eq!(
+            unix_seconds(134_387_838_000_000_000 + 9_999_999),
+            1_794_310_200
+        );
+        assert_eq!(unix_seconds(0), -11_644_473_600);
+        assert_eq!(unix_seconds(-1), -11_644_473_601, "rounded down");
+    }
+
+    #[test]
     fn setting_what_is_left_out_says_whether_it_changed() {
         let excluded = Excluded::default();
         assert!(!excluded.set(&[]), "nothing to nothing");
@@ -729,6 +788,29 @@ mod tests {
         );
         let rows = index.search("b", &Places::default(), 5).rows;
         assert_eq!(rows[0].item.kind, Kind::Folder);
+    }
+
+    /// The size and last write of the file at `path` on disk.
+    fn stat_on_disk(path: &Path) -> (u64, i64) {
+        let metadata = fs::metadata(path).expect("there");
+        let written = metadata.modified().expect("a time");
+        let written = written
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("after 1970");
+        (metadata.len(), written.as_secs() as i64)
+    }
+
+    #[test]
+    fn a_walk_keeps_each_files_size_and_last_write() {
+        let folder = Scratch::new("walk-stat").with(&["sub\\"]);
+        fs::write(folder.0.join(r"sub\five.txt"), b"12345").expect("write");
+        let index = walked(&folder.0);
+        let five = index.find(&folder.path(r"sub\five.txt")).expect("found");
+        assert_eq!(
+            index.stat(five),
+            Some(stat_on_disk(&folder.0.join(r"sub\five.txt")))
+        );
+        assert_eq!(index.stat(five).map(|(size, _)| size), Some(5));
     }
 
     #[test]
@@ -907,7 +989,7 @@ mod tests {
     }
 
     fn search(files: &Files, query: &str) -> Vec<String> {
-        let rows = files.search(query, &Places::default(), 20);
+        let rows = files.search(query, &Filters::default(), &Places::default(), 20);
         rows.into_iter().map(|row| row.item.id.0).collect()
     }
 
@@ -983,6 +1065,43 @@ mod tests {
             search(serving.files(), "inside"),
             [folder.path(r"real\inside.txt")]
         );
+    }
+
+    #[test]
+    fn a_file_written_while_watched_has_its_new_size_and_time_at_once() {
+        let folder = Scratch::new("live-written").with(&["grows.txt"]);
+        let serving = Serving::new_walking(&folder, None);
+        serving.finds("grows", &[folder.path("grows.txt")]);
+        let path = folder.0.join("grows.txt");
+        fs::write(&path, b"now ten b.").expect("write");
+        let stat = |serving: &Serving| {
+            let index = read(&serving.files().0);
+            index
+                .find(&folder.path("grows.txt"))
+                .and_then(|entry| index.stat(entry))
+        };
+        serving.until(|serving| stat(serving).is_some_and(|(size, _)| size == 10));
+        assert_eq!(stat(&serving), Some(stat_on_disk(&path)));
+    }
+
+    #[test]
+    fn the_files_and_folders_the_filters_let_through_are_kept_of_those_given() {
+        let folder = Scratch::new("let-through").with(&["a.pdf", "b.txt", "sub\\"]);
+        let (files, writer) = Files::new();
+        walk(&folder.0, &writer.0, &Excluded::default());
+        let items = [
+            Item::file(folder.path("a.pdf"), false),
+            Item::file(folder.path("b.txt"), false),
+            Item::file(folder.path("gone.pdf"), false),
+            Item {
+                kind: Kind::App,
+                ..Item::file(folder.path("a.pdf"), false)
+            },
+        ];
+        let clock = hyalo_core::filter::Clock { now: 0, offset: 0 };
+        let filters = hyalo_core::filter::Query::parse("ext:pdf", clock).filters;
+        let kept = files.let_through(&filters, &items);
+        assert_eq!(kept, [&items[0]], "files there alone");
     }
 
     #[test]
