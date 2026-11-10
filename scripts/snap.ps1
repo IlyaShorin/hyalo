@@ -65,8 +65,11 @@ function Get-Area($hwnd) {
 # Starts hyalo again, which asks the running one to show (or to open its
 # settings), and waits for the window.
 function Show-Window {
-    $arguments = if ($Settings) { @("--settings") } else { @() }
-    Start-Process -FilePath $Exe -ArgumentList $arguments | Out-Null
+    # Windows PowerShell refuses an empty -ArgumentList, so it is only
+    # passed when there is one.
+    $start = @{ FilePath = $Exe }
+    if ($Settings) { $start.ArgumentList = "--settings" }
+    Start-Process @start | Out-Null
     for ($i = 0; $i -lt 50; $i++) {
         $hwnd = Find-Window
         if ($hwnd -ne [IntPtr]::Zero -and [Snap]::IsWindowVisible($hwnd)) { return $hwnd }
