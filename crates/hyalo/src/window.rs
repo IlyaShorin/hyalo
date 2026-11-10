@@ -48,6 +48,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use windows::core::{BOOL, PCWSTR, Result, w};
 
 use crate::apps::Icon;
+use crate::autostart::Autostart;
 use crate::catalog::{self, Catalog, FileIcons, Found, Provider, Request};
 use crate::files::{self, Files, Roots};
 use crate::highlight::utf16_ranges;
@@ -113,6 +114,8 @@ pub struct Services {
     pub tray: Rc<dyn Tray>,
     /// Where the config lives; `None` runs on the defaults.
     pub config: Option<PathBuf>,
+    /// Starts the launcher with Windows; `None` where it may not.
+    pub autostart: Option<Autostart>,
 }
 
 impl Services {
@@ -150,6 +153,7 @@ impl Services {
             hotkeys: Box::new(hotkeys::System),
             tray: Rc::new(tray::Shell),
             config: store::ours("APPDATA", "config.toml"),
+            autostart: Autostart::real(),
         }
     }
 }
@@ -221,7 +225,17 @@ impl App {
 
     /// What the tray's menu holds now.
     fn menu(&self) -> Vec<tray::Line> {
-        tray::menu(self.hotkey(), None)
+        let starts = self.services.autostart.as_ref().map(Autostart::starts);
+        tray::menu(self.hotkey(), starts)
+    }
+
+    /// Starts with Windows if it does not, and stops if it does.
+    fn toggle_start(&mut self) {
+        if let Some(autostart) = &self.services.autostart
+            && let Err(error) = autostart.set(!autostart.starts())
+        {
+            eprintln!("hyalo: cannot change starting with Windows: {error}");
+        }
     }
 
     /// Opens the config in the editor Windows has for it.
@@ -478,16 +492,18 @@ thread_local! {
     static APP: RefCell<Option<App>> = const { RefCell::new(None) };
 }
 
-/// Opens the launcher, listing the apps, and runs until the window closes.
-pub fn run() -> Result<()> {
-    open(Services::real())?;
+/// Opens the launcher, shown or in the tray, and runs until the window
+/// closes.
+pub fn run(shown: bool) -> Result<()> {
+    open(Services::real(), shown)?;
     message_loop();
     Ok(())
 }
 
-/// Creates the launcher window on this thread, binds the hotkey and shows
-/// the window, with the picks saved before.
-fn open(services: Services) -> Result<HWND> {
+/// Creates the launcher window on this thread, with the picks saved
+/// before, binds the hotkey, puts the icon in the tray and shows the
+/// window, or, not `shown`, only sets the providers looking.
+fn open(services: Services, shown: bool) -> Result<HWND> {
     let hwnd = create_window()?;
     let placement = placement_under_cursor()?;
     let frecency = services
@@ -522,7 +538,12 @@ fn open(services: Services) -> Result<HWND> {
         *app = Some(opened);
     });
     style_window(hwnd)?;
-    show(hwnd)?;
+    match shown {
+        true => show(hwnd)?,
+        false => {
+            with_app(App::find_if_stale);
+        }
+    }
     Ok(hwnd)
 }
 
@@ -717,7 +738,10 @@ fn on_command(hwnd: HWND, command: tray::Command) -> Result<()> {
             with_app(App::open_settings);
             Ok(())
         }
-        tray::Command::StartWithWindows => Ok(()),
+        tray::Command::StartWithWindows => {
+            with_app(App::toggle_start);
+            Ok(())
+        }
         tray::Command::Exit => unsafe { DestroyWindow(hwnd) },
     }
 }
@@ -935,6 +959,7 @@ mod tests {
     };
 
     use super::*;
+    use crate::autostart;
     use crate::render::Frame;
     use crate::scratch::Scratch;
     use crate::test_desktop::on_hidden_desktop;
@@ -1064,6 +1089,7 @@ mod tests {
             hotkeys: Box::new(Rc::new(Keyboard::default())),
             tray: Rc::new(Taskbar::default()),
             config: None,
+            autostart: None,
         };
         (services, ran)
     }
@@ -1156,7 +1182,7 @@ mod tests {
         /// as a key state that is not 0.
         fn serving(services: Services) -> Self {
             hold(&[]);
-            Self(open(services).expect("open the launcher"))
+            Self(open(services, true).expect("open the launcher"))
         }
 
         /// A launcher that lists apps with these titles, once it has them
@@ -1518,6 +1544,43 @@ mod tests {
     }
 
     #[test]
+    fn start_with_windows_from_the_menu_turns_it_on_and_off() {
+        on_hidden_desktop(|| {
+            let keys = autostart::tests::Keys::new("window-menu");
+            let exe = r"C:\Programs\hyalo\hyalo.exe";
+            let taskbar = Rc::new(Taskbar::default());
+            let (mut services, _) = services(listing(&[]).0, None);
+            services.tray = taskbar.clone();
+            services.autostart = Some(keys.autostart(exe));
+            let launcher = Launcher::serving(services);
+            launcher.pick(&taskbar, tray::Command::StartWithWindows);
+            let value = keys.run_value().expect("a Run value");
+            assert_eq!(value, format!("\"{exe}\" --hidden"));
+            launcher.pick(&taskbar, tray::Command::StartWithWindows);
+            assert_eq!(keys.run_value(), None);
+            launcher.pick(&taskbar, tray::Command::StartWithWindows);
+            launcher.tray(WM_CONTEXTMENU, (0, 0));
+            let menus = taskbar.menus.borrow();
+            let lines = &menus.last().expect("a menu").0;
+            assert_eq!(*lines, tray::menu(Some(Hotkey::default()), Some(true)));
+        });
+    }
+
+    #[test]
+    fn opening_in_the_tray_looks_for_apps_without_showing() {
+        on_hidden_desktop(|| {
+            let (provider, runs) = listing(&["Notepad"]);
+            let hwnd = open(services(provider, None).0, false).expect("open the launcher");
+            let launcher = Launcher(hwnd);
+            launcher.pump_until(|app| !app.catalog.items.is_empty());
+            assert!(!launcher.visible());
+            assert_eq!(runs.load(Ordering::SeqCst), 1);
+            launcher.hotkey();
+            assert_eq!(runs.load(Ordering::SeqCst), 1, "still fresh when shown");
+        });
+    }
+
+    #[test]
     fn the_icon_comes_back_when_explorer_restarts() {
         on_hidden_desktop(|| {
             let (launcher, taskbar, _) = in_the_tray(None, None);
@@ -1640,7 +1703,7 @@ mod tests {
     #[test]
     fn destroying_the_window_quits_the_app_with_exit_code_zero() {
         on_hidden_desktop(|| {
-            let hwnd = open(services(listing(&[]).0, None).0).expect("open the launcher");
+            let hwnd = open(services(listing(&[]).0, None).0, true).expect("open the launcher");
             unsafe { DestroyWindow(hwnd) }.expect("destroy the window");
             let mut message = MSG::default();
             let quit = unsafe { PeekMessageW(&mut message, None, WM_QUIT, WM_QUIT, PM_REMOVE) };
