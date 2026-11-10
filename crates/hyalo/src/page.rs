@@ -7,6 +7,7 @@
 use std::ops::Range;
 
 use hyalo_core::config::List;
+use hyalo_core::text::Language;
 
 /// What a control does when used.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -27,6 +28,8 @@ pub enum Target {
     OpenConfig,
     /// "Open config.toml" in the card that tells a problem.
     Fix,
+    /// The option of the language choice for this language.
+    Language(Language),
 }
 
 /// What the window shows.
@@ -88,12 +91,24 @@ pub enum Control {
         target: Target,
         on: bool,
     },
-    /// The hotkey recorder: the keys it shows, and whether it listens.
+    /// The hotkey recorder: the keys it shows, whether it listens, and
+    /// what it asks for while it listens and no key is held.
     Keys {
         target: Target,
         caps: Vec<String>,
         listening: bool,
+        prompt: String,
     },
+    /// Options side by side, one of them on.
+    Choice(Vec<Choice>),
+}
+
+/// One option of a choice.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Choice {
+    pub label: String,
+    pub target: Target,
+    pub on: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -162,6 +177,13 @@ pub enum What {
     Keys {
         caps: Vec<String>,
         listening: bool,
+        prompt: String,
+        target: Target,
+    },
+    /// An option of a choice: on, or there to be chosen.
+    Choice {
+        label: String,
+        on: bool,
         target: Target,
     },
     Remove(Target),
@@ -183,6 +205,7 @@ impl What {
             What::Button { target, .. }
             | What::Toggle { target, .. }
             | What::Keys { target, .. }
+            | What::Choice { target, .. }
             | What::Field { target, .. }
             | What::Remove(target) => Some(*target),
             _ => None,
@@ -272,6 +295,8 @@ pub const KEYS_PAD: f32 = 6.0;
 const KEYS_MIN: f32 = 160.0;
 /// The × on an entry, square.
 const REMOVE: f32 = 32.0;
+/// Room between the options of a choice.
+const CHOICE_GAP: f32 = 4.0;
 
 /// Places every piece of `page` on a page `width` DIPs wide; `measure`
 /// tells how wide a control's label is.
@@ -413,7 +438,9 @@ impl Out<'_> {
             Some(control) => {
                 let (width, height) = self.size(control);
                 let at = self.at(right - width, SETTING, width, height);
-                self.mark(at, control_mark(control));
+                for (place, what) in self.control_marks(control, at) {
+                    self.mark(place, what);
+                }
                 at.x - GAP
             }
             None => right,
@@ -477,7 +504,60 @@ impl Out<'_> {
             Control::Button(button) => (self.button_width(&button.label), CONTROL_HEIGHT),
             Control::Toggle { .. } => TOGGLE,
             Control::Keys { caps, .. } => (self.keys_width(caps), CONTROL_HEIGHT),
+            Control::Choice(choices) => (self.choice_width(choices), CONTROL_HEIGHT),
         }
+    }
+
+    /// The marks of `control` at `at`: one, or one per option of a
+    /// choice, side by side.
+    fn control_marks(&self, control: &Control, at: Area) -> Vec<(Area, What)> {
+        let what = match control {
+            Control::Choice(choices) => return self.options(choices, at),
+            Control::Button(button) => button_mark(button),
+            Control::Toggle { target, on } => What::Toggle {
+                on: *on,
+                target: *target,
+            },
+            Control::Keys {
+                target,
+                caps,
+                listening,
+                prompt,
+            } => What::Keys {
+                caps: caps.clone(),
+                listening: *listening,
+                prompt: prompt.clone(),
+                target: *target,
+            },
+        };
+        vec![(at, what)]
+    }
+
+    /// The options of a choice from the left of `at`, each as wide as a
+    /// button with its label.
+    fn options(&self, choices: &[Choice], at: Area) -> Vec<(Area, What)> {
+        let mut x = at.x;
+        let mut marks = Vec::new();
+        for choice in choices {
+            let width = self.button_width(&choice.label);
+            let what = What::Choice {
+                label: choice.label.clone(),
+                on: choice.on,
+                target: choice.target,
+            };
+            marks.push((Area { x, width, ..at }, what));
+            x += width + CHOICE_GAP;
+        }
+        marks
+    }
+
+    /// A choice: each option as wide as a button with its label.
+    fn choice_width(&self, choices: &[Choice]) -> f32 {
+        let each = choices
+            .iter()
+            .map(|choice| self.button_width(&choice.label));
+        let gaps = choices.len().saturating_sub(1) as f32 * CHOICE_GAP;
+        each.sum::<f32>() + gaps
     }
 
     fn button_width(&self, label: &str) -> f32 {
@@ -489,25 +569,6 @@ impl Out<'_> {
         let each = caps.iter().map(|cap| (self.measure)(cap) + 2.0 * CAP_PAD);
         let gaps = caps.len().saturating_sub(1) as f32 * CAP_GAP;
         (each.sum::<f32>() + gaps + 2.0 * KEYS_PAD).max(KEYS_MIN)
-    }
-}
-
-fn control_mark(control: &Control) -> What {
-    match control {
-        Control::Button(button) => button_mark(button),
-        Control::Toggle { target, on } => What::Toggle {
-            on: *on,
-            target: *target,
-        },
-        Control::Keys {
-            target,
-            caps,
-            listening,
-        } => What::Keys {
-            caps: caps.clone(),
-            listening: *listening,
-            target: *target,
-        },
     }
 }
 
@@ -773,11 +834,67 @@ mod tests {
     }
 
     #[test]
+    fn a_choice_lays_its_options_out_side_by_side_on_the_right() {
+        let option = |label: &str, language, on| Choice {
+            label: label.to_string(),
+            target: Target::Language(language),
+            on,
+        };
+        let choice = Control::Choice(vec![
+            option("English", Language::English, true),
+            option("Русский", Language::Russian, false),
+        ]);
+        let page = Page {
+            title: String::new(),
+            sections: vec![Section {
+                title: None,
+                cards: vec![Card {
+                    alarm: false,
+                    muted: false,
+                    strips: vec![setting("Language", Some(choice))],
+                }],
+            }],
+        };
+        let laid = lay_out(&page, 600.0, &measure);
+        let english = laid
+            .area(Target::Language(Language::English))
+            .expect("English");
+        let russian = laid
+            .area(Target::Language(Language::Russian))
+            .expect("Russian");
+        let top = MARGIN + TITLE + (SETTING - CONTROL_HEIGHT) / 2.0;
+        assert_eq!(russian, area(600.0 - 24.0 - 16.0 - 94.0, top, 94.0, 32.0));
+        assert_eq!(english, area(russian.x - 4.0 - 94.0, top, 94.0, 32.0));
+        let targets = [Language::English, Language::Russian].map(Target::Language);
+        assert_eq!(laid.targets(), targets);
+        let on: Vec<bool> = laid
+            .marks
+            .iter()
+            .filter_map(|mark| match mark.what {
+                What::Choice { on, .. } => Some(on),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(on, [true, false]);
+        let name = laid
+            .marks
+            .iter()
+            .find(|mark| mark.what == What::Name("Language".into()));
+        let name = name.expect("the setting's name").at;
+        assert_eq!(
+            name.x + name.width,
+            english.x - 12.0,
+            "its text stops short of it"
+        );
+    }
+
+    #[test]
     fn the_recorder_is_as_wide_as_its_keys_and_at_least_160() {
         let keys = |caps: &[&str]| Control::Keys {
             target: Target::Hotkey,
             caps: caps.iter().map(|cap| cap.to_string()).collect(),
             listening: false,
+            prompt: String::new(),
         };
         let width = |control| {
             let page = Page {

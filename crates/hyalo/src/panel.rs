@@ -10,13 +10,14 @@
 use std::collections::HashMap;
 
 use hyalo_core::config::{Change, List, Problem, Why, Written};
+use hyalo_core::text::{Language, Text};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     VIRTUAL_KEY, VK_ESCAPE, VK_RETURN, VK_SPACE, VK_TAB,
 };
 
 use crate::field::{self, Edit, Edited, Field, Key};
 use crate::keys::Held;
-use crate::page::{self, Button, Card, Control, Laid, Page, Section, Strip, Target};
+use crate::page::{self, Button, Card, Choice, Control, Laid, Page, Section, Strip, Target};
 use crate::recorder::{Heard, Mods, Recorder};
 
 /// What the window must do.
@@ -90,24 +91,45 @@ pub struct Panel {
     pressed: Option<Target>,
     /// How far the page is scrolled, in DIPs.
     scroll: f32,
+    /// The language Windows is shown in, which a file without one speaks.
+    windows: Language,
 }
 
 impl Panel {
-    /// The panel for a file that holds `file`, and for starting with
-    /// Windows as `starts` says.
-    pub fn new(file: Result<Written, Problem>, starts: Option<bool>) -> Panel {
+    /// The panel for a file that holds `file`, for starting with Windows
+    /// as `starts` says, speaking the file's language or `windows`, the
+    /// language Windows is shown in.
+    pub fn new(file: Result<Written, Problem>, starts: Option<bool>, windows: Language) -> Panel {
         let mut panel = Panel {
             starts,
+            windows,
             ..Panel::default()
         };
         panel.reload(file);
         panel
     }
 
+    /// What the page says things in: the language the file names, or
+    /// Windows'; while the file is broken, the last good one's.
+    pub fn language(&self) -> Language {
+        let named = self.written.as_ref().and_then(|written| written.language);
+        named.unwrap_or(self.windows)
+    }
+
+    /// The window's title.
+    pub fn title(&self) -> &'static str {
+        self.language().say(Text::WindowTitle)
+    }
+
+    /// `text` in the page's language.
+    fn say(&self, text: Text) -> String {
+        self.language().say(text).to_string()
+    }
+
     /// What the page shows now.
     pub fn page(&self) -> Page {
         Page {
-            title: "Settings".to_string(),
+            title: self.say(Text::Settings),
             sections: SECTIONS
                 .iter()
                 .filter_map(|section| section(self))
@@ -408,6 +430,9 @@ impl Panel {
             Target::Fix | Target::OpenConfig => Some(Effect::OpenConfig),
             Target::StartWithWindows => self.starts.map(|on| Effect::StartWithWindows(!on)),
             Target::Pick(list) => Some(Effect::Pick(list)),
+            Target::Language(language) => {
+                (language != self.language()).then_some(Effect::Change(Change::Language(language)))
+            }
             _ => None,
         }
     }
@@ -429,7 +454,7 @@ impl Panel {
             Target::Name(list) | Target::AddName(list) => {
                 list != List::Exclude && self.written.is_some()
             }
-            Target::Hotkey | Target::Pick(_) => self.written.is_some(),
+            Target::Hotkey | Target::Pick(_) | Target::Language(_) => self.written.is_some(),
         }
     }
 
@@ -462,10 +487,10 @@ impl Panel {
 
     /// The help line of the setting at `spot`: what went wrong there, as
     /// a warning, or `help`.
-    fn help(&self, spot: Spot, help: &str) -> (String, bool) {
+    fn help(&self, spot: Spot, help: Text) -> (String, bool) {
         match &self.note {
-            Some((noted, why)) if *noted == spot => (why.to_string(), true),
-            _ => (help.to_string(), false),
+            Some((noted, why)) if *noted == spot => (why.said(self.language()), true),
+            _ => (self.say(help), false),
         }
     }
 
@@ -473,51 +498,68 @@ impl Panel {
     fn problem(&self) -> Option<Section> {
         let problem = self.problem.as_ref()?;
         let help = match self.written {
-            Some(_) => "hyalo keeps its last good settings until it is fixed",
-            None => "hyalo runs on its defaults until it is fixed",
+            Some(_) => Text::KeepsUntilFixed,
+            None => Text::DefaultsUntilFixed,
         };
-        let fix = Control::Button(button("Open config.toml", Target::Fix));
-        let title = setting(
-            "config.toml has a problem",
-            (help.to_string(), false),
-            Some(fix),
-        );
-        let text = format!("Line {}: {}", problem.line, problem.why);
+        let fix = Control::Button(button(&self.say(Text::OpenConfig), Target::Fix));
+        let title = setting(&self.say(Text::Problem), (self.say(help), false), Some(fix));
+        let (language, line) = (self.language(), problem.line.to_string());
+        let text = language.fill(Text::Line, &[&line, &problem.why.said(language)]);
         Some(Section {
             title: None,
             cards: vec![card(true, false, vec![title, Strip::Text { text }])],
         })
     }
 
-    /// The hotkey, and starting with Windows.
+    /// The hotkey, starting with Windows, and the language.
     fn launcher(&self) -> Option<Section> {
         let written = self.written.as_ref()?;
         let listening = self.recorder.listening();
         let help = match listening {
-            true => "Press the new combination; Esc keeps the one you have",
-            false => "Shows and hides the launcher: click, then press the keys",
+            true => Text::Listening,
+            false => Text::HotkeyHelp,
         };
         let keys = Control::Keys {
             target: Target::Hotkey,
             caps: self.recorder.caps(written.hotkey),
             listening,
+            prompt: self.say(Text::PressKeys),
         };
         let muted = self.problem.is_some();
-        let hotkey = setting("Hotkey", self.help(Spot::Hotkey, help), Some(keys));
+        let hotkey = setting(
+            &self.say(Text::Hotkey),
+            self.help(Spot::Hotkey, help),
+            Some(keys),
+        );
         let mut cards = vec![card(false, muted, vec![hotkey])];
         if let Some(on) = self.starts {
             let toggle = Control::Toggle {
                 target: Target::StartWithWindows,
                 on,
             };
-            let help = "Starts hyalo in the tray when you sign in".to_string();
-            let strip = setting("Start with Windows", (help, false), Some(toggle));
+            let help = (self.say(Text::StartsInTray), false);
+            let strip = setting(&self.say(Text::StartWithWindows), help, Some(toggle));
             cards.push(card(false, muted, vec![strip]));
         }
+        cards.push(self.languages(muted));
         Some(Section {
-            title: Some("Launcher".to_string()),
+            title: Some(self.say(Text::Launcher)),
             cards,
         })
+    }
+
+    /// The choice of language: each language by its own name, the one
+    /// spoken on.
+    fn languages(&self, muted: bool) -> Card {
+        let options = Language::ALL.map(|language| Choice {
+            label: language.name().to_string(),
+            target: Target::Language(language),
+            on: language == self.language(),
+        });
+        let help = self.help(Spot::Language, Text::LanguageHelp);
+        let choice = Control::Choice(options.to_vec());
+        let strip = setting(&self.say(Text::LanguageName), help, Some(choice));
+        card(false, muted, vec![strip])
     }
 
     /// The three lists of folders.
@@ -525,7 +567,7 @@ impl Panel {
         self.written.as_ref()?;
         let cards = List::ALL.map(|list| self.list(list)).to_vec();
         Some(Section {
-            title: Some("Folders".to_string()),
+            title: Some(self.say(Text::Folders)),
             cards,
         })
     }
@@ -534,24 +576,13 @@ impl Panel {
     /// lists that take a folder's name, a field for one.
     fn list(&self, list: List) -> Card {
         let (name, help, example) = match list {
-            List::Exclude => (
-                "Leave out of the index",
-                "Full paths: the file index leaves out these folders and all in them",
-                "",
-            ),
-            List::RankLower => (
-                "Rank lower",
-                "Files in these rank lower: a folder name, wherever it is, or a full path",
-                "target",
-            ),
-            List::RankHigher => (
-                "Rank higher",
-                "Files in these rank higher, as in Desktop, Documents and Downloads",
-                "notes",
-            ),
+            List::Exclude => (Text::Exclude, Text::ExcludeHelp, ""),
+            List::RankLower => (Text::RankLower, Text::RankLowerHelp, "target"),
+            List::RankHigher => (Text::RankHigher, Text::RankHigherHelp, "notes"),
         };
-        let pick = Control::Button(button("Add folder…", Target::Pick(list)));
-        let mut strips = vec![setting(name, self.help(Spot::List(list), help), Some(pick))];
+        let pick = Control::Button(button(&self.say(Text::AddFolder), Target::Pick(list)));
+        let help = self.help(Spot::List(list), help);
+        let mut strips = vec![setting(&self.say(name), help, Some(pick))];
         let entries = self.entries(list).iter().enumerate();
         strips.extend(entries.map(|(at, text)| Strip::Entry {
             text: text.clone(),
@@ -565,8 +596,8 @@ impl Panel {
                 text: name.text().to_string(),
                 caret: name.caret_utf16(),
                 selection: name.selection_utf16(),
-                placeholder: format!("A folder name, such as {example}"),
-                add: button("Add", Target::AddName(list)),
+                placeholder: self.language().fill(Text::FolderName, &[example]),
+                add: button(&self.say(Text::Add), Target::AddName(list)),
             });
         }
         card(false, self.problem.is_some(), strips)
@@ -574,13 +605,9 @@ impl Panel {
 
     /// The way to the file itself.
     fn file(&self) -> Option<Section> {
-        let open = Control::Button(button("Open config.toml", Target::OpenConfig));
-        let help = "Changes here are saved to it at once, and what you save there shows up here";
-        let strip = setting(
-            "Edit the file instead",
-            (help.to_string(), false),
-            Some(open),
-        );
+        let open = Control::Button(button(&self.say(Text::OpenConfig), Target::OpenConfig));
+        let help = (self.say(Text::EditFileHelp), false);
+        let strip = setting(&self.say(Text::EditFile), help, Some(open));
         Some(Section {
             title: Some("config.toml".to_string()),
             cards: vec![card(false, false, vec![strip])],
@@ -623,6 +650,7 @@ mod tests {
     use super::*;
     use hyalo_core::config::{self, DEFAULT};
     use hyalo_core::hotkey::Hotkey;
+    use hyalo_core::text::Language;
     use std::ops::Range;
     use windows::Win32::UI::Input::KeyboardAndMouse::{
         VK_A, VK_C, VK_DELETE, VK_END, VK_F4, VK_HOME, VK_K, VK_LEFT, VK_SPACE, VK_V, VK_X,
@@ -635,7 +663,7 @@ mod tests {
     }
 
     fn panel() -> Panel {
-        Panel::new(Ok(written(DEFAULT)), Some(false))
+        Panel::new(Ok(written(DEFAULT)), Some(false), Language::English)
     }
 
     fn broken() -> Problem {
@@ -728,6 +756,7 @@ mod tests {
             "Launcher",
             "Hotkey",
             "Start with Windows",
+            "Language",
             "Folders",
             "Leave out of the index",
             r"C:\Windows\WinSxS",
@@ -740,13 +769,13 @@ mod tests {
         assert_eq!(texts(&panel), shown);
         assert_eq!(keys(&panel), (caps("Alt+Space"), false));
         assert_eq!(toggle(&panel), Some(false));
-        let on = Panel::new(Ok(written(DEFAULT)), Some(true));
+        let on = Panel::new(Ok(written(DEFAULT)), Some(true), Language::English);
         assert_eq!(toggle(&on), Some(true));
     }
 
     #[test]
     fn where_hyalo_may_not_start_with_windows_there_is_no_switch() {
-        let panel = Panel::new(Ok(written(DEFAULT)), None);
+        let panel = Panel::new(Ok(written(DEFAULT)), None, Language::English);
         assert_eq!(toggle(&panel), None);
         assert!(!texts(&panel).contains(&"Start with Windows".to_string()));
     }
@@ -834,6 +863,7 @@ mod tests {
             (false, true),
             (false, true),
             (false, true),
+            (false, true),
             (false, false),
         ];
         assert_eq!(muted(&panel), cards);
@@ -841,7 +871,7 @@ mod tests {
 
     #[test]
     fn a_file_broken_from_the_start_shows_its_problem_and_the_way_to_it() {
-        let panel = Panel::new(Err(broken()), Some(true));
+        let panel = Panel::new(Err(broken()), Some(true), Language::English);
         let shown = texts(&panel);
         assert_eq!(shown.len(), 6, "{shown:?}");
         assert!(shown[2].starts_with("Line 2: "));
@@ -881,7 +911,7 @@ mod tests {
 
     #[test]
     fn the_hotkey_it_has_changes_nothing() {
-        let mut panel = Panel::new(Ok(written("hotkey = 'F4'\n")), None);
+        let mut panel = Panel::new(Ok(written("hotkey = 'F4'\n")), None, Language::English);
         click(&mut panel, Target::Hotkey);
         assert_eq!(plain(&mut panel, VK_F4.0), None);
         assert!(!panel.listening());
@@ -1146,7 +1176,7 @@ mod tests {
         }
         press(&mut panel, VK_TAB.0, SHIFT);
         assert!(panel.look(*order.last().expect("controls")).ring);
-        let mut fresh = Panel::new(Ok(written(DEFAULT)), Some(false));
+        let mut fresh = Panel::new(Ok(written(DEFAULT)), Some(false), Language::English);
         press(&mut fresh, VK_TAB.0, SHIFT);
         assert!(
             fresh.look(*order.last().expect("controls")).ring,
@@ -1180,7 +1210,10 @@ mod tests {
         );
         assert_eq!(plain(&mut panel, VK_A.0), None);
         assert_eq!(
-            plain(&mut Panel::new(Ok(written(DEFAULT)), None), VK_SPACE.0),
+            plain(
+                &mut Panel::new(Ok(written(DEFAULT)), None, Language::English),
+                VK_SPACE.0
+            ),
             None,
             "no focus"
         );
@@ -1201,7 +1234,7 @@ mod tests {
     #[test]
     fn removing_the_entry_with_the_focus_hands_it_to_the_one_before() {
         let text = "[folders]\nrank_lower = ['a', 'b']\n";
-        let mut panel = Panel::new(Ok(written(text)), None);
+        let mut panel = Panel::new(Ok(written(text)), None, Language::English);
         click(&mut panel, Target::Remove(List::RankLower, 1));
         panel.reload(Ok(written("[folders]\nrank_lower = ['a']\n")));
         assert!(panel.look(Target::Remove(List::RankLower, 0)).focused);
@@ -1209,7 +1242,7 @@ mod tests {
         assert!(panel.look(Target::Pick(List::RankLower)).focused);
         click(&mut panel, Target::StartWithWindows);
         assert!(!panel.look(Target::StartWithWindows).focused, "none here");
-        let mut starting = Panel::new(Ok(written(text)), Some(true));
+        let mut starting = Panel::new(Ok(written(text)), Some(true), Language::English);
         click(&mut starting, Target::StartWithWindows);
         starting.set_starts(None);
         assert_eq!(
@@ -1395,5 +1428,132 @@ notes
         assert_eq!(field(&panel, List::RankLower), (String::new(), 0, 0..0));
         type_text(&mut panel, "a🔍");
         assert_eq!(field(&panel, List::RankLower), ("a🔍".to_string(), 3, 3..3));
+    }
+
+    fn russian() -> Panel {
+        let text = config::default_file(Language::Russian);
+        Panel::new(Ok(written(&text)), Some(false), Language::English)
+    }
+
+    /// Each option of the language choice: its label, and whether it is
+    /// on.
+    fn choices(panel: &Panel) -> Vec<(String, bool)> {
+        let marks = laid(panel).marks.into_iter();
+        let options = marks.filter_map(|mark| match mark.what {
+            What::Choice { label, on, .. } => Some((label, on)),
+            _ => None,
+        });
+        options.collect()
+    }
+
+    #[test]
+    fn the_page_speaks_the_language_the_file_names() {
+        let panel = russian();
+        let shown = [
+            "Параметры",
+            "Основные",
+            "Сочетание клавиш",
+            "Запускать вместе с Windows",
+            "Язык",
+            "Папки",
+            "Не индексировать",
+            r"C:\Windows\WinSxS",
+            "Показывать ниже",
+            "target",
+            "Показывать выше",
+            "config.toml",
+            "Редактировать файл напрямую",
+        ];
+        assert_eq!(texts(&panel), shown);
+        assert_eq!(panel.title(), "Параметры hyalo");
+        assert_eq!(panel.language(), Language::Russian);
+    }
+
+    #[test]
+    fn a_file_without_a_language_speaks_the_one_windows_is_shown_in() {
+        let windows = Panel::new(Ok(written("hotkey = 'F4'\n")), None, Language::Russian);
+        assert_eq!(windows.language(), Language::Russian);
+        assert_eq!(texts(&windows)[0], "Параметры");
+        let named = Panel::new(Ok(written(DEFAULT)), None, Language::Russian);
+        assert_eq!(
+            named.language(),
+            Language::English,
+            "the file's comes first"
+        );
+        let broken = Panel::new(Err(broken()), None, Language::Russian);
+        assert_eq!(broken.language(), Language::Russian);
+    }
+
+    #[test]
+    fn the_language_spoken_is_on_and_choosing_the_other_writes_it() {
+        let mut panel = panel();
+        let options = [
+            ("English".to_string(), true),
+            ("Русский".to_string(), false),
+        ];
+        assert_eq!(choices(&panel), options);
+        let english = Target::Language(Language::English);
+        assert_eq!(click(&mut panel, english), None, "spoken already");
+        let change = Change::Language(Language::Russian);
+        let written_ru = Some(Effect::Change(change.clone()));
+        assert_eq!(
+            click(&mut panel, Target::Language(Language::Russian)),
+            written_ru
+        );
+        let after = config::edit(DEFAULT, &change).expect("edited");
+        panel.done(&change, Some(written(&after)));
+        assert_eq!(texts(&panel)[0], "Параметры");
+        let options = [
+            ("English".to_string(), false),
+            ("Русский".to_string(), true),
+        ];
+        assert_eq!(choices(&panel), options);
+    }
+
+    #[test]
+    fn tab_goes_through_the_language_choice() {
+        let mut panel = panel();
+        let laid = laid(&panel);
+        let order = laid.targets();
+        let at = order
+            .iter()
+            .position(|&target| target == Target::Language(Language::English))
+            .expect("on the page");
+        assert_eq!(order[at + 1], Target::Language(Language::Russian));
+        click(&mut panel, Target::Language(Language::English));
+        plain(&mut panel, VK_TAB.0);
+        let space = plain(&mut panel, VK_SPACE.0);
+        let russian = Some(Effect::Change(Change::Language(Language::Russian)));
+        assert_eq!(space, russian);
+    }
+
+    #[test]
+    fn what_went_wrong_and_the_recorders_prompt_are_said_in_the_pages_language() {
+        let mut panel = russian();
+        let ctrl_k = Hotkey::parse("Ctrl+K").expect("a hotkey");
+        panel.refused(&Change::Hotkey(ctrl_k), Why::Taken(ctrl_k));
+        let warning = "! Ctrl+K уже занято другим приложением".to_string();
+        assert!(texts(&panel).contains(&warning));
+        click(&mut panel, Target::Hotkey);
+        let prompt = laid(&panel)
+            .marks
+            .into_iter()
+            .find_map(|mark| match mark.what {
+                What::Keys { prompt, .. } => Some(prompt),
+                _ => None,
+            });
+        assert_eq!(prompt.as_deref(), Some("Нажмите клавиши"));
+        let help = What::Help {
+            text: "Нажмите новое сочетание; Esc оставит текущее".to_string(),
+            alarm: false,
+        };
+        assert_eq!(help_of(&panel, "Сочетание клавиш"), help);
+        panel.reload(Err(broken()));
+        let shown = texts(&panel);
+        assert_eq!(shown[1], "В config.toml ошибка");
+        assert!(
+            shown[2].starts_with("Строка 2: unknown field `hotkye`"),
+            "{shown:?}"
+        );
     }
 }

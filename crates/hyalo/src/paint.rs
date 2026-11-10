@@ -77,8 +77,6 @@ const HELP_SIZE: f32 = 12.0;
 const LABEL_SIZE: f32 = 14.0;
 /// A key cap's height in the recorder.
 const CAP_HEIGHT: f32 = 22.0;
-/// What the recorder shows while it listens and nothing is held yet.
-const LISTENING: &str = "Press keys";
 
 pub struct Painter {
     surface: Surface,
@@ -226,8 +224,12 @@ impl Painter {
             What::Button { label, .. } => self.draw_button(label, at, look),
             What::Toggle { on, .. } => self.draw_toggle(*on, at, look),
             What::Keys {
-                caps, listening, ..
-            } => self.draw_keys(caps, *listening, at, look),
+                caps,
+                listening,
+                prompt,
+                ..
+            } => self.draw_keys(caps, (*listening, prompt), at, look),
+            What::Choice { label, on, .. } => self.draw_choice(label, *on, at, look),
             What::Remove(_) => self.draw_remove(at, look),
             What::Field {
                 text,
@@ -299,6 +301,21 @@ impl Painter {
         self.ring(at, CONTROL_RADIUS, look)
     }
 
+    /// An option of a choice: the one on filled with the blue, as the
+    /// switch is when on, its label dark; the others as buttons.
+    fn draw_choice(&self, label: &str, on: bool, at: Area, look: Look) -> Result<()> {
+        if !on {
+            return self.draw_button(label, at, look);
+        }
+        let fill = match look.hovered {
+            true => ACCENT_HOVER,
+            false => ACCENT,
+        };
+        self.round(at, CONTROL_RADIUS, Some(fill), None)?;
+        self.write(label, &self.fonts.label, at, KNOB_ON)?;
+        self.ring(at, CONTROL_RADIUS, look)
+    }
+
     /// The switch: a pill with a knob, on the right and blue when on.
     fn draw_toggle(&self, on: bool, at: Area, look: Look) -> Result<()> {
         let radius = at.height / 2.0;
@@ -328,13 +345,19 @@ impl Painter {
 
     /// The recorder: its keys as caps, side by side; blue-edged while it
     /// listens, with a hint after the keys held so far.
-    fn draw_keys(&self, caps: &[String], listening: bool, at: Area, look: Look) -> Result<()> {
+    fn draw_keys(
+        &self,
+        caps: &[String],
+        (listening, prompt): (bool, &str),
+        at: Area,
+        look: Look,
+    ) -> Result<()> {
         let edge = if listening { ACCENT } else { CONTROL_EDGE };
         self.round(at, CONTROL_RADIUS, Some(fill(look, listening)), Some(edge))?;
         let color = if look.enabled { TEXT } else { FAINT };
         let end = self.draw_caps(caps, at, color)?;
         if listening {
-            let hint = if caps.is_empty() { LISTENING } else { "…" };
+            let hint = if caps.is_empty() { prompt } else { "…" };
             // A word or an ellipsis, never cut.
             let rest = Area {
                 x: end + FIELD_INSET / 2.0 - CAP_GAP,
@@ -655,6 +678,7 @@ impl Painter {
 #[cfg(test)]
 mod tests {
     use hyalo_core::config::{self, DEFAULT, List};
+    use hyalo_core::text::Language;
     use windows::Win32::UI::Input::KeyboardAndMouse::VK_TAB;
 
     use super::*;
@@ -686,7 +710,7 @@ mod tests {
     #[test]
     fn the_settings_at_100_percent() {
         on_hidden_desktop(|| {
-            let mut panel = Panel::new(Ok(written(DEFAULT)), Some(true));
+            let mut panel = Panel::new(Ok(written(DEFAULT)), Some(true), Language::English);
             let laid = lay_out(&panel.page(), 640.0, &|text| {
                 text.chars().count() as f32 * 8.0
             });
@@ -699,9 +723,22 @@ mod tests {
     }
 
     #[test]
+    fn the_settings_in_russian_at_100_percent() {
+        on_hidden_desktop(|| {
+            let text = config::default_file(Language::Russian);
+            let mut panel = Panel::new(Ok(written(&text)), Some(true), Language::English);
+            panel.press(Some(Target::Hotkey));
+            panel.release(Some(Target::Hotkey));
+            panel.hover(Some(Target::Language(Language::English)));
+            let frame = painted(&mut panel, (640, 1040), 96);
+            assert_looks_like("settings-ru-100", &frame);
+        });
+    }
+
+    #[test]
     fn a_problem_in_the_file_at_100_percent() {
         on_hidden_desktop(|| {
-            let mut panel = Panel::new(Ok(written(DEFAULT)), None);
+            let mut panel = Panel::new(Ok(written(DEFAULT)), None, Language::English);
             let problem = config::written("\nhotkye = 1\n").expect_err("a problem");
             panel.reload(Err(problem));
             panel.press(Some(Target::Fix));
@@ -714,7 +751,7 @@ mod tests {
     fn recording_typing_and_the_focus_ring_at_150_percent() {
         on_hidden_desktop(|| {
             let text = "hotkey = 'F4'\n[folders]\nrank_lower = ['target', 'C:\\Users\\Me\\AppData\\Local\\Some Vendor\\a folder whose path is long enough to be cut short']\n";
-            let mut panel = Panel::new(Ok(written(text)), Some(false));
+            let mut panel = Panel::new(Ok(written(text)), Some(false), Language::English);
             panel.press(Some(Target::Name(List::RankLower)));
             panel.release(Some(Target::Name(List::RankLower)));
             let long = r"D:\Projects\a folder whose name is far too long for the field it is typed in, and longer still";
@@ -736,7 +773,7 @@ mod tests {
     #[test]
     fn typing_a_name_in_a_page_scrolled_down_at_125_percent() {
         on_hidden_desktop(|| {
-            let mut panel = Panel::new(Ok(written(DEFAULT)), None);
+            let mut panel = Panel::new(Ok(written(DEFAULT)), None, Language::English);
             panel.press(Some(Target::Name(List::RankHigher)));
             panel.release(Some(Target::Name(List::RankHigher)));
             for unit in "notes".encode_utf16() {
@@ -752,7 +789,7 @@ mod tests {
     #[test]
     fn a_selection_in_a_field_and_a_long_name_scrolled_to_its_caret() {
         on_hidden_desktop(|| {
-            let mut panel = Panel::new(Ok(written(DEFAULT)), None);
+            let mut panel = Panel::new(Ok(written(DEFAULT)), None, Language::English);
             panel.press(Some(Target::Name(List::RankLower)));
             panel.release(Some(Target::Name(List::RankLower)));
             let long = r"D:\Projects\a folder whose name is far too long for the field it is typed in, and longer";
@@ -799,7 +836,7 @@ mod tests {
     #[test]
     fn a_page_taller_than_the_view_shows_where_the_view_is() {
         on_hidden_desktop(|| {
-            let mut panel = Panel::new(Ok(written(DEFAULT)), Some(true));
+            let mut panel = Panel::new(Ok(written(DEFAULT)), Some(true), Language::English);
             let short = painted(&mut panel, (640, 300), 96);
             let bar = |frame: &Frame, y: usize| frame.pixel(635, y)[3];
             assert!(bar(&short, 10) > 40, "the bar at the top");

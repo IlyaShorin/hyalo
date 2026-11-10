@@ -8,7 +8,7 @@
 //! keys and the config's settings, files, apps.
 
 /// A language hyalo speaks.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub enum Language {
     #[default]
     English,
@@ -165,25 +165,25 @@ table! {
     StartsInTray => "Starts hyalo in the tray when you sign in",
         "hyalo запускается в области уведомлений при входе в систему";
     LanguageName => "Language", "Язык";
-    LanguageHelp => "Of the settings, the tray menu and the launcher's rows",
-        "Параметров, меню в области уведомлений и строк поиска";
+    LanguageHelp => "For this window, the tray menu and the launcher's rows",
+        "Для этого окна, меню в области уведомлений и строк поиска";
     Folders => "Folders", "Папки";
     Exclude => "Leave out of the index", "Не индексировать";
     ExcludeHelp => "Full paths: the file index leaves out these folders and all in them",
         "Полные пути: эти папки и всё в них не попадают в индекс файлов";
     RankLower => "Rank lower", "Показывать ниже";
     RankLowerHelp => "Files in these rank lower: a folder name, wherever it is, or a full path",
-        "Файлы из этих папок ниже в результатах: имя папки, где бы она ни была, или полный путь";
+        "Файлы в них ниже в поиске: имя папки (где угодно) или полный путь";
     RankHigher => "Rank higher", "Показывать выше";
     RankHigherHelp => "Files in these rank higher, as in Desktop, Documents and Downloads",
-        "Файлы из этих папок выше в результатах, как из «Рабочего стола», «Документов» и «Загрузок»";
+        "Файлы в них выше в поиске, как в «Документах» и «Загрузках»";
     AddFolder => "Add folder…", "Добавить папку…";
     Add => "Add", "Добавить";
     /// The example of a folder name.
     FolderName => "A folder name, such as {0}", "Имя папки, например {0}";
     EditFile => "Edit the file instead", "Редактировать файл напрямую";
     EditFileHelp => "Changes here are saved to it at once, and what you save there shows up here",
-        "Изменения отсюда сразу сохраняются в файл, а сохранённое в файле сразу видно здесь";
+        "Изменения отсюда сразу попадают в файл, а из файла — сюда";
     PickExclude => "Leave a folder out of the index", "Папка, которую не индексировать";
     PickLower => "Rank a folder lower", "Папка, файлы из которой показывать ниже";
     PickHigher => "Rank a folder higher", "Папка, файлы из которой показывать выше";

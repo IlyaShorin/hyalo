@@ -16,6 +16,7 @@ use std::time::Instant;
 
 use hyalo_core::config::{self, Change, List, Problem, Refusal, Why};
 use hyalo_core::item::Action;
+use hyalo_core::text::{Language, Text};
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Dwm::{
     DWMSBT_MAINWINDOW, DWMWA_SYSTEMBACKDROP_TYPE, DWMWA_USE_IMMERSIVE_DARK_MODE,
@@ -31,13 +32,13 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 use windows::Win32::UI::WindowsAndMessaging::{
     CS_DBLCLKS, CreateWindowExW, DefWindowProcW, DestroyWindow, GetClientRect, IDC_ARROW, IsIconic,
     LoadCursorW, MINMAXINFO, RegisterClassExW, SM_CXICON, SM_CXSMICON, SW_RESTORE, SW_SHOW,
-    SWP_NOACTIVATE, SWP_NOZORDER, SetForegroundWindow, SetWindowPos, ShowWindow, WA_INACTIVE,
-    WM_ACTIVATE, WM_CHAR, WM_DESTROY, WM_DPICHANGED, WM_GETMINMAXINFO, WM_KEYDOWN, WM_KEYUP,
-    WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_SIZE,
+    SWP_NOACTIVATE, SWP_NOZORDER, SetForegroundWindow, SetWindowPos, SetWindowTextW, ShowWindow,
+    WA_INACTIVE, WM_ACTIVATE, WM_CHAR, WM_DESTROY, WM_DPICHANGED, WM_GETMINMAXINFO, WM_KEYDOWN,
+    WM_KEYUP, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_SIZE,
     WM_SYSCHAR, WM_SYSKEYDOWN, WM_SYSKEYUP, WNDCLASSEXW, WS_EX_NOREDIRECTIONBITMAP,
     WS_OVERLAPPEDWINDOW,
 };
-use windows::core::{BOOL, PCWSTR, Result, w};
+use windows::core::{BOOL, HSTRING, PCWSTR, Result, w};
 
 use super::{
     App, MOUSE_SHIFT, Placement, client_point, double_click_room, double_click_time, down,
@@ -70,6 +71,8 @@ pub(super) struct SettingsWindow {
     /// When and where the last double-click in a field was, until a
     /// third click uses it.
     double: Option<(Instant, (i32, i32))>,
+    /// The title the window has, in the page's language.
+    title: &'static str,
 }
 
 /// Opens the settings window, or brings the one open forward. Called
@@ -214,6 +217,7 @@ impl SettingsWindow {
             tracking: false,
             recorded: false,
             double: None,
+            title: "",
         };
         window.redraw()?;
         Ok(window)
@@ -227,7 +231,20 @@ impl SettingsWindow {
         self.laid = page::lay_out(&self.panel.page(), width, &|text| painter.measure(text));
         self.panel.fit(self.laid.height, height);
         let panel = &self.panel;
-        painter.draw(&self.laid, panel.scroll(), &|target| panel.look(target))
+        let drawn = painter.draw(&self.laid, panel.scroll(), &|target| panel.look(target));
+        self.retitle();
+        drawn
+    }
+
+    /// Names the window in the page's language, when that changed.
+    fn retitle(&mut self) {
+        let title = self.panel.title();
+        if title != self.title {
+            // SAFETY: a plain call on a live window; the WM_SETTEXT it
+            // sends finds the app state borrowed and goes to Windows.
+            let _ = unsafe { SetWindowTextW(self.hwnd, &HSTRING::from(title)) };
+            self.title = title;
+        }
     }
 
     /// Redraws, telling of a failure rather than handing it on: a frame
@@ -485,7 +502,11 @@ impl App {
             },
             settings::written,
         );
-        Some(Panel::new(file, self.starts()))
+        Some(Panel::new(
+            file,
+            self.starts(),
+            self.services.windows_language,
+        ))
     }
 
     /// Whether hyalo starts with Windows; `None` where it may not.
@@ -580,13 +601,14 @@ impl App {
     }
 }
 
-/// The title of the folder picker for a list.
-fn picking(list: List) -> &'static str {
-    match list {
-        List::Exclude => "Leave a folder out of the index",
-        List::RankLower => "Rank a folder lower",
-        List::RankHigher => "Rank a folder higher",
-    }
+/// The title of the folder picker for a list, in `language`.
+fn picking(list: List, language: Language) -> &'static str {
+    let title = match list {
+        List::Exclude => Text::PickExclude,
+        List::RankLower => Text::PickLower,
+        List::RankHigher => Text::PickHigher,
+    };
+    language.say(title)
 }
 
 /// Carries out what the panel said to do. Called with no app state
@@ -631,7 +653,8 @@ fn pick(hwnd: HWND, list: List) {
     let Some(picker) = with_app(|app| Rc::clone(&app.services.picker)) else {
         return;
     };
-    if let Some(path) = picker.pick(hwnd, picking(list)) {
+    let language = ours(hwnd, |window| window.panel.language()).unwrap_or_default();
+    if let Some(path) = picker.pick(hwnd, picking(list, language)) {
         with_app(|app| app.change(Change::Add(list, path)));
     }
 }
@@ -744,8 +767,8 @@ mod tests {
         VK_SPACE, VK_TAB, VK_V, VK_X,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
-        GWL_EXSTYLE, GWL_STYLE, GetWindowLongPtrW, IsWindow, IsWindowVisible, SendMessageW,
-        WM_HOTKEY, WS_CAPTION, WS_EX_TOOLWINDOW,
+        GWL_EXSTYLE, GWL_STYLE, GetWindowLongPtrW, GetWindowTextW, IsWindow, IsWindowVisible,
+        SendMessageW, WM_HOTKEY, WS_CAPTION, WS_EX_TOOLWINDOW,
     };
 
     use super::super::tests::{
@@ -1123,6 +1146,51 @@ mod tests {
                 !settings.takes(WM_SYSCHAR, usize::from(b' ')),
                 "the next Alt+Space does"
             );
+        });
+    }
+
+    /// The window's title, as Windows has it.
+    fn title(hwnd: HWND) -> String {
+        let mut title = [0_u16; 64];
+        let length = unsafe { GetWindowTextW(hwnd, &mut title) };
+        String::from_utf16_lossy(&title[..length as usize])
+    }
+
+    #[test]
+    fn choosing_russian_writes_it_and_the_window_and_the_tray_speak_it() {
+        on_hidden_desktop(|| {
+            let setup = set_up("settings-window-language", DEFAULT, None);
+            let settings = setup.settings();
+            assert_eq!(title(settings.0), "hyalo settings");
+            assert!(settings.shows("Hotkey"));
+            settings.click(Target::Language(Language::Russian));
+            let russian = config::default_file(Language::Russian);
+            assert_eq!(setup.file(), russian);
+            assert!(settings.shows("Сочетание клавиш"));
+            assert_eq!(title(settings.0), "Параметры hyalo");
+            setup
+                .launcher
+                .pump_until(|app| app.language() == Language::Russian);
+            setup.launcher.tray(super::super::WM_CONTEXTMENU, (0, 0));
+            let menus = setup.taskbar.menus.borrow();
+            let (lines, _) = menus.last().expect("a menu");
+            let exit = lines.iter().any(|line| match line {
+                tray::Line::Entry(entry) => entry.label == "Выход",
+                tray::Line::Separator => false,
+            });
+            assert!(exit);
+        });
+    }
+
+    #[test]
+    fn the_picker_asks_in_the_pages_language() {
+        on_hidden_desktop(|| {
+            let text = config::default_file(Language::Russian);
+            let setup = set_up("settings-window-picker-russian", &text, None);
+            let settings = setup.settings();
+            settings.click(Target::Pick(List::RankHigher));
+            let asked = setup.chooser.asked.borrow().clone();
+            assert_eq!(asked, ["Папка, файлы из которой показывать выше"]);
         });
     }
 
