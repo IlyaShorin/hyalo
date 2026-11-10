@@ -5,7 +5,7 @@
 
 use std::fs::{File, OpenOptions};
 use std::os::windows::fs::OpenOptionsExt;
-use std::process::Command;
+use std::process::{Command, Output};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
@@ -74,11 +74,7 @@ pub fn in_own_window_station(name: &str, test: impl FnOnce()) {
         test();
         return;
     }
-    let output = Command::new(std::env::current_exe().expect("the test binary"))
-        .args([name, "--exact", "--nocapture", "--test-threads=1"])
-        .env(OWN_STATION, "1")
-        .output()
-        .expect("run the test in a child process");
+    let output = alone(name, OWN_STATION);
     let out = String::from_utf8_lossy(&output.stdout);
     let err = String::from_utf8_lossy(&output.stderr);
     let ran = out.contains("1 passed");
@@ -86,6 +82,40 @@ pub fn in_own_window_station(name: &str, test: impl FnOnce()) {
         output.status.success() && ran,
         "{name} in its own window station:\n{out}\n{err}"
     );
+}
+
+/// Set in a child process that runs one test and then exits.
+const EXITING: &str = "HYALO_TEST_EXITING";
+
+/// The exit code of a child process that runs `test` on the hidden
+/// desktop and then exits from that same thread, as hyalo does when
+/// `main` returns: what the thread still holds goes only as the process
+/// exits, after Windows has stopped every other thread. A test thread
+/// that ends cleans up while the rest of the process still runs, so only
+/// a process that exits shows what that costs. `name` is the test's path;
+/// the child runs that test alone. The child's output is shown only when
+/// the test fails.
+pub fn exit_code_on_hidden_desktop(name: &str, test: impl FnOnce() + Send + 'static) -> i32 {
+    if std::env::var_os(EXITING).is_some() {
+        on_hidden_desktop(|| {
+            test();
+            std::process::exit(0);
+        });
+    }
+    let output = alone(name, EXITING);
+    let out = String::from_utf8_lossy(&output.stdout);
+    print!("{out}{}", String::from_utf8_lossy(&output.stderr));
+    assert!(out.contains("running 1 test"), "{name} did not run");
+    output.status.code().expect("an exit code")
+}
+
+/// Runs the test `name` alone in a child process with `flag` set.
+fn alone(name: &str, flag: &str) -> Output {
+    Command::new(std::env::current_exe().expect("the test binary"))
+        .args([name, "--exact", "--nocapture", "--test-threads=1"])
+        .env(flag, "1")
+        .output()
+        .expect("run the test in a child process")
 }
 
 /// Waits for this process's turn at `what` the whole session shares, and

@@ -1035,7 +1035,13 @@ extern "system" fn wndproc(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPA
         // No WM_PAINT: the picture lives in the DirectComposition swap chain
         // and survives without one; DefWindowProc validates the window.
         WM_DESTROY => {
-            with_app(App::close);
+            // The app goes with its window, its renderer too. Left on the
+            // thread until the process exits, the D3D device would be
+            // released only after Windows has stopped every other thread,
+            // and that release ends the process with 0x87A instead of 0.
+            if let Some(mut app) = take_app() {
+                app.close();
+            }
             unsafe { PostQuitMessage(0) };
             handled(Ok(()))
         }
@@ -1500,6 +1506,14 @@ fn with_app<R>(f: impl FnOnce(&mut App) -> R) -> Option<R> {
     .flatten()
 }
 
+/// Takes the app state off the thread, unless it is borrowed further up
+/// the stack or already gone.
+fn take_app() -> Option<App> {
+    APP.try_with(|cell| cell.try_borrow_mut().ok()?.take())
+        .ok()
+        .flatten()
+}
+
 #[cfg(test)]
 mod tests {
     use std::cell::RefCell;
@@ -1526,7 +1540,9 @@ mod tests {
     use crate::autostart;
     use crate::render::Frame;
     use crate::scratch::Scratch;
-    use crate::test_desktop::{in_own_window_station, on_hidden_desktop};
+    use crate::test_desktop::{
+        exit_code_on_hidden_desktop, in_own_window_station, on_hidden_desktop,
+    };
     use std::path::Path;
 
     fn app(title: &str) -> Item {
@@ -2831,6 +2847,17 @@ mod tests {
             let quit = unsafe { PeekMessageW(&mut message, None, WM_QUIT, WM_QUIT, PM_REMOVE) };
             assert!(quit.as_bool());
         });
+    }
+
+    #[test]
+    fn hyalo_exits_with_zero_once_its_shown_window_has_closed() {
+        let name = "window::tests::hyalo_exits_with_zero_once_its_shown_window_has_closed";
+        let code = exit_code_on_hidden_desktop(name, || {
+            // Shown: drawn, so it has a renderer.
+            let hwnd = open(services(listing(&[]).0, None).0, true).expect("open the launcher");
+            unsafe { SendMessageW(hwnd, WM_CLOSE, None, None) };
+        });
+        assert_eq!(code, 0, "exit code {code:#X}");
     }
 
     #[test]
