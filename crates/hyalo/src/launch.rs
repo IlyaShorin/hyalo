@@ -26,6 +26,7 @@ pub fn run(action: &Action, as_admin: bool) -> Result<()> {
         Action::Open(target) => open(target, as_admin),
         Action::Launch { program, arguments } => execute(program, Some(arguments), verb(as_admin)),
         Action::Reveal(path) => reveal(path),
+        Action::System(command) => crate::system::run(*command),
         Action::CopyText(text) => copy(text),
         Action::Edit(path) => edit(path),
         // The launcher opens its own window; there is nothing to run.

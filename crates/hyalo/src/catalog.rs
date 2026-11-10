@@ -57,6 +57,9 @@ pub type FileIcons = Arc<dyn Fn(&[ItemId], u32, &dyn Fn(Found)) + Send + Sync>;
 pub struct Catalog {
     /// What the apps provider lists.
     pub items: Vec<Item>,
+    /// Windows' own settings and the system commands, in the language in
+    /// force.
+    pub system: Vec<Item>,
     pub icons: HashMap<ItemId, Icon>,
     /// Files and folders picked before, ranked with the items so that
     /// frecency lifts them however many files match as well.

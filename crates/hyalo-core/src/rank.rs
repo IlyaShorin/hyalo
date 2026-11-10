@@ -83,7 +83,7 @@ fn kind_weight(kind: Kind) -> f64 {
         Kind::Folder => 1,
         // Windows' settings rank like apps: a page should not drown
         // under files.
-        Kind::App | Kind::Setting => 2,
+        Kind::App | Kind::Setting | Kind::Command => 2,
         // A notice is never ranked; it goes first, as an answer does.
         Kind::Calculator | Kind::Notice => 3,
     };
@@ -249,16 +249,17 @@ mod tests {
     }
 
     #[test]
-    fn a_windows_setting_ranks_like_an_app() {
+    fn a_windows_setting_and_a_system_command_rank_like_an_app() {
         let items = [
             item("file", "Sound", Kind::File),
             item("setting", "Sound", Kind::Setting),
+            item("command", "Sound", Kind::Command),
             item("folder", "Sound", Kind::Folder),
             item("app", "Sound", Kind::App),
         ];
         assert_eq!(
             order("sound", &items, &Frecency::default()),
-            ["setting", "app", "folder", "file"]
+            ["setting", "command", "app", "folder", "file"]
         );
     }
 

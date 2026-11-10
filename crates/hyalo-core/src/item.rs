@@ -5,6 +5,9 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::system_commands::Command;
+use crate::text::Text;
+
 /// One row in the results list.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Item {
@@ -38,6 +41,8 @@ pub enum Kind {
     /// One of Windows' own settings: a page of the Settings app or a
     /// Control Panel item.
     Setting,
+    /// A system command, such as Restart.
+    Command,
     /// What hyalo tells the user, such as a mistake in the config: never
     /// ranked, never remembered as a pick.
     Notice,
@@ -51,6 +56,8 @@ pub enum Action {
     /// Start `program` with `arguments`, such as
     /// `rundll32.exe sysdm.cpl,EditEnvironmentVariables`.
     Launch { program: String, arguments: String },
+    /// Carry out a system command, such as restarting.
+    System(Command),
     /// Open the folder a file or folder is in, with it selected.
     Reveal(String),
     /// Put the text on the clipboard, such as a calculator answer.
@@ -60,6 +67,18 @@ pub enum Action {
     /// Open a text file, such as the config, in the app Windows has for
     /// its kind, or in Notepad when there is none.
     Edit(String),
+}
+
+impl Action {
+    /// What the row says after the first Enter, for an action that asks
+    /// before it runs (a system command such as Restart); `None` for one
+    /// that runs at once.
+    pub fn asking(&self) -> Option<Text> {
+        match self {
+            Action::System(command) => command.asking(),
+            _ => None,
+        }
+    }
 }
 
 impl Item {
@@ -120,6 +139,17 @@ mod tests {
     fn something_at_the_root_of_a_drive_lives_in_the_drive_itself() {
         let file = Item::file(r"C:\pagefile.sys".to_string(), false);
         assert_eq!(file.subtitle, r"C:\");
+    }
+
+    #[test]
+    fn only_a_system_command_that_asks_first_asks() {
+        let restart = Action::System(Command::Restart);
+        assert_eq!(restart.asking(), Some(Text::AskRestart));
+        assert_eq!(Action::System(Command::Lock).asking(), None);
+        assert_eq!(
+            Action::Open("ms-settings:display".to_string()).asking(),
+            None
+        );
     }
 
     #[test]

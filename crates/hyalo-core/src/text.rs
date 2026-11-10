@@ -124,6 +124,28 @@ table! {
     WindowsSettings => "Settings", "Параметры Windows";
     /// The second line of a Control Panel item.
     ControlPanel => "Control Panel", "Панель управления";
+    /// The second line of a system command.
+    SystemCommand => "System command", "Системная команда";
+    Lock => "Lock", "Заблокировать";
+    Sleep => "Sleep", "Спящий режим";
+    Hibernate => "Hibernate", "Гибернация";
+    Restart => "Restart", "Перезагрузка";
+    ShutDown => "Shut down", "Завершение работы";
+    SignOut => "Sign out", "Выйти";
+    EmptyRecycleBin => "Empty Recycle Bin", "Очистить корзину";
+    /// A system command's second line after the first Enter.
+    AskSleep => "Press Enter again to sleep",
+        "Нажмите Enter ещё раз, чтобы перевести компьютер в спящий режим";
+    AskHibernate => "Press Enter again to hibernate",
+        "Нажмите Enter ещё раз, чтобы перевести компьютер в гибернацию";
+    AskRestart => "Press Enter again to restart",
+        "Нажмите Enter ещё раз, чтобы перезагрузить компьютер";
+    AskShutDown => "Press Enter again to shut down",
+        "Нажмите Enter ещё раз, чтобы выключить компьютер";
+    AskSignOut => "Press Enter again to sign out",
+        "Нажмите Enter ещё раз, чтобы выйти из системы";
+    AskEmptyRecycleBin => "Press Enter again to empty the Recycle Bin",
+        "Нажмите Enter ещё раз, чтобы очистить корзину";
     /// An amount, its currency, the target, the rates' date.
     Currency => "{0} {1} → {2} · Bank of Russia, {3} · Enter to copy",
         "{0} {1} → {2} · Банк России, {3} · Enter — скопировать";

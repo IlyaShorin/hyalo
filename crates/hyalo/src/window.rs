@@ -24,6 +24,7 @@ use hyalo_core::places::Places;
 use hyalo_core::rank::Ranked;
 use hyalo_core::text::{Language, Text};
 use hyalo_core::update::{Checked, Failure, Progress, Release, Update};
+use hyalo_core::{system_commands, system_settings};
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Globalization::GetUserDefaultUILanguage;
 use windows::Win32::Graphics::Dwm::{
@@ -73,7 +74,7 @@ use crate::results::{self, Listed, MAX_ROWS, Results};
 use crate::settings::{self, Loaded};
 use crate::tray::{self, Tray};
 use crate::update::Updates;
-use crate::{http, launch, rates, store, update};
+use crate::{http, launch, rates, store, system, update};
 
 mod settings_window;
 
@@ -153,6 +154,8 @@ pub struct Services {
     /// Where newer releases come from and how one is installed; `None`
     /// where hyalo does not update itself, as in a debug build.
     pub updates: Option<Updates>,
+    /// Whether Windows has hibernation turned on, so Hibernate is listed.
+    pub hibernates: bool,
 }
 
 impl Services {
@@ -201,6 +204,7 @@ impl Services {
             // SAFETY: a plain call.
             windows_language: Language::of_windows(unsafe { GetUserDefaultUILanguage() }),
             updates: Updates::real(),
+            hibernates: system::hibernates(),
         }
     }
 }
@@ -340,6 +344,7 @@ impl App {
         self.find_if_stale();
         self.config = config;
         self.check_for_update();
+        self.catalog.system = system_rows(self.language(), self.services.hibernates);
     }
 
     /// Tells the sources that walk folders what to leave out; what one of
@@ -643,7 +648,11 @@ impl App {
     /// or after a double-click selects everything; on a row, the row is
     /// opened when the button comes up over it.
     fn press(&mut self, point: POINT, shift: bool) -> Result<()> {
-        let (pressed, edited) = match self.part_at(point) {
+        let part = self.part_at(point);
+        if !matches!(part, Part::Row(_)) {
+            self.calm()?;
+        }
+        let (pressed, edited) = match part {
             Part::Text if self.third(point) => (None, self.query.apply(Edit::SelectAll)),
             Part::Text => (Some(Press::Text), self.place(point, shift)),
             Part::Row(row) => (Some(Press::Row(row)), Edited::Nothing),
@@ -721,8 +730,31 @@ impl App {
             return false;
         }
         self.results.select(row);
-        self.act(Command::Open { as_admin: false });
-        true
+        let asked = self.enter(Command::Open { as_admin: false });
+        !asked.unwrap_or_else(|error| {
+            eprintln!("hyalo: {error}");
+            false
+        })
+    }
+
+    /// Enter on the selected row: opens it, unless it asks first and has
+    /// not asked yet; then it asks, in place. Whether it asked: the
+    /// launcher stays, waiting for the next Enter.
+    fn enter(&mut self, command: Command) -> Result<bool> {
+        if self.results.confirm() {
+            self.act(command);
+            return Ok(false);
+        }
+        self.redraw().map(|()| true)
+    }
+
+    /// Stops the selected row asking, as anything but Enter does, and
+    /// shows it.
+    fn calm(&mut self) -> Result<()> {
+        match self.results.calm() {
+            true => self.redraw(),
+            false => Ok(()),
+        }
     }
 
     /// Carries out what `command` does with the selected row and notes
@@ -828,7 +860,12 @@ impl App {
     /// items and files.
     fn listed(&self) -> Results {
         let query = self.query.text();
-        let items = self.catalog.items.iter().chain(&self.catalog.picked);
+        let catalog = &self.catalog;
+        let items = catalog
+            .items
+            .iter()
+            .chain(&catalog.system)
+            .chain(&catalog.picked);
         let (frecency, places) = (&self.frecency, &self.places);
         let found = Results::search(query, items, self.file_hits(), frecency, places, now());
         let answer = match query.is_empty() {
@@ -947,10 +984,10 @@ fn scene<'a>(
     icons: &'a HashMap<ItemId, Icon>,
     language: Language,
 ) -> Scene<'a> {
-    let row = |listed: &'a Listed| Row {
+    let row = |(index, listed): (usize, &'a Listed)| Row {
         id: &listed.item.id,
         title: &listed.item.title,
-        subtitle: results::subtitle(&listed.item, language),
+        subtitle: results.subtitle(index, language),
         highlights: utf16_ranges(&listed.item.title, &listed.matched),
         icon: icons.get(&listed.item.id),
     };
@@ -959,9 +996,17 @@ fn scene<'a>(
         placeholder: language.say(Text::Placeholder),
         caret: query.caret_utf16(),
         selection: query.selection_utf16(),
-        rows: results.rows().iter().map(row).collect(),
+        rows: results.rows().iter().enumerate().map(row).collect(),
         selected: results.selected(),
     }
+}
+
+/// Windows' own settings and the system commands, in `language`; Hibernate
+/// only when Windows `hibernates`.
+fn system_rows(language: Language, hibernates: bool) -> Vec<Item> {
+    let mut rows = system_settings::items(language);
+    rows.extend(system_commands::items(language, hibernates));
+    rows
 }
 
 /// The time frecency counts in.
@@ -1466,18 +1511,18 @@ fn hide(hwnd: HWND) {
 /// it only when the row has a folder to show.
 fn on_key(hwnd: HWND, key: VIRTUAL_KEY) -> Result<()> {
     let held = held();
-    let moved = match keys::command(key, held) {
+    let command = keys::command(key, held);
+    if !matches!(command, Some(Command::Open { .. })) {
+        with_app(App::calm).unwrap_or(Ok(()))?;
+    }
+    let moved = match command {
         Some(Command::Up) => with_app(|app| app.move_selection(Results::up)),
         Some(Command::Down) => with_app(|app| app.move_selection(Results::down)),
         Some(Command::Hide) => {
             hide(hwnd);
             None
         }
-        Some(command @ Command::Open { .. }) => {
-            with_app(|app| app.act(command));
-            hide(hwnd);
-            None
-        }
+        Some(command @ Command::Open { .. }) => return on_enter(hwnd, command),
         Some(command) => {
             if with_app(|app| app.act(command)) == Some(true) {
                 hide(hwnd);
@@ -1487,6 +1532,16 @@ fn on_key(hwnd: HWND, key: VIRTUAL_KEY) -> Result<()> {
         None => return on_field_key(hwnd, field::key(key, held)),
     };
     moved.unwrap_or(Ok(()))
+}
+
+/// Enter: opens the selected row and hides the launcher, even with
+/// nothing to open, unless the row asked first.
+fn on_enter(hwnd: HWND, command: Command) -> Result<()> {
+    let asked = with_app(|app| app.enter(command)).transpose()?;
+    if asked != Some(true) {
+        hide(hwnd);
+    }
+    Ok(())
 }
 
 /// A key that edits the query or copies from it; Ctrl+C that copied a
@@ -1646,8 +1701,8 @@ mod tests {
     use windows::Win32::Graphics::Dwm::DwmGetWindowAttribute;
     use windows::Win32::Graphics::Gdi::MonitorFromWindow;
     use windows::Win32::UI::Input::KeyboardAndMouse::{
-        SetKeyboardState, VK_A, VK_C, VK_DELETE, VK_DOWN, VK_END, VK_ESCAPE, VK_HOME, VK_LEFT,
-        VK_RETURN, VK_RIGHT, VK_UP, VK_V, VK_X,
+        SetKeyboardState, VK_A, VK_BACK, VK_C, VK_DELETE, VK_DOWN, VK_END, VK_ESCAPE, VK_HOME,
+        VK_LEFT, VK_RETURN, VK_RIGHT, VK_UP, VK_V, VK_X,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
         GetClientRect, GetCursor, GetWindowRect, IsWindow, PM_QS_POSTMESSAGE, PM_REMOVE,
@@ -1810,6 +1865,7 @@ mod tests {
             position: None,
             windows_language: Language::English,
             updates: None,
+            hibernates: true,
         };
         (services, ran)
     }
@@ -2715,7 +2771,8 @@ mod tests {
         on_hidden_desktop(|| {
             let launcher = Launcher::open();
             let empty = placeholder_glare(&launcher.frame());
-            launcher.type_text("a");
+            // Letters nothing is found by, so the bar stays alone.
+            launcher.type_text("zqx");
             let typed = placeholder_glare(&launcher.frame());
             assert!(
                 empty > typed.saturating_add(40),
@@ -3034,8 +3091,9 @@ mod tests {
     #[test]
     fn the_arrows_move_the_selection_and_wrap() {
         on_hidden_desktop(|| {
-            let launcher = Launcher::listing(&["a1", "a2", "a3"]);
-            launcher.type_text("a");
+            // Titles no Windows setting matches as well, so three rows.
+            let launcher = Launcher::listing(&["zq1", "zq2", "zq3"]);
+            launcher.type_text("zq");
             assert_eq!(launcher.lit_row(3), 0);
             launcher.press(VK_DOWN);
             assert_eq!(launcher.lit_row(3), 1);
@@ -3468,6 +3526,141 @@ mod tests {
             launcher.press(VK_RETURN);
             assert!(ran.borrow().is_empty());
             assert!(!launcher.visible());
+        });
+    }
+
+    /// The first row's title and second line, as the window shows them.
+    fn first_shown() -> (String, String) {
+        let shown = with_app(|app| {
+            let row = &app.results.rows()[0];
+            let said = app.results.subtitle(0, app.language());
+            (row.item.title.clone(), said.to_string())
+        });
+        shown.expect("app state")
+    }
+
+    fn restart() -> (Action, bool) {
+        (Action::System(system_commands::Command::Restart), false)
+    }
+
+    #[test]
+    fn a_windows_setting_is_listed_by_name_and_enter_opens_it() {
+        on_hidden_desktop(|| {
+            let (launcher, ran) = Launcher::listing_with(&["Notepad"], None);
+            launcher.type_text("bluetooth");
+            let bluetooth = ("Bluetooth & devices".to_string(), "Settings".to_string());
+            assert_eq!(first_shown(), bluetooth);
+            launcher.press(VK_RETURN);
+            let opened = Action::Open("ms-settings:bluetooth".to_string());
+            assert_eq!(*ran.borrow(), [(opened, false)]);
+            assert!(!launcher.visible());
+        });
+    }
+
+    #[test]
+    fn a_control_panel_item_is_found_by_its_russian_name_too() {
+        on_hidden_desktop(|| {
+            let (launcher, ran) = Launcher::listing_with(&[], None);
+            launcher.type_text("переменные среды");
+            let names = (
+                "Environment Variables".to_string(),
+                "Control Panel".to_string(),
+            );
+            assert_eq!(first_shown(), names);
+            launcher.press(VK_RETURN);
+            let variables = Action::Launch {
+                program: "rundll32.exe".to_string(),
+                arguments: "sysdm.cpl,EditEnvironmentVariables".to_string(),
+            };
+            assert_eq!(*ran.borrow(), [(variables, false)]);
+        });
+    }
+
+    #[test]
+    fn enter_on_restart_asks_in_place_and_the_next_enter_restarts() {
+        on_hidden_desktop(|| {
+            let (launcher, ran) = Launcher::listing_with(&[], None);
+            launcher.type_text("restart");
+            assert_eq!(first_shown().1, "System command");
+            launcher.press(VK_RETURN);
+            assert!(ran.borrow().is_empty(), "not yet");
+            assert!(launcher.visible());
+            assert_eq!(first_shown().1, "Press Enter again to restart");
+            launcher.press(VK_RETURN);
+            assert_eq!(*ran.borrow(), [restart()]);
+            assert!(!launcher.visible());
+        });
+    }
+
+    #[test]
+    fn lock_runs_at_the_first_enter() {
+        on_hidden_desktop(|| {
+            let (launcher, ran) = Launcher::listing_with(&[], None);
+            launcher.type_text("lock");
+            launcher.press(VK_RETURN);
+            let lock = Action::System(system_commands::Command::Lock);
+            assert_eq!(*ran.borrow(), [(lock, false)]);
+            assert!(!launcher.visible());
+        });
+    }
+
+    #[test]
+    fn any_key_but_enter_stops_the_asking() {
+        on_hidden_desktop(|| {
+            let (launcher, ran) = Launcher::listing_with(&[], None);
+            launcher.type_text("restart");
+            for key in [VK_DOWN, VK_UP, VK_LEFT, VK_BACK] {
+                launcher.press(VK_RETURN);
+                assert_eq!(first_shown().1, "Press Enter again to restart", "{key:?}");
+                launcher.press(key);
+                assert_eq!(first_shown().1, "System command", "{key:?}");
+            }
+            launcher.press(VK_RETURN);
+            assert!(ran.borrow().is_empty(), "each Enter asked anew");
+            assert!(launcher.visible());
+        });
+    }
+
+    #[test]
+    fn typing_or_hiding_stops_the_asking() {
+        on_hidden_desktop(|| {
+            let (launcher, ran) = Launcher::listing_with(&[], None);
+            launcher.type_text("restar");
+            launcher.press(VK_RETURN);
+            launcher.type_text("t");
+            assert_eq!(first_shown().1, "System command");
+            launcher.press(VK_RETURN);
+            launcher.press(VK_ESCAPE);
+            launcher.hotkey();
+            launcher.type_text("restart");
+            launcher.press(VK_RETURN);
+            assert!(ran.borrow().is_empty());
+            assert_eq!(first_shown().1, "Press Enter again to restart");
+        });
+    }
+
+    #[test]
+    fn a_click_on_restart_asks_and_a_second_click_restarts() {
+        on_hidden_desktop(|| {
+            let (launcher, ran) = Launcher::listing_with(&[], None);
+            launcher.type_text("restart");
+            launcher.click(200.0, middle_of(0));
+            assert!(ran.borrow().is_empty());
+            assert!(launcher.visible());
+            launcher.click(200.0, middle_of(0));
+            assert_eq!(*ran.borrow(), [restart()]);
+            assert!(!launcher.visible());
+        });
+    }
+
+    #[test]
+    fn a_click_in_the_query_stops_the_asking() {
+        on_hidden_desktop(|| {
+            let launcher = Launcher::listing(&[]);
+            launcher.type_text("restart");
+            launcher.press(VK_RETURN);
+            launcher.click(60.0, layout::BAR_HEIGHT / 2.0);
+            assert_eq!(first_shown().1, "System command");
         });
     }
 
