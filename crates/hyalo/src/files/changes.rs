@@ -104,17 +104,22 @@ pub fn changes(records: &[Record]) -> Vec<Change> {
                 None => Change::Removed(record.path.clone()),
             },
         };
-        if let (Some(Change::Touched(before, _)), Change::Touched(path, _)) =
-            (changes.last(), &change)
-            && before == path
-        {
-            changes.pop();
-        }
-        if changes.last() != Some(&change) {
-            changes.push(change);
-        }
+        then(&mut changes, change);
     }
     changes
+}
+
+/// Puts `change` after `changes`, unless it is just like the last; one
+/// of size or time takes the place of one just before it for that name.
+fn then(changes: &mut Vec<Change>, change: Change) {
+    if let (Some(Change::Touched(before, _)), Change::Touched(path, _)) = (changes.last(), &change)
+        && before == path
+    {
+        changes.pop();
+    }
+    if changes.last() != Some(&change) {
+        changes.push(change);
+    }
 }
 
 /// Makes `change` in the index; the folder to walk if it brought one,

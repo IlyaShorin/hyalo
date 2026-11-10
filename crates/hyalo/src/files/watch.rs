@@ -339,41 +339,69 @@ fn records(bytes: &[u8], top: &str) -> Vec<Record> {
 /// The record at the start of `entry`, if hyalo knows its kind, and how
 /// far on the next one starts (0: none); `None` if it is cut short.
 fn record(entry: &[u8], top: &str) -> Option<(Option<Record>, usize)> {
-    let field = |at: usize| Some(u32::from_ne_bytes(*entry.get(at..at + 4)?.as_array()?));
-    let wide = |at: usize| Some(i64::from_ne_bytes(*entry.get(at..at + 8)?.as_array()?));
-    let size = wide(offset_of!(FILE_NOTIFY_EXTENDED_INFORMATION, FileSize))?;
-    let written = wide(offset_of!(
-        FILE_NOTIFY_EXTENDED_INFORMATION,
-        LastModificationTime
-    ))?;
-    let stat = Stat {
-        size: size.max(0) as u64,
-        written: unix_seconds(written),
-    };
-    let next = field(offset_of!(
-        FILE_NOTIFY_EXTENDED_INFORMATION,
-        NextEntryOffset
-    ))?;
-    let action = field(offset_of!(FILE_NOTIFY_EXTENDED_INFORMATION, Action))?;
-    let attributes = field(offset_of!(FILE_NOTIFY_EXTENDED_INFORMATION, FileAttributes))?;
-    let tag = field(offset_of!(FILE_NOTIFY_EXTENDED_INFORMATION, Anonymous))?;
-    let length = field(offset_of!(FILE_NOTIFY_EXTENDED_INFORMATION, FileNameLength))? as usize;
-    let name = entry.get(NAME..NAME + length)?.as_chunks::<2>().0;
-    let name = String::from_utf16(
-        &name
-            .iter()
-            .map(|&unit| u16::from_ne_bytes(unit))
-            .collect::<Vec<_>>(),
-    );
+    let next = u32_at(
+        entry,
+        offset_of!(FILE_NOTIFY_EXTENDED_INFORMATION, NextEntryOffset),
+    )?;
+    let action = u32_at(entry, offset_of!(FILE_NOTIFY_EXTENDED_INFORMATION, Action))?;
+    let (kind, stat, name) = (kind_in(entry)?, stat_in(entry)?, name_in(entry)?);
     let record = action_of(FILE_ACTION(action))
-        .zip(name.ok())
+        .zip(name)
         .map(|(action, name)| Record {
             action,
             path: format!("{top}\\{name}"),
-            kind: Kind::of(attributes, tag),
+            kind,
             stat,
         });
     Some((record, next as usize))
+}
+
+/// The four bytes at `at`, as a number.
+fn u32_at(entry: &[u8], at: usize) -> Option<u32> {
+    Some(u32::from_ne_bytes(*entry.get(at..at + 4)?.as_array()?))
+}
+
+/// The eight bytes at `at`, as a number.
+fn i64_at(entry: &[u8], at: usize) -> Option<i64> {
+    Some(i64::from_ne_bytes(*entry.get(at..at + 8)?.as_array()?))
+}
+
+/// What the record says the name is, by its attributes.
+fn kind_in(entry: &[u8]) -> Option<Kind> {
+    let attributes = u32_at(
+        entry,
+        offset_of!(FILE_NOTIFY_EXTENDED_INFORMATION, FileAttributes),
+    )?;
+    let tag = u32_at(
+        entry,
+        offset_of!(FILE_NOTIFY_EXTENDED_INFORMATION, Anonymous),
+    )?;
+    Some(Kind::of(attributes, tag))
+}
+
+/// The size and last write the record gives.
+fn stat_in(entry: &[u8]) -> Option<Stat> {
+    let size = i64_at(
+        entry,
+        offset_of!(FILE_NOTIFY_EXTENDED_INFORMATION, FileSize),
+    )?;
+    let at = offset_of!(FILE_NOTIFY_EXTENDED_INFORMATION, LastModificationTime);
+    Some(Stat {
+        size: size.max(0) as u64,
+        written: unix_seconds(i64_at(entry, at)?),
+    })
+}
+
+/// The record's name, unless it is not valid Unicode; `None` if it is
+/// cut short.
+fn name_in(entry: &[u8]) -> Option<Option<String>> {
+    let length = u32_at(
+        entry,
+        offset_of!(FILE_NOTIFY_EXTENDED_INFORMATION, FileNameLength),
+    )?;
+    let units = entry.get(NAME..NAME + length as usize)?.as_chunks::<2>().0;
+    let units: Vec<u16> = units.iter().map(|&unit| u16::from_ne_bytes(unit)).collect();
+    Some(String::from_utf16(&units).ok())
 }
 
 fn action_of(action: FILE_ACTION) -> Option<Action> {
