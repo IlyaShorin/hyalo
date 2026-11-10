@@ -210,10 +210,14 @@ impl Walk<'_> {
         prune(shared, self.excluded, report);
         let roots = (self.roots)();
         let (sender, events) = mpsc::channel();
-        let tell = |sender: mpsc::Sender<Event>| Box::new(move |event| sender.send(event).is_ok());
+        // Each root's events say which root they are about.
+        let tell = |sender: mpsc::Sender<(usize, Event)>, root: usize| {
+            Box::new(move |event| sender.send((root, event)).is_ok())
+        };
         let watches: Vec<Watch> = roots
             .iter()
-            .map(|root| Watch::start(root, tell(sender.clone())))
+            .enumerate()
+            .map(|(at, root)| Watch::start(root, tell(sender.clone(), at)))
             .collect();
         self.walk(shared, &roots, report);
         self.follow(shared, &roots, &events, report);
@@ -229,15 +233,15 @@ impl Walk<'_> {
     }
 
     /// Keeps the index in step with what the watches see, until nobody
-    /// but the provider holds it: changes as they come, a walk of every
-    /// root when a watch lost track, what is excluded as it changes. Tells
+    /// but the provider holds it: changes as they come, a walk of a root
+    /// whose watch lost track, what is excluded as it changes. Tells
     /// the window, and saves the snapshot, now and then when the index
     /// changed, and once more at the end.
     fn follow(
         &self,
         shared: &Arc<RwLock<Index>>,
         roots: &[PathBuf],
-        events: &Receiver<Event>,
+        events: &Receiver<(usize, Event)>,
         report: &dyn Fn(Found),
     ) {
         let version = read(shared).version();
@@ -250,9 +254,9 @@ impl Walk<'_> {
             // Out of the match, which would hold the lock through it.
             let patience = kept.patience(read(shared).version());
             match events.recv_timeout(patience) {
-                Ok(Event::Changed(records)) => self.take(shared, &records),
-                Ok(Event::Lost) => {
-                    self.walk(shared, roots, report);
+                Ok((_, Event::Changed(records))) => self.take(shared, &records),
+                Ok((root, Event::Lost)) => {
+                    self.rewalk(shared, &roots[root]);
                     kept.saved = Mark::new(read(shared).version());
                 }
                 Err(_) => {}
@@ -272,6 +276,18 @@ impl Walk<'_> {
         {
             save_to(shared, self.snapshot);
         }
+    }
+
+    /// Walks `root` again into an index of its own and puts what it found
+    /// in place of what the index held of it; takes out what is excluded,
+    /// and saves the snapshot. The other roots stay as they are.
+    fn rewalk(&self, shared: &RwLock<Index>, root: &Path) {
+        let fresh = RwLock::default();
+        walk(root, &fresh, self.excluded);
+        let fresh = fresh.into_inner().unwrap_or_else(PoisonError::into_inner);
+        write(shared).replace(&fresh);
+        prune(shared, self.excluded, &|_| {});
+        save_to(shared, self.snapshot);
     }
 
     /// Makes the changes `records` hold, then walks the folders they
@@ -1150,8 +1166,8 @@ mod tests {
     }
 
     #[test]
-    fn a_watch_that_lost_track_walks_again() {
-        let folder = Scratch::new("lost").with(&["before.txt"]);
+    fn a_watch_that_lost_track_walks_its_root_again_and_that_one_alone() {
+        let (lost, kept) = (Scratch::new("lost"), Scratch::new("lost-not"));
         let (files, writer) = Files::new();
         let excluded = Excluded::default();
         let walk = Walk {
@@ -1159,12 +1175,13 @@ mod tests {
             snapshot: None,
             excluded: &excluded,
         };
-        let roots = [folder.0.clone()];
+        let roots = [kept.0.clone(), lost.0.clone()];
         walk.walk(&writer.0, &roots, &|_| {});
-        // Made while nothing watches: only a walk finds it.
-        fs::write(folder.0.join("unseen.txt"), b"x").expect("write");
+        // Made while nothing watches: only a walk finds them.
+        fs::write(lost.0.join("unseen.txt"), b"x").expect("write");
+        fs::write(kept.0.join("unseen.txt"), b"x").expect("write");
         let (sender, events) = mpsc::channel();
-        sender.send(Event::Lost).expect("send");
+        sender.send((1, Event::Lost)).expect("send");
         // Searches until it finds, then lets the index go, which ends the
         // following.
         let searching = thread::spawn(move || {
@@ -1176,7 +1193,11 @@ mod tests {
         });
         walk.follow(&writer.0, &roots, &events, &|_| {});
         let found = searching.join().expect("the search");
-        assert_eq!(found, [folder.path("unseen.txt")]);
+        assert_eq!(
+            found,
+            [lost.path("unseen.txt")],
+            "the other root not walked"
+        );
     }
 
     #[test]
