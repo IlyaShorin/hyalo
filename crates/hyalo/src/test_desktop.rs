@@ -2,11 +2,14 @@
 //! mutator run) never flashes windows on screen or steals the user's focus.
 //! Tests that use the clipboard run in a child process with a window
 //! station of its own, so they never overwrite what the user copied.
+//! Tests that wait for the shell do it `within` a deadline, so a call
+//! that never returns fails its test instead of holding up the run.
 
 use std::fs::{File, OpenOptions};
 use std::os::windows::fs::OpenOptionsExt;
+use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 use std::process::{Command, Output};
-use std::sync::OnceLock;
+use std::sync::{OnceLock, mpsc};
 use std::time::{Duration, Instant};
 
 use windows::Win32::Foundation::GENERIC_ALL;
@@ -150,5 +153,79 @@ fn enter_own_window_station() {
         let station = CreateWindowStationW(PCWSTR::null(), 0, GENERIC_ALL.0, None)
             .expect("create a window station");
         SetProcessWindowStation(station).expect("enter the window station");
+    }
+}
+
+/// Runs `work` on a thread of its own and hands back what it returns, or
+/// fails the test if it has not returned within `deadline`. A test run
+/// waits for every test, and nothing kills a test: one call that never
+/// returns would hold up the run for good (the shell did, under eight
+/// test suites at once). The stuck thread is left; it ends with the
+/// process.
+#[track_caller]
+pub fn within<T: Send + 'static>(
+    deadline: Duration,
+    work: impl FnOnce() -> T + Send + 'static,
+) -> T {
+    let (answer, answered) = mpsc::channel();
+    std::thread::spawn(move || {
+        let outcome = catch_unwind(AssertUnwindSafe(work));
+        // The test may have given up and gone; then no one is listening.
+        let _ = answer.send(outcome);
+    });
+    let Ok(outcome) = answered.recv_timeout(deadline) else {
+        panic!("no answer within {deadline:?}; the work is left running");
+    };
+    outcome.unwrap_or_else(|panic| resume_unwind(panic))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::any::Any;
+
+    /// What a panic said.
+    fn said(panic: Box<dyn Any + Send>) -> String {
+        match panic.downcast::<String>() {
+            Ok(text) => *text,
+            Err(panic) => panic
+                .downcast::<&str>()
+                .map(|text| text.to_string())
+                .unwrap_or_default(),
+        }
+    }
+
+    #[test]
+    fn work_that_never_returns_fails_the_test_once_the_deadline_passes() {
+        // The stand-in waits for a word the test sends only after `within`
+        // has given up: as far as `within` can tell, it never returns.
+        let (release, held) = mpsc::channel::<()>();
+        let started = Instant::now();
+        let deadline = Duration::from_millis(200);
+        let outcome = catch_unwind(AssertUnwindSafe(|| within(deadline, move || held.recv())));
+        let waited = started.elapsed();
+        drop(release);
+        let panic = outcome.expect_err("the test fails");
+        assert_eq!(
+            said(panic),
+            "no answer within 200ms; the work is left running"
+        );
+        assert!(waited >= deadline, "gave up after {waited:?}");
+        assert!(waited < Duration::from_secs(5), "gave up after {waited:?}");
+    }
+
+    #[test]
+    fn what_the_work_returns_comes_back() {
+        assert_eq!(within(Duration::from_secs(5), || 42), 42);
+    }
+
+    #[test]
+    fn work_that_fails_fails_the_test_in_its_own_words() {
+        let fails = || -> u8 { panic!("Explorer is not listed") };
+        let outcome = catch_unwind(|| within(Duration::from_secs(5), fails));
+        assert_eq!(
+            said(outcome.expect_err("the test fails")),
+            "Explorer is not listed"
+        );
     }
 }

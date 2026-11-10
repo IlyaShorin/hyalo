@@ -138,6 +138,7 @@ pub fn stale(found_at: Option<Instant>, now: Instant, trusted: Duration) -> bool
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::apps::tests::shell;
     use hyalo_core::item::{Action, Kind};
     use std::cell::RefCell;
 
@@ -222,9 +223,8 @@ mod tests {
             ItemId(format!(r"{windows}\explorer.exe")),
             ItemId(format!(r"{windows}\no such file.exe")),
         ];
-        let found = RefCell::new(Vec::new());
-        file_icons(&ids, 32, &|piece| found.borrow_mut().push(piece));
-        let found = found.into_inner();
+        let asked = ids.clone();
+        let found = reported(move |report| file_icons(&asked, 32, report));
         assert_eq!(found.len(), 1, "one icon, none for what is not there");
         let icon = icon_of(&found, &ids[0].0).expect("explorer's icon");
         assert_eq!((icon.width, icon.height), (32, 32));
@@ -232,11 +232,26 @@ mod tests {
 
     const EXPLORER: &str = "Microsoft.Windows.Explorer";
 
-    /// Everything `find_apps` reports for `request`.
-    fn found(request: &Request) -> Vec<Found> {
-        let found = RefCell::new(Vec::new());
-        find_apps(request, &|piece| found.borrow_mut().push(piece));
-        found.into_inner()
+    /// Everything `find` reports, found with the shell, which has a
+    /// deadline (`apps::tests::shell`).
+    #[track_caller]
+    fn reported(find: impl FnOnce(&dyn Fn(Found)) + Send + 'static) -> Vec<Found> {
+        shell(move || {
+            let found = RefCell::new(Vec::new());
+            find(&|piece| found.borrow_mut().push(piece));
+            found.into_inner()
+        })
+    }
+
+    /// Everything `find_apps` reports when the window has the icons of
+    /// `known`.
+    #[track_caller]
+    fn found(known: HashSet<ItemId>) -> Vec<Found> {
+        let request = Request {
+            icon_size: 32,
+            known,
+        };
+        reported(move |report| find_apps(&request, report))
     }
 
     fn icon_of<'a>(found: &'a [Found], id: &str) -> Option<&'a Icon> {
@@ -248,18 +263,14 @@ mod tests {
 
     #[test]
     fn the_apps_provider_reports_the_apps_then_only_the_icons_not_known() {
-        let mut request = Request {
-            icon_size: 32,
-            known: HashSet::new(),
-        };
-        let first = found(&request);
+        let first = found(HashSet::new());
         let Some(Found::Items(items)) = first.first() else {
             panic!("the items come first");
         };
         assert!(items.iter().any(|item| item.id.0 == EXPLORER));
         let icon = icon_of(&first, EXPLORER).expect("Explorer's icon");
         assert_eq!((icon.width, icon.height), (32, 32));
-        request.known = items.iter().map(|item| item.id.clone()).collect();
-        assert_eq!(found(&request).len(), 1, "the items again, no icons");
+        let known = items.iter().map(|item| item.id.clone()).collect();
+        assert_eq!(found(known).len(), 1, "the items again, no icons");
     }
 }
