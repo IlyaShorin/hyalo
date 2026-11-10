@@ -144,6 +144,16 @@ table! {
     ChooseHotkey => "Choose another hotkey", "Выберите другое сочетание клавиш";
     /// What to do about a notice.
     OpenSettings => "{0} · Enter to open settings", "{0} · Enter — открыть параметры";
+    /// A newer release, by its version; also the name of its setting.
+    UpdateOut => "hyalo {0} is out", "Вышла hyalo {0}";
+    SeeWhatsNew => "See what is new and install it", "Посмотрите, что нового, и установите";
+    /// The release that did not install, and why.
+    NotInstalled => "hyalo {0} is not installed: {1}", "hyalo {0} не установлена: {1}";
+    /// The version that runs on.
+    KeepsVersion => "hyalo {0} keeps running", "Работает прежняя hyalo {0}";
+    /// The tray's line for a newer release, and while it installs.
+    InstallUpdate => "Install hyalo {0}", "Установить hyalo {0}";
+    Installing => "Installing hyalo {0}…", "Устанавливается hyalo {0}…";
 
     // The settings window.
     WindowTitle => "hyalo settings", "Параметры hyalo";
@@ -187,6 +197,19 @@ table! {
     PickExclude => "Leave a folder out of the index", "Папка, которую не индексировать";
     PickLower => "Rank a folder lower", "Папка, файлы из которой показывать ниже";
     PickHigher => "Rank a folder higher", "Папка, файлы из которой показывать выше";
+    Updates => "Updates", "Обновления";
+    /// The version that runs.
+    InstallHelp => "You have {0}: Install downloads it, checks it and restarts hyalo",
+        "У вас {0}: «Установить» скачает её, проверит и перезапустит hyalo";
+    InstallingHelp => "Downloading and checking it; hyalo restarts once it is in place",
+        "Скачивается и проверяется; затем hyalo перезапустится";
+    /// Why the update did not install.
+    FailedHelp => "Not installed: {0}", "Не установлена: {0}";
+    Install => "Install", "Установить";
+    CheckUpdates => "Check for updates", "Проверять обновления";
+    /// The version that runs.
+    CheckHelp => "You have hyalo {0}; GitHub is asked once a day, nothing installs by itself",
+        "У вас hyalo {0}; раз в день спрашивает GitHub, сама ничего не ставит";
 
     // What can be wrong.
     /// Why the file could not be saved, as Windows says it.
@@ -212,6 +235,12 @@ table! {
     NoKey => "no key after the modifiers in `{0}`", "в `{0}` нет клавиши после модификаторов";
     Bare => "`{0}` needs Ctrl, Alt or Win: only F1 to F24 do without",
         "к `{0}` нужно добавить Ctrl, Alt или Win: без них обходятся только F1–F24";
+    /// Why an update was not installed; the reasons as Windows says them.
+    DownloadFailed => "cannot download it: {0}", "не удалось скачать: {0}";
+    Mismatch => "the download is not the build its SHA-256 names",
+        "скачанный файл не совпадает со своей SHA-256";
+    SwapFailed => "cannot put it in place: {0}", "не удалось заменить файл: {0}";
+    StartFailed => "cannot start it: {0}", "не удалось запустить: {0}";
 }
 
 #[cfg(test)]
