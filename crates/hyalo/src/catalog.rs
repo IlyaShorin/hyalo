@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 
 use hyalo_core::item::{Item, ItemId};
 use hyalo_core::rates::Rates;
+use hyalo_core::system_settings;
 use hyalo_core::update::{Failure, Release};
 use windows::core::Result;
 
@@ -118,6 +119,34 @@ fn report_apps(request: &Request, report: &dyn Fn(Found)) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// The icons of Windows' settings the window lacks, from the shell: the
+/// Settings app's for each of its pages, found once, and each Control
+/// Panel item's own.
+pub fn find_system_icons(request: &Request, report: &dyn Fn(Found)) {
+    if let Err(error) = Com::init() {
+        eprintln!("hyalo: no icons for Windows' settings: {error}");
+        return;
+    }
+    let mut found: HashMap<&str, Icon> = HashMap::new();
+    for setting in system_settings::SETTINGS {
+        let id = setting.id();
+        if request.known.contains(&id) {
+            continue;
+        }
+        let icon = match found.get(setting.icon) {
+            Some(icon) => Ok(icon.clone()),
+            None => apps::icon_at(setting.icon, request.icon_size),
+        };
+        match icon {
+            Ok(icon) => {
+                found.insert(setting.icon, icon.clone());
+                report(Found::Icon(id, icon));
+            }
+            Err(error) => eprintln!("hyalo: no icon for {}: {error}", id.0),
+        }
+    }
 }
 
 /// The shell's icons for files and folders, one by one.
@@ -270,6 +299,35 @@ mod tests {
             Found::Icon(of, icon) if of.0 == id => Some(icon),
             _ => None,
         })
+    }
+
+    #[test]
+    fn every_windows_setting_gets_an_icon_once_and_none_it_has_already() {
+        let request = Request {
+            icon_size: 32,
+            known: HashSet::new(),
+        };
+        let first = reported(move |report| find_system_icons(&request, report));
+        let settings = system_settings::SETTINGS;
+        assert_eq!(first.len(), settings.len(), "one icon each");
+        let display = icon_of(&first, "ms-settings:display").expect("a page's icon");
+        assert_eq!((display.width, display.height), (32, 32));
+        let sound = icon_of(&first, "ms-settings:sound").expect("another page's");
+        assert_eq!(display, sound, "the Settings app's, both");
+        let devices = "shell:::{74246bfc-4c96-11d0-abef-0020af6b0b7a}";
+        let devices = icon_of(&first, devices).expect("Device Manager's own");
+        assert_ne!(devices, display);
+        let known = settings
+            .iter()
+            .skip(1)
+            .map(|setting| setting.id())
+            .collect();
+        let request = Request {
+            icon_size: 32,
+            known,
+        };
+        let again = reported(move |report| find_system_icons(&request, report));
+        assert_eq!(again.len(), 1, "only the one not known");
     }
 
     #[test]

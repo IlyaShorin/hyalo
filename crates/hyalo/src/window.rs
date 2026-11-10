@@ -175,6 +175,12 @@ impl Services {
                     trusted: catalog::REFRESH_AFTER,
                     excluded: None,
                 },
+                // The icons of Windows' settings: they never change.
+                Source {
+                    provider: Arc::new(catalog::find_system_icons),
+                    trusted: Duration::MAX,
+                    excluded: None,
+                },
                 Source {
                     provider: walk,
                     trusted: files::REFRESH_AFTER,
@@ -990,6 +996,7 @@ fn scene<'a>(
         subtitle: results.subtitle(index, language),
         highlights: utf16_ranges(&listed.item.title, &listed.matched),
         icon: icons.get(&listed.item.id),
+        glyph: results::glyph(&listed.item.action),
     };
     Scene {
         query: query.text(),
@@ -998,6 +1005,7 @@ fn scene<'a>(
         selection: query.selection_utf16(),
         rows: results.rows().iter().enumerate().map(row).collect(),
         selected: results.selected(),
+        asking: results.asking(),
     }
 }
 
@@ -3539,6 +3547,22 @@ mod tests {
         shown.expect("app state")
     }
 
+    /// Whether the first row's second line shows in amber, the asking
+    /// colour, in the frame on screen: some of its pixels much redder
+    /// than blue.
+    fn asks_in_amber(launcher: &Launcher) -> bool {
+        let frame = launcher.frame();
+        let scale = layout::scale(launcher.placement().dpi);
+        let top = layout::row_top(0) + 25.0;
+        let ys = (top * scale) as usize..((top + 18.0) * scale) as usize;
+        let xs = (60.0 * scale) as usize..(300.0 * scale) as usize;
+        ys.flat_map(|y| xs.clone().map(move |x| (x, y)))
+            .any(|(x, y)| {
+                let [blue, _, red, _] = frame.pixel(x, y);
+                red > blue.saturating_add(80)
+            })
+    }
+
     fn restart() -> (Action, bool) {
         (Action::System(system_commands::Command::Restart), false)
     }
@@ -3582,10 +3606,12 @@ mod tests {
             let (launcher, ran) = Launcher::listing_with(&[], None);
             launcher.type_text("restart");
             assert_eq!(first_shown().1, "System command");
+            assert!(!asks_in_amber(&launcher));
             launcher.press(VK_RETURN);
             assert!(ran.borrow().is_empty(), "not yet");
             assert!(launcher.visible());
             assert_eq!(first_shown().1, "Press Enter again to restart");
+            assert!(asks_in_amber(&launcher), "the question, in amber");
             launcher.press(VK_RETURN);
             assert_eq!(*ran.borrow(), [restart()]);
             assert!(!launcher.visible());

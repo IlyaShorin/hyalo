@@ -24,10 +24,10 @@ use windows::Win32::Graphics::Direct2D::{
     D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC, D2D1_ROUNDED_RECT, ID2D1Bitmap1,
 };
 use windows::Win32::Graphics::DirectWrite::{
-    DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_TEXT_RANGE, IDWriteFactory,
-    IDWriteTextFormat, IDWriteTextLayout,
+    DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_TEXT_ALIGNMENT_CENTER,
+    DWRITE_TEXT_RANGE, IDWriteFactory, IDWriteTextFormat, IDWriteTextLayout,
 };
-use windows::core::Result;
+use windows::core::{PCWSTR, Result, w};
 use windows_numerics::Vector2;
 
 use crate::apps::Icon;
@@ -51,6 +51,9 @@ pub struct Scene<'a> {
     pub rows: Vec<Row<'a>>,
     /// The selected row; ignored without rows.
     pub selected: usize,
+    /// Whether the selected row asks to press Enter again: its second
+    /// line, the question, is drawn in amber.
+    pub asking: bool,
 }
 
 /// One row of the results list.
@@ -62,11 +65,18 @@ pub struct Row<'a> {
     /// The letters the query matched, as UTF-16 ranges of `title`.
     pub highlights: Vec<Range<u32>>,
     pub icon: Option<&'a Icon>,
+    /// A symbol of Segoe Fluent Icons drawn where an icon goes, for a row
+    /// that has none of its own, such as a system command.
+    pub glyph: Option<char>,
 }
 
 const QUERY_SIZE: f32 = 24.0;
 const TITLE_SIZE: f32 = 15.0;
 const SUBTITLE_SIZE: f32 = 12.0;
+/// A row's symbol: Windows 11's own icon font, about as tall as an app's
+/// icon draws its picture.
+const GLYPH_FONT: PCWSTR = w!("Segoe Fluent Icons");
+const GLYPH_SIZE: f32 = 20.0;
 /// Matches the radius DWM uses for `DWMWCP_ROUND`.
 const CORNER_RADIUS: f32 = 8.0;
 const ICON_CENTER_X: f32 = 30.0;
@@ -92,6 +102,9 @@ const SELECTION: D2D1_COLOR_F = rgba(1.0, 1.0, 1.0, 0.12);
 const TITLE_TEXT: D2D1_COLOR_F = rgba(1.0, 1.0, 1.0, 0.92);
 const MATCHED_TEXT: D2D1_COLOR_F = rgba(0.55, 0.76, 1.0, 1.0);
 const SUBTITLE_TEXT: D2D1_COLOR_F = rgba(1.0, 1.0, 1.0, 0.5);
+const GLYPH: D2D1_COLOR_F = rgba(1.0, 1.0, 1.0, 0.85);
+/// The question of a row that asks before it runs: amber, as a warning.
+const ASKING_TEXT: D2D1_COLOR_F = rgba(1.0, 0.78, 0.36, 0.95);
 
 pub struct Renderer {
     surface: Surface,
@@ -102,11 +115,13 @@ pub struct Renderer {
     scroll: f32,
 }
 
-/// The text formats: the query, a row's title, a row's subtitle.
+/// The text formats: the query, a row's title, a row's subtitle, a
+/// row's symbol.
 struct Fonts {
     query: IDWriteTextFormat,
     title: IDWriteTextFormat,
     subtitle: IDWriteTextFormat,
+    glyph: IDWriteTextFormat,
 }
 
 impl Renderer {
@@ -142,7 +157,12 @@ impl Renderer {
         self.draw_separator(w)?;
         self.draw_selection(scene.selected, w)?;
         for (index, row) in scene.rows.iter().enumerate() {
-            self.draw_row(row, row_top(index), w)?;
+            let asks = scene.asking && index == scene.selected;
+            let said = match asks {
+                true => ASKING_TEXT,
+                false => SUBTITLE_TEXT,
+            };
+            self.draw_row(row, row_top(index), w, said)?;
         }
         Ok(())
     }
@@ -339,9 +359,12 @@ impl Renderer {
         Ok(())
     }
 
-    fn draw_row(&mut self, row: &Row, top: f32, w: f32) -> Result<()> {
-        if let Some(icon) = row.icon {
-            self.draw_icon(row.id, icon, top)?;
+    /// A row at `top`, its second line in `said`.
+    fn draw_row(&mut self, row: &Row, top: f32, w: f32, said: D2D1_COLOR_F) -> Result<()> {
+        match (row.icon, row.glyph) {
+            (Some(icon), _) => self.draw_icon(row.id, icon, top)?,
+            (None, Some(glyph)) => self.draw_glyph(glyph, top)?,
+            (None, None) => {}
         }
         let width = w - TEXT_LEFT - TEXT_RIGHT_PAD;
         let (title_top, title_height) = TITLE_LINE;
@@ -356,7 +379,7 @@ impl Renderer {
             self.surface
                 .layout(row.subtitle, &self.fonts.subtitle, width, subtitle_height)?;
         self.surface
-            .draw_text(&subtitle, TEXT_LEFT, top + subtitle_top, SUBTITLE_TEXT)
+            .draw_text(&subtitle, TEXT_LEFT, top + subtitle_top, said)
     }
 
     /// The icon, centred in the row's height.
@@ -376,6 +399,17 @@ impl Renderer {
                 .DrawBitmap(&bitmap, Some(&place), 1.0, smooth, None, None)
         };
         Ok(())
+    }
+
+    /// A symbol in the icon's place, centred in it.
+    fn draw_glyph(&self, glyph: char, top: f32) -> Result<()> {
+        let mut buffer = [0; 4];
+        let text = glyph.encode_utf8(&mut buffer);
+        let layout = self
+            .surface
+            .layout(text, &self.fonts.glyph, ICON_SIZE, ICON_SIZE)?;
+        let y = top + (ROW_HEIGHT - ICON_SIZE) / 2.0;
+        self.surface.draw_text(&layout, ICON_LEFT, y, GLYPH)
     }
 
     /// The icon as a Direct2D bitmap, uploaded the first time it is drawn.
@@ -431,8 +465,16 @@ impl Fonts {
                 dwrite,
                 text_format(dwrite, TEXT_FONT, SUBTITLE_SIZE, normal)?,
             )?,
+            glyph: centred(text_format(dwrite, GLYPH_FONT, GLYPH_SIZE, normal)?)?,
         })
     }
+}
+
+/// Text centred across its layout's width too.
+fn centred(format: IDWriteTextFormat) -> Result<IDWriteTextFormat> {
+    // SAFETY: a plain call on a format of ours.
+    unsafe { format.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER)? };
+    Ok(format)
 }
 
 #[cfg(test)]
@@ -465,6 +507,7 @@ mod tests {
                 selection: end..end,
                 rows: Vec::new(),
                 selected: 0,
+                asking: false,
             }
         }
     }
@@ -569,6 +612,7 @@ mod tests {
                         subtitle: "App",
                         highlights: utf16_ranges("Notepad", &[0, 1, 2, 3]),
                         icon: Some(&blue),
+                        glyph: None,
                     },
                     Row {
                         id: &ids[1],
@@ -576,6 +620,7 @@ mod tests {
                         subtitle: "App",
                         highlights: utf16_ranges("Sticky Notes", &[7, 8, 9, 10]),
                         icon: Some(&green),
+                        glyph: None,
                     },
                     Row {
                         id: &ids[2],
@@ -583,6 +628,7 @@ mod tests {
                         subtitle: r"C:\Program Files\Some Vendor\Some Product\a path long enough that it, too, has to be cut short with an ellipsis\bin\app.exe",
                         highlights: Vec::new(),
                         icon: None,
+                        glyph: None,
                     },
                 ]
             };
@@ -612,12 +658,48 @@ mod tests {
                     subtitle: "Calculator · Enter to copy",
                     highlights: Vec::new(),
                     icon: None,
+                    glyph: None,
                 }],
                 selected: 0,
                 ..Scene::bar("1234567+0,5")
             };
             let frame = drawn(&scene, (720, 128), 96);
             assert_looks_like("answer-100", &frame);
+        });
+    }
+
+    #[test]
+    fn system_commands_show_their_symbols_and_the_asking_row_asks_at_100_percent() {
+        on_hidden_desktop(|| {
+            let commands = [
+                ("Restart", "Press Enter again to restart", '\u{E777}'),
+                ("Shut down", "System command", '\u{E7E8}'),
+                ("Sleep", "System command", '\u{E708}'),
+                ("Hibernate", "System command", '\u{E823}'),
+                ("Lock", "System command", '\u{E72E}'),
+                ("Sign out", "System command", '\u{F3B1}'),
+                ("Empty Recycle Bin", "System command", '\u{E74D}'),
+            ];
+            let ids = commands.map(|(title, _, _)| ItemId(format!("system:{title}")));
+            let rows = commands
+                .iter()
+                .zip(&ids)
+                .map(|(&(title, subtitle, glyph), id)| Row {
+                    id,
+                    title,
+                    subtitle,
+                    highlights: Vec::new(),
+                    icon: None,
+                    glyph: Some(glyph),
+                });
+            let scene = Scene {
+                rows: rows.collect(),
+                selected: 0,
+                asking: true,
+                ..Scene::bar("restart")
+            };
+            let frame = drawn(&scene, (720, 416), 96);
+            assert_looks_like("commands-100", &frame);
         });
     }
 
@@ -632,6 +714,7 @@ mod tests {
                     subtitle: "hyalo keeps its last good settings · Enter to open config.toml",
                     highlights: Vec::new(),
                     icon: None,
+                    glyph: None,
                 }],
                 selected: 0,
                 ..Scene::bar("")
@@ -652,6 +735,7 @@ mod tests {
                     subtitle: "100 USD → RUB · Bank of Russia, 10.11.2026 · Enter to copy",
                     highlights: Vec::new(),
                     icon: None,
+                    glyph: None,
                 }],
                 selected: 0,
                 ..Scene::bar("100 usd")

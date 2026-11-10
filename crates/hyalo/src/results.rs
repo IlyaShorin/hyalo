@@ -3,10 +3,11 @@
 use std::collections::HashSet;
 
 use hyalo_core::frecency::{Frecency, Timestamp};
-use hyalo_core::item::{Item, Kind};
+use hyalo_core::item::{Action, Item, Kind};
 use hyalo_core::places::Places;
 use hyalo_core::rank::{Ranked, rank};
 use hyalo_core::rates::Rates;
+use hyalo_core::system_commands::Command;
 use hyalo_core::text::{Language, Text};
 use hyalo_core::{calculator, currency};
 
@@ -28,6 +29,23 @@ pub fn subtitle(item: &Item, language: Language) -> &str {
         (Kind::App, true) => language.say(Text::App),
         _ => &item.subtitle,
     }
+}
+
+/// The symbol a row shows where an icon goes: a system command's, from
+/// Segoe Fluent Icons; `None` for the rest, which have icons.
+pub fn glyph(action: &Action) -> Option<char> {
+    let Action::System(command) = action else {
+        return None;
+    };
+    Some(match command {
+        Command::Lock => '\u{E72E}',
+        Command::Sleep => '\u{E708}',
+        Command::Hibernate => '\u{E823}',
+        Command::Restart => '\u{E777}',
+        Command::ShutDown => '\u{E7E8}',
+        Command::SignOut => '\u{F3B1}',
+        Command::EmptyRecycleBin => '\u{E74D}',
+    })
 }
 
 /// One row of the list: an item, and the letters of its title the query
@@ -123,7 +141,6 @@ impl Results {
     }
 
     /// Whether the selected row asks to press Enter again.
-    #[cfg(test)]
     pub fn asking(&self) -> bool {
         self.asking
     }
@@ -186,7 +203,7 @@ impl Results {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hyalo_core::item::{Action, ItemId, Kind};
+    use hyalo_core::item::{ItemId, Kind};
     use hyalo_core::system_commands;
 
     const NOW: Timestamp = Timestamp(1_700_000_000);
@@ -511,6 +528,25 @@ mod tests {
         assert!(fresh.asking());
         let gone = results.kept(search("restart", &apps(&["Restart"])));
         assert!(!gone.asking(), "another item, though named the same");
+    }
+
+    #[test]
+    fn each_system_command_shows_a_symbol_of_its_own_and_nothing_else_does() {
+        let glyphs: std::collections::HashSet<char> = Command::ALL
+            .into_iter()
+            .filter_map(|command| glyph(&Action::System(command)))
+            .collect();
+        assert_eq!(glyphs.len(), Command::ALL.len());
+        assert!(
+            glyphs
+                .iter()
+                .all(|glyph| ('\u{E000}'..='\u{F8FF}').contains(glyph))
+        );
+        assert_eq!(glyph(&Action::System(Command::Lock)), Some('\u{E72E}'));
+        assert_eq!(
+            glyph(&Action::Open("ms-settings:display".to_string())),
+            None
+        );
     }
 
     #[test]
