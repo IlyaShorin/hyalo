@@ -718,29 +718,26 @@ impl App {
     /// The left button came up at `point`: over the row it went down on,
     /// that row opens, as Enter would; after a drag, where the launcher
     /// went is kept. Whether a row opened.
-    fn release(&mut self, point: POINT) -> bool {
+    fn release(&mut self, point: POINT) -> Result<bool> {
         match self.pressed.take() {
             Some(Press::Row(row)) => self.open(row, point),
             Some(Press::Drag(_)) => {
                 self.keep_position();
-                false
+                Ok(false)
             }
-            _ => false,
+            _ => Ok(false),
         }
     }
 
     /// Opens row `row` if the button came up over it at `point`; whether
     /// it did.
-    fn open(&mut self, row: usize, point: POINT) -> bool {
+    fn open(&mut self, row: usize, point: POINT) -> Result<bool> {
         if self.row_under(point) != Some(row) {
-            return false;
+            return Ok(false);
         }
         self.results.select(row);
-        let asked = self.enter(Command::Open { as_admin: false });
-        !asked.unwrap_or_else(|error| {
-            eprintln!("hyalo: {error}");
-            false
-        })
+        let asked = self.enter(Command::Open { as_admin: false })?;
+        Ok(!asked)
     }
 
     /// Enter on the selected row: opens it, unless it asks first and has
@@ -1390,7 +1387,7 @@ fn on_mouse(hwnd: HWND, message: u32, wparam: WPARAM, point: POINT) -> Result<()
         WM_LBUTTONUP => {
             // SAFETY: a plain call; without the mouse it does nothing.
             let _ = unsafe { ReleaseCapture() };
-            if with_app(|app| app.release(point)) == Some(true) {
+            if with_app(|app| app.release(point)).transpose()? == Some(true) {
                 hide(hwnd);
             }
             Ok(())

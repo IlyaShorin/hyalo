@@ -134,6 +134,85 @@ mod tests {
     use super::*;
     use std::cell::RefCell;
     use windows::Win32::Foundation::{ERROR_ACCESS_DENIED, SetLastError};
+    use windows::Win32::Security::{
+        GetTokenInformation, TOKEN_PRIVILEGES_ATTRIBUTES, TokenPrivileges,
+    };
+
+    /// This process's token, open to read and change its privileges.
+    struct Token(HANDLE);
+
+    impl Token {
+        fn open() -> Self {
+            let mut token = HANDLE::default();
+            let access = TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY;
+            // SAFETY: a plain call into a live HANDLE, closed on drop.
+            unsafe { OpenProcessToken(GetCurrentProcess(), access, &mut token) }
+                .expect("open this process's token");
+            Self(token)
+        }
+
+        /// The shutdown privilege's LUID.
+        fn shutdown() -> LUID {
+            let mut luid = LUID::default();
+            // SAFETY: a plain call into a live LUID.
+            unsafe { LookupPrivilegeValueW(PCWSTR::null(), SE_SHUTDOWN_NAME, &mut luid) }
+                .expect("the privilege's LUID");
+            luid
+        }
+
+        /// Turns the shutdown privilege off again.
+        fn disable_shutdown(&self) {
+            let privileges = TOKEN_PRIVILEGES {
+                PrivilegeCount: 1,
+                Privileges: [LUID_AND_ATTRIBUTES {
+                    Luid: Self::shutdown(),
+                    Attributes: TOKEN_PRIVILEGES_ATTRIBUTES(0),
+                }],
+            };
+            // SAFETY: the privileges outlive the call.
+            unsafe { AdjustTokenPrivileges(self.0, false, Some(&privileges), 0, None, None) }
+                .expect("disable it");
+        }
+
+        /// Whether the shutdown privilege is enabled, as the token says.
+        fn shutdown_enabled(&self) -> bool {
+            let mut size = 0;
+            // SAFETY: with no buffer the call only says how much it needs.
+            let _ = unsafe { GetTokenInformation(self.0, TokenPrivileges, None, 0, &mut size) };
+            // In u32s, so the privileges are aligned as Windows wants.
+            let mut buffer = vec![0_u32; (size as usize).div_ceil(4)];
+            // SAFETY: the buffer holds `size` bytes; what Windows writes
+            // there is a TOKEN_PRIVILEGES with PrivilegeCount entries.
+            unsafe {
+                let written = Some(buffer.as_mut_ptr().cast());
+                GetTokenInformation(self.0, TokenPrivileges, written, size, &mut size)
+                    .expect("the token's privileges");
+                let privileges = &*buffer.as_ptr().cast::<TOKEN_PRIVILEGES>();
+                let count = privileges.PrivilegeCount as usize;
+                let all = std::slice::from_raw_parts(privileges.Privileges.as_ptr(), count);
+                all.iter().any(|privilege| {
+                    privilege.Luid == Self::shutdown()
+                        && privilege.Attributes.0 & SE_PRIVILEGE_ENABLED.0 != 0
+                })
+            }
+        }
+    }
+
+    impl Drop for Token {
+        fn drop(&mut self) {
+            // SAFETY: the handle is ours, closed once.
+            let _ = unsafe { CloseHandle(self.0) };
+        }
+    }
+
+    #[test]
+    fn allowing_shutdown_enables_the_privilege_in_this_process_and_shuts_nothing_down() {
+        let token = Token::open();
+        token.disable_shutdown();
+        assert!(!token.shutdown_enabled(), "off to begin with");
+        allow_shutdown().expect("allowed");
+        assert!(token.shutdown_enabled());
+    }
 
     /// Windows as a test sees it: notes each call, carries out none.
     #[derive(Default)]

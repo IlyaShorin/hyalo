@@ -413,11 +413,10 @@ impl Renderer {
 
     /// A symbol in the icon's place, centred in it.
     fn draw_glyph(&self, glyph: char, top: f32) -> Result<()> {
-        let mut buffer = [0; 4];
-        let text = glyph.encode_utf8(&mut buffer);
+        let text = glyph.to_string();
         let layout = self
             .surface
-            .layout(text, &self.fonts.glyph, ICON_SIZE, ICON_SIZE)?;
+            .layout(&text, &self.fonts.glyph, ICON_SIZE, ICON_SIZE)?;
         let y = top + (ROW_HEIGHT - ICON_SIZE) / 2.0;
         self.surface.draw_text(&layout, ICON_LEFT, y, GLYPH)
     }
