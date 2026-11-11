@@ -4,7 +4,7 @@ A fast, glassy Spotlight-style launcher for Windows 11. Press a hotkey, type a f
 
 *hyalo* comes from Greek ὕαλος, "glass".
 
-> **Status:** 0.2.1, with all of v0.1 and v0.2 below: finds and opens apps, files and folders (kept current as they change, narrowed by filters), Windows' own settings pages and Control Panel items, answers arithmetic, converts currencies, searches the web, switches windows, locks, restarts or shuts down the PC (asking first); lives in the tray, with a TOML config applied as you save it and a settings window that edits it; speaks English or Russian; updates itself from GitHub Releases. Download `hyalo.exe` from the latest release and run it: it installs itself.
+> **Status:** 0.2.2, with all of v0.1 and v0.2 below: finds and opens apps, files and folders (kept current as they change, narrowed by filters), Windows' own settings pages and Control Panel items, answers arithmetic, converts currencies, searches the web, switches windows, locks, restarts or shuts down the PC (asking first); lives in the tray, with a TOML config applied as you save it and a settings window that edits it; speaks English or Russian; updates itself from GitHub Releases. Download `hyalo.exe` from the latest release and run it: it installs itself.
 
 ## Goals
 
