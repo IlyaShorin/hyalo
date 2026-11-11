@@ -7,7 +7,7 @@ use windows::Win32::System::Com::{
     COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE, CoIncrementMTAUsage, CoInitializeEx,
     CoUninitialize,
 };
-use windows::core::{HRESULT, Result};
+use windows::core::Result;
 
 /// Proof that COM is initialized on this thread. Not `Send`: COM belongs
 /// to the thread that joined it.
@@ -35,10 +35,8 @@ impl Drop for Com {
 /// be torn down while the callback that ended the wait was still
 /// returning. The first call starts it; later ones say how that went.
 pub fn keep_multithreaded() -> Result<()> {
-    static KEPT: OnceLock<HRESULT> = OnceLock::new();
+    static KEPT: OnceLock<Result<()>> = OnceLock::new();
     // SAFETY: a plain call; the usage it takes is never given back.
-    let kept = KEPT.get_or_init(|| {
-        unsafe { CoIncrementMTAUsage() }.map_or_else(|error| error.code(), |_| HRESULT(0))
-    });
-    kept.ok()
+    let kept = KEPT.get_or_init(|| unsafe { CoIncrementMTAUsage() }.map(drop));
+    kept.clone()
 }
