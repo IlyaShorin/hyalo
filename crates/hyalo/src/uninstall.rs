@@ -24,7 +24,7 @@ use windows::Win32::UI::Shell::{
 };
 use windows::core::{GUID, HSTRING, Result};
 
-use crate::com::Com;
+use crate::com::keep_multithreaded;
 use crate::registry::{self, STRING};
 
 /// Where Programs and Features finds what it lists: the machine's 64-bit
@@ -83,7 +83,7 @@ const ONE: [u8; 4] = 1_u32.to_le_bytes();
 /// Removes the package `full_name` for the current user, as Start's
 /// Uninstall does, and waits until it is gone: call it off the UI thread.
 pub fn remove(full_name: &str) -> Result<()> {
-    let _com = Com::multithreaded()?;
+    keep_multithreaded()?;
     let removing = PackageManager::new()?.RemovePackageAsync(&HSTRING::from(full_name))?;
     // A removal that failed still hands back its result, with the error
     // in it.
