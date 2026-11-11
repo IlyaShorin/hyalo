@@ -3269,6 +3269,19 @@ mod tests {
     }
 
     #[test]
+    fn what_reads_as_a_filter_after_the_prefix_finds_windows_by_title() {
+        on_hidden_desktop(|| {
+            let (mut services, _) = services(listing(&["Notepad"]).0, None);
+            let titles = ["ext:pdf - Search", "notes.txt - Notepad"];
+            services.sources.push(windowing(&titles).0);
+            let launcher = Launcher::serving(services);
+            launcher.pump_until(|app| app.catalog.windows.len() == titles.len());
+            launcher.type_text("> ext:pdf");
+            assert_eq!(listed(), ["ext:pdf - Search"]);
+        });
+    }
+
+    #[test]
     fn the_windows_are_looked_for_again_at_every_show() {
         on_hidden_desktop(|| {
             let (launcher, _, runs) = switching(None);
@@ -3884,6 +3897,16 @@ mod tests {
             assert_eq!(*ran.borrow(), [(Action::Open(url.to_string()), false)]);
             assert!(!launcher.visible());
             assert!(!picks.0.exists(), "a web search is not a pick");
+        });
+    }
+
+    #[test]
+    fn what_reads_as_a_filter_after_a_web_prefix_is_searched_for_too() {
+        on_hidden_desktop(|| {
+            let launcher = Launcher::listing(&["Notepad"]);
+            launcher.type_text("g rust ext:pdf");
+            let title = "Search Google for “rust ext:pdf”";
+            assert_eq!(first_row().0, title);
         });
     }
 
