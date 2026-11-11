@@ -83,7 +83,7 @@ fn make_setting(document: &mut DocumentMut, before: &Written, change: &Change) -
 /// `after` with the line endings of `before`: toml_edit ends every line
 /// it writes with a line feed, and a file saved on Windows may end its
 /// lines with a carriage return too.
-fn line_endings(before: &str, after: String) -> String {
+pub(super) fn line_endings(before: &str, after: String) -> String {
     match before.contains("\r\n") {
         true => after.replace("\r\n", "\n").replace('\n', "\r\n"),
         false => after,

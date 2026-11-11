@@ -14,8 +14,10 @@ use crate::places::{self, Place};
 use crate::text::{Language, Text};
 use crate::web::{self, Engine};
 
+mod complete;
 mod edit;
 
+pub use complete::completed;
 pub use edit::{Change, Refusal, edit};
 
 /// What the file holds when hyalo writes it the first time: every
