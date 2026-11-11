@@ -149,6 +149,10 @@ table! {
     /// An amount, its currency, the target, the rates' date.
     Currency => "{0} {1} → {2} · Bank of Russia, {3} · Enter to copy",
         "{0} {1} → {2} · Банк России, {3} · Enter — скопировать";
+    /// A web search engine, and the words it is asked for.
+    SearchWeb => "Search {0} for “{1}”", "Искать в {0}: «{1}»";
+    WebSearch => "Web search · Enter to open in the browser",
+        "Поиск в интернете · Enter — открыть в браузере";
 
     // The tray.
     Show => "Show hyalo", "Показать hyalo";
@@ -217,6 +221,11 @@ table! {
     Add => "Add", "Добавить";
     /// The example of a folder name.
     FolderName => "A folder name, such as {0}", "Имя папки, например {0}";
+    Web => "Web search", "Поиск в интернете";
+    Searches => "Search prefixes", "Префиксы поиска";
+    SearchesHelp => "Type a prefix, a space and words: g, gh, yt, w and ya are built in",
+        "Префикс, пробел и слова: g, gh, yt, w и ya уже есть";
+    Engine => "A prefix and an address with {query}", "Префикс и адрес с {query}";
     EditFile => "Edit the file instead", "Редактировать файл напрямую";
     EditFileHelp => "Changes here are saved to it at once, and what you save there shows up here",
         "Изменения отсюда сразу попадают в файл, а из файла — сюда";
@@ -251,6 +260,12 @@ table! {
         "`{0}` — не имя папки и не полный путь вроде `D:\\old`";
     NotLanguage => "`{0}` is not a language hyalo speaks: \"en\" or \"ru\"",
         "hyalo не знает языка `{0}`: только \"en\" или \"ru\"";
+    NotPrefix => "`{0}` is not a prefix: one word, not starting with >",
+        "`{0}` — не префикс: нужно одно слово, и не с >";
+    NotAddress => "`{0}` is not a web address with {query} where the words go",
+        "`{0}` — не веб-адрес с {query} на месте слов";
+    NotEngine => "`{0}` is not a prefix and an address, such as `so https://stackoverflow.com/search?q={query}`",
+        "`{0}` — не префикс с адресом вроде `so https://stackoverflow.com/search?q={query}`";
     Twice => "`{0}` twice", "`{0}` указано дважды";
     Unnamed => "hyalo has no name for that key: choose another",
         "у этой клавиши нет имени в hyalo: выберите другую";

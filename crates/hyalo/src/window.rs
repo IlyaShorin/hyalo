@@ -74,6 +74,7 @@ use crate::picker::{self, Picker};
 use crate::render::{Renderer, Row, Scene};
 use crate::results::{self, Listed, MAX_ROWS, Results};
 use crate::settings::{self, Loaded};
+use crate::switcher;
 use crate::tray::{self, Tray};
 use crate::update::Updates;
 use crate::{http, launch, rates, store, system, update};
@@ -197,6 +198,12 @@ impl Services {
                     trusted: rates::REFRESH_AFTER,
                     excluded: None,
                 },
+                // Looked for at every show: windows come and go.
+                Source {
+                    provider: switcher::provider(),
+                    trusted: Duration::ZERO,
+                    excluded: None,
+                },
             ],
             files,
             icons: Arc::new(catalog::file_icons),
@@ -218,14 +225,22 @@ impl Services {
 }
 
 /// Carries out `action` on a thread of its own: the shell can take a
-/// while, and the UAC prompt waits for the user.
+/// while, and the UAC prompt waits for the user. Switching to a window
+/// happens at once, while the launcher is still in front: Windows lets
+/// the foreground hand the foreground on, and the launcher hides next.
 fn run_in_background(action: &Action, as_admin: bool) {
     let action = action.clone();
-    std::thread::spawn(move || {
-        if let Err(error) = launch::run(&action, as_admin) {
-            eprintln!("hyalo: cannot run {action:?}: {error}");
-        }
-    });
+    if launch::at_once(&action) {
+        return carry_out(&action, as_admin);
+    }
+    std::thread::spawn(move || carry_out(&action, as_admin));
+}
+
+/// Carries out `action`, telling the log when it cannot.
+fn carry_out(action: &Action, as_admin: bool) {
+    if let Err(error) = launch::run(action, as_admin) {
+        eprintln!("hyalo: cannot run {action:?}: {error}");
+    }
 }
 
 struct App {
@@ -834,9 +849,14 @@ impl App {
     /// Notes a pick, on disk too when there is a picks file; a file or
     /// folder is kept to rank with the apps from now on. A calculator
     /// answer is not noted: it already comes first, and each sum would
-    /// leave a pick behind.
+    /// leave a pick behind; nor is a web search, for the same reasons,
+    /// nor a window, whose handle means nothing once it closes.
     fn note(&mut self, item: Item) {
-        if matches!(item.kind, Kind::Calculator | Kind::Notice) {
+        let kind = item.kind;
+        if matches!(
+            kind,
+            Kind::Calculator | Kind::Web | Kind::Window | Kind::Notice
+        ) {
             return;
         }
         self.frecency.record(&item.id, self.query.text(), now());
@@ -861,13 +881,16 @@ impl App {
         self.fetch_icons();
     }
 
-    /// The rows for the query: its answer, if it has one, then the best
-    /// items and files.
-    /// The words match apps and names; the filters among them narrow the
-    /// files and folders alone, picked ones too. A query of filters alone
-    /// lists files and folders by place. The answer reads the whole text.
+    /// The rows for the query: the open windows after `>`; else its
+    /// answer, if it has one, then the best items and files. The words
+    /// match apps and names; the filters among them narrow the files and
+    /// folders alone, picked ones too. A query of filters alone lists
+    /// files and folders by place. The answer reads the whole text.
     fn listed(&self) -> Results {
         let text = self.query.text();
+        if let Some(filter) = hyalo_core::switcher::filter(text) {
+            return Results::windows(filter, &self.catalog.windows);
+        }
         let query = Query::parse(text, clock());
         let picked = self.picked(&query.filters);
         let (frecency, places, files) = (&self.frecency, &self.places, self.file_hits(&query));
@@ -881,7 +904,10 @@ impl App {
         };
         let answer = match text.is_empty() {
             true => self.notice_row(),
-            false => results::answer(text, self.catalog.rates.as_ref(), self.language()),
+            false => {
+                let rates = self.catalog.rates.as_ref();
+                results::answer(text, rates, &self.config.search, self.language())
+            }
         };
         found.answered(answer)
     }
@@ -3171,6 +3197,101 @@ mod tests {
         });
     }
 
+    /// A windows source that lists `titles` as open windows of Notepad,
+    /// front first, with handles 1, 2, ..., each with an icon; and how
+    /// many times it looked.
+    fn windowing(titles: &[&str]) -> (Source, Arc<AtomicUsize>) {
+        let items: Vec<Item> = titles
+            .iter()
+            .zip(1..)
+            .map(|(title, window)| hyalo_core::switcher::item(window, title, "Notepad"))
+            .collect();
+        let runs = Arc::new(AtomicUsize::new(0));
+        let counted = runs.clone();
+        let provider: Provider = Arc::new(move |request: &Request, report: &dyn Fn(Found)| {
+            counted.fetch_add(1, Ordering::SeqCst);
+            report(Found::Windows(items.clone()));
+            for item in &items {
+                report(Found::Icon(item.id.clone(), red(request.icon_size)));
+            }
+        });
+        let source = Source {
+            provider,
+            trusted: Duration::ZERO,
+            excluded: None,
+        };
+        (source, runs)
+    }
+
+    const WINDOWS: [&str; 3] = ["notes.txt - Notepad", "todo.txt - Notepad", "Notepad tips"];
+
+    /// A launcher listing Notepad and the open `WINDOWS`, once it has
+    /// them; what it was asked to run, and how often it looked for them.
+    fn switching(picks: Option<PathBuf>) -> (Launcher, Ran, Arc<AtomicUsize>) {
+        let (mut services, ran) = services(listing(&["Notepad"]).0, picks);
+        let (source, runs) = windowing(&WINDOWS);
+        services.sources.push(source);
+        let launcher = Launcher::serving(services);
+        launcher.pump_until(|app| app.catalog.icons.len() == 1 + WINDOWS.len());
+        (launcher, ran, runs)
+    }
+
+    #[test]
+    fn the_prefix_lists_the_open_windows_front_first_with_their_icons() {
+        on_hidden_desktop(|| {
+            let (launcher, _, _) = switching(None);
+            launcher.type_text(">");
+            assert_eq!(listed(), WINDOWS);
+            assert_eq!(first_row(), (WINDOWS[0].to_string(), "Notepad".to_string()));
+            let icons = with_app(|app| {
+                let rows = app.results.rows().iter();
+                rows.filter(|row| app.catalog.icons.contains_key(&row.item.id))
+                    .count()
+            });
+            assert_eq!(icons, Some(WINDOWS.len()));
+            launcher.type_text(" tips");
+            assert_eq!(listed(), ["Notepad tips"], "the windows alone, not the app");
+        });
+    }
+
+    #[test]
+    fn enter_switches_to_the_window_the_filter_found_and_remembers_no_pick() {
+        on_hidden_desktop(|| {
+            let picks = PicksFile::new("window-switcher");
+            let (launcher, ran, _) = switching(Some(picks.0.clone()));
+            launcher.type_text(">todo");
+            assert_eq!(listed(), ["todo.txt - Notepad"]);
+            launcher.press(VK_RETURN);
+            assert_eq!(*ran.borrow(), [(Action::Switch(2), false)]);
+            assert!(!launcher.visible());
+            assert!(!picks.0.exists(), "a window is not a pick");
+        });
+    }
+
+    #[test]
+    fn what_reads_as_a_filter_after_the_prefix_finds_windows_by_title() {
+        on_hidden_desktop(|| {
+            let (mut services, _) = services(listing(&["Notepad"]).0, None);
+            let titles = ["ext:pdf - Search", "notes.txt - Notepad"];
+            services.sources.push(windowing(&titles).0);
+            let launcher = Launcher::serving(services);
+            launcher.pump_until(|app| app.catalog.windows.len() == titles.len());
+            launcher.type_text("> ext:pdf");
+            assert_eq!(listed(), ["ext:pdf - Search"]);
+        });
+    }
+
+    #[test]
+    fn the_windows_are_looked_for_again_at_every_show() {
+        on_hidden_desktop(|| {
+            let (launcher, _, runs) = switching(None);
+            let before = runs.load(Ordering::SeqCst);
+            launcher.hotkey();
+            launcher.hotkey();
+            launcher.pump_until(|_| runs.load(Ordering::SeqCst) == before + 1);
+        });
+    }
+
     #[test]
     fn showing_again_soon_does_not_list_the_apps_again() {
         on_hidden_desktop(|| {
@@ -3749,6 +3870,63 @@ mod tests {
             let copy = Action::CopyText("6".to_string());
             assert_eq!(*ran.borrow(), [(copy, false)]);
             assert!(!launcher.visible());
+        });
+    }
+
+    #[test]
+    fn a_prefix_and_words_list_a_web_search_first_and_enter_opens_it() {
+        on_hidden_desktop(|| {
+            let picks = PicksFile::new("window-web-search");
+            let (launcher, ran) = Launcher::listing_with(&["Git Bash"], Some(picks.0.clone()));
+            launcher.type_text("git");
+            assert_eq!(listed(), ["Git Bash"], "a word that starts like gh");
+            hold(&[VK_CONTROL]);
+            launcher.press(VK_A);
+            hold(&[]);
+            launcher.type_text("g привет мир");
+            let title = "Search Google for “привет мир”";
+            assert_eq!(
+                first_row(),
+                (
+                    title.to_string(),
+                    "Web search · Enter to open in the browser".to_string()
+                )
+            );
+            launcher.press(VK_RETURN);
+            let url = "https://www.google.com/search?q=%D0%BF%D1%80%D0%B8%D0%B2%D0%B5%D1%82%20%D0%BC%D0%B8%D1%80";
+            assert_eq!(*ran.borrow(), [(Action::Open(url.to_string()), false)]);
+            assert!(!launcher.visible());
+            assert!(!picks.0.exists(), "a web search is not a pick");
+        });
+    }
+
+    #[test]
+    fn what_reads_as_a_filter_after_a_web_prefix_is_searched_for_too() {
+        on_hidden_desktop(|| {
+            let launcher = Launcher::listing(&["Notepad"]);
+            launcher.type_text("g rust ext:pdf");
+            let title = "Search Google for “rust ext:pdf”";
+            assert_eq!(first_row().0, title);
+        });
+    }
+
+    #[test]
+    fn a_web_search_of_the_configs_is_listed_and_changes_when_saved() {
+        on_hidden_desktop(|| {
+            let so = "[search]\nso = 'https://stackoverflow.com/search?q={query}'\n";
+            let (_scratch, path) = config_file("window-config-search", so);
+            let keyboard = Rc::new(Keyboard::default());
+            let (launcher, _, _) = configured(&path, &keyboard);
+            launcher.type_text("so borrow");
+            assert_eq!(first_row().0, "Search stackoverflow.com for “borrow”");
+            std::fs::write(
+                &path,
+                "[search]\nso = 'https://sourcegraph.com/search?q={query}'\n",
+            )
+            .expect("save");
+            launcher.pump_until(|app| {
+                app.results.rows()[0].item.title == "Search sourcegraph.com for “borrow”"
+            });
         });
     }
 

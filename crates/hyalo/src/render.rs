@@ -755,6 +755,73 @@ mod tests {
     }
 
     #[test]
+    fn a_web_search_row_names_its_engine_and_the_words_at_100_percent() {
+        on_hidden_desktop(|| {
+            let query = "g rust lifetimes";
+            let language = hyalo_core::text::Language::English;
+            let item = hyalo_core::web::answer(query, &[], language).expect("a search");
+            let scene = Scene {
+                rows: vec![Row {
+                    id: &item.id,
+                    title: &item.title,
+                    subtitle: &item.subtitle,
+                    highlights: Vec::new(),
+                    icon: None,
+                    glyph: None,
+                }],
+                selected: 0,
+                ..Scene::bar(query)
+            };
+            let frame = drawn(&scene, (720, 128), 96);
+            assert_looks_like("web-search-100", &frame);
+        });
+    }
+
+    #[test]
+    fn open_windows_listed_with_their_apps_and_icons_at_100_percent() {
+        on_hidden_desktop(|| {
+            let windows = [
+                ("notes.txt - Notepad", "Notepad", [240, 160, 40]),
+                (
+                    "Notepad tips - YouTube - Google Chrome",
+                    "Google Chrome",
+                    [90, 200, 80],
+                ),
+                ("Downloads", "Windows Explorer", [80, 140, 240]),
+            ];
+            let items: Vec<_> = (1..)
+                .zip(windows)
+                .map(|(at, (title, app, _))| hyalo_core::switcher::item(at, title, app))
+                .collect();
+            let icons: Vec<Icon> = windows
+                .iter()
+                .map(|(_, _, colour)| disc(32, *colour))
+                .collect();
+            let found = crate::results::Results::windows("note", &items);
+            let rows = found
+                .rows()
+                .iter()
+                .zip(&icons)
+                .map(|(listed, icon)| Row {
+                    id: &listed.item.id,
+                    title: &listed.item.title,
+                    subtitle: &listed.item.subtitle,
+                    highlights: utf16_ranges(&listed.item.title, &listed.matched),
+                    icon: Some(icon),
+                    glyph: None,
+                })
+                .collect();
+            let scene = Scene {
+                rows,
+                selected: 0,
+                ..Scene::bar(">note")
+            };
+            let frame = drawn(&scene, (720, 176), 96);
+            assert_looks_like("windows-100", &frame);
+        });
+    }
+
+    #[test]
     fn a_resized_renderer_draws_at_its_new_size_and_scale() {
         on_hidden_desktop(|| {
             let canvas = Canvas::new();

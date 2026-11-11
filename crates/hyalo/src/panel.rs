@@ -74,11 +74,12 @@ enum Spot {
 
 /// The page's sections, top to bottom; each is left out when it has
 /// nothing to show.
-const SECTIONS: [fn(&Panel) -> Option<Section>; 6] = [
+const SECTIONS: [fn(&Panel) -> Option<Section>; 7] = [
     Panel::problem,
     Panel::news,
     Panel::launcher,
     Panel::folders,
+    Panel::search,
     Panel::updates,
     Panel::file,
 ];
@@ -497,11 +498,12 @@ impl Panel {
     }
 
     /// Whether the page, showing good settings, has the control of the
-    /// setting `target`.
+    /// setting `target`: Add folder… only for the lists of folders.
     fn shows(&self, target: Target) -> bool {
         match target {
             Target::StartWithWindows => self.starts.is_some(),
             Target::Name(list) | Target::AddName(list) => list != List::Exclude,
+            Target::Pick(list) => list != List::Search,
             Target::CheckUpdates => self.updates.is_some(),
             _ => true,
         }
@@ -624,24 +626,36 @@ impl Panel {
     /// The three lists of folders.
     fn folders(&self) -> Option<Section> {
         self.written.as_ref()?;
-        let cards = List::ALL.map(|list| self.list(list)).to_vec();
+        let cards = List::FOLDERS.map(|list| self.list(list)).to_vec();
         Some(Section {
             title: Some(self.say(Text::Folders)),
             cards,
         })
     }
 
-    /// A list: its setting with Add folder…, its entries, and for the
-    /// lists that take a folder's name, a field for one.
+    /// The user's web searches.
+    fn search(&self) -> Option<Section> {
+        self.written.as_ref()?;
+        Some(Section {
+            title: Some(self.say(Text::Web)),
+            cards: vec![self.list(List::Search)],
+        })
+    }
+
+    /// A list: its setting, with Add folder… for a list of folders, its
+    /// entries, and for the lists that take a name or a web search, a
+    /// field for one.
     fn list(&self, list: List) -> Card {
-        let (name, help, example) = match list {
-            List::Exclude => (Text::Exclude, Text::ExcludeHelp, ""),
-            List::RankLower => (Text::RankLower, Text::RankLowerHelp, "target"),
-            List::RankHigher => (Text::RankHigher, Text::RankHigherHelp, "notes"),
+        let (name, help) = match list {
+            List::Exclude => (Text::Exclude, Text::ExcludeHelp),
+            List::RankLower => (Text::RankLower, Text::RankLowerHelp),
+            List::RankHigher => (Text::RankHigher, Text::RankHigherHelp),
+            List::Search => (Text::Searches, Text::SearchesHelp),
         };
         let pick = Control::Button(button(&self.say(Text::AddFolder), Target::Pick(list)));
+        let pick = (list != List::Search).then_some(pick);
         let help = self.help(Spot::List(list), help);
-        let mut strips = vec![setting(&self.say(name), help, Some(pick))];
+        let mut strips = vec![setting(&self.say(name), help, pick)];
         let entries = self.entries(list).iter().enumerate();
         strips.extend(entries.map(|(at, text)| Strip::Entry {
             text: text.clone(),
@@ -655,7 +669,7 @@ impl Panel {
                 text: name.text().to_string(),
                 caret: name.caret_utf16(),
                 selection: name.selection_utf16(),
-                placeholder: self.language().fill(Text::FolderName, &[example]),
+                placeholder: self.placeholder(list),
                 add: button(&self.say(Text::Add), Target::AddName(list)),
             });
         }
@@ -726,6 +740,16 @@ impl Panel {
         let help = self.noted(Spot::Updates, help);
         let strip = setting(&self.say(Text::CheckUpdates), help, Some(toggle));
         Some(card(false, self.problem.is_some(), vec![strip]))
+    }
+
+    /// What the field of `list` shows while nothing is typed in it.
+    fn placeholder(&self, list: List) -> String {
+        let example = match list {
+            List::Search => return self.say(Text::Engine),
+            List::RankHigher => "notes",
+            _ => "target",
+        };
+        self.language().fill(Text::FolderName, &[example])
     }
 
     /// The way to the file itself.
@@ -889,6 +913,8 @@ mod tests {
             "Rank lower",
             "target",
             "Rank higher",
+            "Web search",
+            "Search prefixes",
             "config.toml",
             "Edit the file instead",
         ];
@@ -909,7 +935,7 @@ mod tests {
     #[test]
     fn the_lists_that_take_a_name_have_a_field_for_one() {
         let laid = laid(&panel());
-        let fields: Vec<Target> = laid
+        let fields: Vec<(Target, String)> = laid
             .marks
             .iter()
             .filter_map(|mark| match &mark.what {
@@ -917,19 +943,68 @@ mod tests {
                     target,
                     placeholder,
                     ..
-                } => {
-                    assert!(placeholder.starts_with("A folder name, such as "));
-                    Some(*target)
-                }
+                } => Some((*target, placeholder.clone())),
                 _ => None,
             })
             .collect();
+        let folder = |list, name: &str| {
+            let placeholder = format!("A folder name, such as {name}");
+            (Target::Name(list), placeholder)
+        };
         assert_eq!(
             fields,
             [
-                Target::Name(List::RankLower),
-                Target::Name(List::RankHigher)
+                folder(List::RankLower, "target"),
+                folder(List::RankHigher, "notes"),
+                (
+                    Target::Name(List::Search),
+                    "A prefix and an address with {query}".to_string()
+                ),
             ]
+        );
+    }
+
+    const SO: &str = "so https://stackoverflow.com/search?q={query}";
+
+    /// What the page shows after the list of web searches' name.
+    fn after_searches(panel: &Panel) -> Option<String> {
+        let shown = texts(panel);
+        let at = shown.iter().position(|text| text == "Search prefixes")?;
+        shown.get(at + 1).cloned()
+    }
+
+    #[test]
+    fn a_web_search_typed_is_added_and_its_cross_takes_it_out() {
+        let mut panel = panel();
+        assert!(!panel.look(Target::Pick(List::Search)).enabled, "no folder");
+        click(&mut panel, Target::Name(List::Search));
+        type_text(&mut panel, SO);
+        let add = Some(Effect::Change(Change::Add(List::Search, SO.to_string())));
+        assert_eq!(plain(&mut panel, VK_RETURN.0), add);
+        let change = Change::Add(List::Search, SO.to_string());
+        let after = config::edit(DEFAULT, &change).expect("edited");
+        panel.done(&change, Some(written(&after)));
+        assert_eq!(after_searches(&panel), Some(SO.to_string()));
+        let remove = Change::Remove(List::Search, SO.to_string());
+        assert_eq!(
+            click(&mut panel, Target::Remove(List::Search, 0)),
+            Some(Effect::Change(remove))
+        );
+    }
+
+    #[test]
+    fn a_web_search_refused_says_why_by_its_list() {
+        let mut panel = panel();
+        click(&mut panel, Target::Name(List::Search));
+        type_text(&mut panel, "so");
+        let change = Change::Add(List::Search, "so".to_string());
+        let wanted = hyalo_core::config::Wanted::Engine;
+        panel.refused(&change, Why::Value(wanted, "so".to_string()));
+        assert!(texts(&panel).contains(&"[so]".to_string()));
+        let said = after_searches(&panel).expect("a warning");
+        assert!(
+            said.starts_with("! `so` is not a prefix and an address"),
+            "{said}"
         );
     }
 
@@ -943,7 +1018,7 @@ mod tests {
             shown[2..4],
             [
                 "Line 2: unknown field `hotkye`, expected one of `hotkey`, `language`,",
-                "`check_for_updates`, `folders`"
+                "`check_for_updates`, `folders`, `search`"
             ]
         );
         assert!(
@@ -984,6 +1059,7 @@ mod tests {
         panel.reload(Err(broken()));
         let cards = [
             (true, false),
+            (false, true),
             (false, true),
             (false, true),
             (false, true),
@@ -1587,6 +1663,8 @@ notes
             "Показывать ниже",
             "target",
             "Показывать выше",
+            "Поиск в интернете",
+            "Префиксы поиска",
             "config.toml",
             "Редактировать файл напрямую",
         ];
@@ -1732,7 +1810,10 @@ notes
     #[test]
     fn where_hyalo_does_not_update_itself_there_is_no_updates_section() {
         let panel = panel();
-        assert_eq!(headers(&panel), ["Launcher", "Folders", "config.toml"]);
+        assert_eq!(
+            headers(&panel),
+            ["Launcher", "Folders", "Web search", "config.toml"]
+        );
         assert_eq!(switch(&panel, Target::CheckUpdates), None);
         assert!(laid(&panel).area(Target::Install).is_none());
     }
@@ -1742,7 +1823,16 @@ notes
         let mut panel = panel();
         panel.set_updates(Some(newest()));
         let headers = headers(&panel);
-        assert_eq!(headers, ["Launcher", "Folders", "Updates", "config.toml"]);
+        assert_eq!(
+            headers,
+            [
+                "Launcher",
+                "Folders",
+                "Web search",
+                "Updates",
+                "config.toml"
+            ]
+        );
         assert_eq!(switch(&panel, Target::CheckUpdates), Some(true));
         let help = "You have hyalo 0.0.1; GitHub is asked once a day, nothing installs by itself";
         assert_eq!(
@@ -1764,7 +1854,13 @@ notes
         )));
         assert_eq!(
             headers(&panel),
-            ["Updates", "Launcher", "Folders", "config.toml"]
+            [
+                "Updates",
+                "Launcher",
+                "Folders",
+                "Web search",
+                "config.toml"
+            ]
         );
         let shown = texts(&panel);
         let at = shown.iter().position(|text| text == "hyalo 0.0.2 is out");

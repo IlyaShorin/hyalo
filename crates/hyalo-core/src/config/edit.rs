@@ -4,7 +4,7 @@
 
 use toml_edit::{Array, DocumentMut, Item, Table, Value};
 
-use super::{List, Problem, Why, Written, written};
+use super::{List, Problem, Wanted, Why, Written, engine_of, written};
 use crate::hotkey::Hotkey;
 use crate::text::Language;
 
@@ -42,7 +42,7 @@ pub fn edit(text: &str, change: &Change) -> Result<String, Refusal> {
     let mut document: DocumentMut = text
         .parse()
         .map_err(|error: toml_edit::TomlError| Refusal::Wrong(Why::Toml(error.to_string())))?;
-    if !make(&mut document, &before, change) {
+    if !make(&mut document, &before, change).map_err(Refusal::Wrong)? {
         return Ok(text.to_string());
     }
     let after = line_endings(text, document.to_string());
@@ -51,8 +51,17 @@ pub fn edit(text: &str, change: &Change) -> Result<String, Refusal> {
 }
 
 /// Makes `change` in `document`, whose settings are `before`; whether it
-/// changed anything.
-fn make(document: &mut DocumentMut, before: &Written, change: &Change) -> bool {
+/// changed anything, or why it cannot be made.
+fn make(document: &mut DocumentMut, before: &Written, change: &Change) -> Result<bool, Why> {
+    match change {
+        Change::Add(List::Search, entry) => add_engine(document, entry),
+        Change::Remove(List::Search, entry) => Ok(remove_engine(document, before, entry)),
+        change => Ok(make_setting(document, before, change)),
+    }
+}
+
+/// Makes a change to a setting or a list of folders in `document`.
+fn make_setting(document: &mut DocumentMut, before: &Written, change: &Change) -> bool {
     match change {
         Change::Hotkey(hotkey) => {
             let differs = *hotkey != before.hotkey;
@@ -95,6 +104,49 @@ fn set(document: &mut DocumentMut, key: &str, mut value: Value) -> bool {
         }
     }
     true
+}
+
+/// Writes the web search `entry` (`prefix address`) in `[search]`, which
+/// is added when the file has none; a prefix there already, in any case,
+/// takes the new address.
+fn add_engine(document: &mut DocumentMut, entry: &str) -> Result<bool, Why> {
+    let wrong = || Why::Value(Wanted::Engine, entry.trim().to_string());
+    let (prefix, url) = engine_of(entry).ok_or_else(wrong)?;
+    let search = document
+        .entry(List::Search.key())
+        .or_insert_with(|| Item::Table(Table::new()))
+        .as_table_like_mut()
+        .ok_or_else(wrong)?;
+    let written = search
+        .iter()
+        .map(|(key, _)| key.to_string())
+        .find(|key| key.to_lowercase() == prefix.to_lowercase());
+    let key = written.unwrap_or_else(|| prefix.to_string());
+    let mut value = Value::from(url);
+    match search.get_mut(&key).and_then(Item::as_value_mut) {
+        Some(old) if old.as_str() == Some(url) => return Ok(false),
+        Some(old) => {
+            *value.decor_mut() = old.decor().clone();
+            *old = value;
+        }
+        None => {
+            search.insert(&key, Item::Value(value));
+        }
+    }
+    Ok(true)
+}
+
+/// Takes the web search listed as `entry` out of `[search]`.
+fn remove_engine(document: &mut DocumentMut, before: &Written, entry: &str) -> bool {
+    let listed = before.list(List::Search).iter().any(|old| old == entry);
+    let prefix = engine_of(entry).map(|(prefix, _)| prefix);
+    let search = document
+        .get_mut(List::Search.key())
+        .and_then(Item::as_table_like_mut);
+    match (listed, prefix, search) {
+        (true, Some(prefix), Some(search)) => search.remove(prefix).is_some(),
+        _ => false,
+    }
 }
 
 /// Adds `entry` at the end of `list`, unless an entry the same but for
@@ -188,9 +240,9 @@ fn take(array: &mut Array, at: usize) {
         .trailing()
         .as_str()
         .is_some_and(|rest| rest.trim().is_empty());
+    // toml_edit writes no trailing comma in an empty array.
     if array.is_empty() && blank {
         array.set_trailing("");
-        array.set_trailing_comma(false);
     }
 }
 
@@ -378,6 +430,15 @@ mod tests {
     }
 
     #[test]
+    fn a_name_in_quotes_of_its_own_reads_back_as_it_was_typed() {
+        // In single quotes it would be `'''notes'''`, which TOML reads as
+        // a string of three quotes around `notes`, without the quotes.
+        let after = edited(DEFAULT, add(List::RankHigher, "''notes''"));
+        let back = written(&after).expect("good settings");
+        assert_eq!(back.list(List::RankHigher), ["''notes''"]);
+    }
+
+    #[test]
     fn what_is_written_reads_back_as_the_change() {
         let after = edited(DEFAULT, add(List::RankLower, r"D:\Archive"));
         let back = written(&after).expect("good settings");
@@ -428,6 +489,118 @@ mod tests {
             edited("", Change::Language(Language::English)),
             "language = \"en\"\n"
         );
+    }
+
+    const SO: &str = "so https://stackoverflow.com/search?q={query}";
+
+    #[test]
+    fn a_web_search_is_added_to_the_search_table_under_its_comments() {
+        let after = edited(DEFAULT, add(List::Search, SO));
+        let expected = format!(
+            "{DEFAULT}so = \"https://stackoverflow.com/search?q={{query}}\"
+"
+        );
+        assert_eq!(after, expected);
+        let back = written(&after).expect("good settings");
+        assert_eq!(back.list(List::Search), [SO]);
+    }
+
+    #[test]
+    fn a_search_table_the_file_leaves_out_is_added_at_its_end() {
+        let text = "hotkey = 'F4'
+";
+        let after = edited(text, add(List::Search, "  so   https://a.io/?q={query} "));
+        assert_eq!(
+            after,
+            "hotkey = 'F4'
+
+[search]
+so = \"https://a.io/?q={query}\"
+"
+        );
+    }
+
+    #[test]
+    fn a_prefix_written_already_takes_the_new_address_in_its_place() {
+        let text = "[search]
+SO = 'https://old.io/{query}' # mine
+w = 'https://w.io/{query}'
+";
+        let after = edited(text, add(List::Search, SO));
+        assert_eq!(
+            after,
+            "[search]
+SO = \"https://stackoverflow.com/search?q={query}\" # mine
+w = 'https://w.io/{query}'
+"
+        );
+        assert_eq!(
+            edited(
+                &after,
+                add(
+                    List::Search,
+                    "SO https://stackoverflow.com/search?q={query}"
+                )
+            ),
+            after
+        );
+    }
+
+    #[test]
+    fn a_web_search_removed_takes_only_its_own_line() {
+        let text = "[search]
+# mine
+so = 'https://stackoverflow.com/search?q={query}'
+w = 'https://w.io/{query}'
+";
+        let after = edited(text, remove(List::Search, SO));
+        assert_eq!(
+            after,
+            "[search]
+w = 'https://w.io/{query}'
+"
+        );
+        assert_eq!(
+            edited(text, remove(List::Search, "so https://other.io/{query}")),
+            text
+        );
+        assert_eq!(edited(text, remove(List::Search, "so")), text);
+        assert_eq!(edited("", remove(List::Search, SO)), "");
+        let inline = "search = { so = 'https://stackoverflow.com/search?q={query}' }
+";
+        assert_eq!(
+            edited(inline, remove(List::Search, SO)),
+            "search = {}
+"
+        );
+    }
+
+    #[test]
+    fn a_web_search_without_an_address_or_with_a_wrong_one_is_refused_with_why() {
+        let refused = edit(DEFAULT, &add(List::Search, " so "));
+        assert_eq!(
+            refused,
+            Err(Refusal::Wrong(Why::Value(Wanted::Engine, "so".to_string())))
+        );
+        let refused = edit(DEFAULT, &add(List::Search, "so https://a.io/"));
+        assert_eq!(
+            refused,
+            Err(Refusal::Wrong(Why::Value(
+                Wanted::Address,
+                "https://a.io/".to_string()
+            )))
+        );
+        let refused = edit(DEFAULT, &add(List::Search, ">w https://a.io/{query}"));
+        assert_eq!(
+            refused,
+            Err(Refusal::Wrong(Why::Value(Wanted::Prefix, ">w".to_string())))
+        );
+        let refused = edit(
+            "search = 5
+",
+            &add(List::Search, SO),
+        );
+        assert!(matches!(refused, Err(Refusal::Broken(_))), "{refused:?}");
     }
 
     #[test]

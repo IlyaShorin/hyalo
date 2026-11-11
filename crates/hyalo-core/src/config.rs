@@ -2,6 +2,7 @@
 //! `config.toml`. Text in, settings or the first problem out, with the
 //! line it is on. Reading and watching the file is the launcher's.
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::ops::Range;
 
@@ -11,6 +12,7 @@ use toml::Spanned;
 use crate::hotkey::{self, Hotkey};
 use crate::places::{self, Place};
 use crate::text::{Language, Text};
+use crate::web::{self, Engine};
 
 mod edit;
 
@@ -50,6 +52,13 @@ rank_lower = ['target']
 # Files in these folders rank higher, as in Desktop, Documents, Downloads
 # and the project folders in your profile: a folder name or a full path.
 rank_higher = []
+
+# Web searches of your own: a prefix, then the address with {query} where
+# the words go, such as so = "https://stackoverflow.com/search?q={query}".
+# Type the prefix, a space and the words. Built in are g (Google), gh
+# (GitHub), yt (YouTube), w (Wikipedia) and ya (Yandex); one of yours with
+# the same prefix takes its place.
+[search]
 "#;
 
 /// The file written the first time, in `language`: the defaults, with the
@@ -75,6 +84,8 @@ pub struct Config {
     pub rank_lower: Vec<Place>,
     /// Places whose files rank higher, besides the built-in ones.
     pub rank_higher: Vec<Place>,
+    /// The user's web searches, besides the built-in ones.
+    pub search: Vec<Engine>,
 }
 
 impl Default for Config {
@@ -89,28 +100,41 @@ impl Default for Config {
             exclude: strings(List::Exclude).collect(),
             rank_lower: places(List::RankLower),
             rank_higher: places(List::RankHigher),
+            search: Vec::new(),
         }
     }
 }
 
-/// A list of folders in `[folders]`.
+/// A list of entries the settings window shows: the three of folders in
+/// `[folders]`, and the web searches in `[search]`, each written there as
+/// `prefix = "address"` and listed as an entry `prefix address`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum List {
     Exclude,
     RankLower,
     RankHigher,
+    Search,
 }
 
 impl List {
     /// Every list, in the order the file has them.
-    pub const ALL: [List; 3] = [List::Exclude, List::RankLower, List::RankHigher];
+    pub const ALL: [List; 4] = [
+        List::Exclude,
+        List::RankLower,
+        List::RankHigher,
+        List::Search,
+    ];
 
-    /// Its key in `[folders]`.
+    /// The lists of folders, in the order `[folders]` has them.
+    pub const FOLDERS: [List; 3] = [List::Exclude, List::RankLower, List::RankHigher];
+
+    /// Its key in `[folders]`; the web searches have the table `[search]`.
     pub fn key(self) -> &'static str {
         match self {
             List::Exclude => "exclude",
             List::RankLower => "rank_lower",
             List::RankHigher => "rank_higher",
+            List::Search => "search",
         }
     }
 
@@ -119,7 +143,7 @@ impl List {
         match self {
             List::Exclude => &[r"C:\Windows\WinSxS"],
             List::RankLower => &["target"],
-            List::RankHigher => &[],
+            List::RankHigher | List::Search => &[],
         }
     }
 
@@ -135,7 +159,7 @@ pub struct Written {
     pub hotkey: Hotkey,
     pub language: Option<Language>,
     pub check_for_updates: bool,
-    lists: [Vec<String>; 3],
+    lists: [Vec<String>; 4],
 }
 
 impl Written {
@@ -208,6 +232,13 @@ pub enum Wanted {
     /// A folder name or a full path: a folder that ranks.
     Place,
     Language,
+    /// One word: a web search's prefix.
+    Prefix,
+    /// A web address with `{query}`: a web search's.
+    Address,
+    /// A prefix, a space and an address: a web search as the settings
+    /// window adds one.
+    Engine,
 }
 
 impl Why {
@@ -240,6 +271,9 @@ impl Wanted {
             Wanted::FullPath => Text::NotFullPath,
             Wanted::Place => Text::NotPlace,
             Wanted::Language => Text::NotLanguage,
+            Wanted::Prefix => Text::NotPrefix,
+            Wanted::Address => Text::NotAddress,
+            Wanted::Engine => Text::NotEngine,
         }
     }
 }
@@ -251,11 +285,17 @@ pub fn parse(text: &str) -> Result<Config, Problem> {
 }
 
 /// The settings `text` gives, and each list's entries as written.
-fn read(text: &str) -> Result<(Config, [Vec<String>; 3]), Problem> {
+fn read(text: &str) -> Result<(Config, [Vec<String>; 4]), Problem> {
     let file: File = toml::from_str(text).map_err(|error| unreadable(text, &error))?;
     let folders = file.folders.unwrap_or_default();
     let lists = [&folders.exclude, &folders.rank_lower, &folders.rank_higher];
-    let written = List::ALL.map(|list| as_written(lists[list.index()].as_deref(), list));
+    let [exclude, rank_lower, rank_higher] =
+        List::FOLDERS.map(|list| as_written(lists[list.index()].as_deref(), list));
+    let search = file.search.unwrap_or_default();
+    let engines = search
+        .iter()
+        .map(|(prefix, url)| entry(prefix, url.get_ref()));
+    let written = [exclude, rank_lower, rank_higher, engines.collect()];
     let defaults = Config::default();
     let at = Lines(text);
     let config = Config {
@@ -270,8 +310,25 @@ fn read(text: &str) -> Result<(Config, [Vec<String>; 3]), Problem> {
         exclude: at.each(folders.exclude, defaults.exclude, excluded)?,
         rank_lower: at.each(folders.rank_lower, defaults.rank_lower, place)?,
         rank_higher: at.each(folders.rank_higher, defaults.rank_higher, place)?,
+        search: search
+            .into_iter()
+            .map(|(prefix, url)| at.read(url, &|url| engine(&prefix, url)))
+            .collect::<Result<_, _>>()?,
     };
     Ok((config, written))
+}
+
+/// A web search as the settings window lists it: its prefix, a space,
+/// its address.
+pub fn entry(prefix: &str, url: &str) -> String {
+    format!("{prefix} {url}")
+}
+
+/// The prefix and the address of a web search listed as `entry`; `None`
+/// without both.
+pub fn engine_of(entry: &str) -> Option<(&str, &str)> {
+    let (prefix, url) = entry.trim().split_once(char::is_whitespace)?;
+    Some((prefix, url.trim_start()))
 }
 
 /// A list's entries as the file writes them, or its defaults when the
@@ -295,6 +352,8 @@ struct File {
     language: Option<Spanned<String>>,
     check_for_updates: Option<bool>,
     folders: Option<Folders>,
+    /// Each prefix and its address, the prefixes in order.
+    search: Option<BTreeMap<String, Spanned<String>>>,
 }
 
 #[derive(Default, Deserialize)]
@@ -389,6 +448,14 @@ fn language(text: &str) -> Result<Language, Why> {
 
 fn place(text: &str) -> Result<Place, Why> {
     Place::parse(text).ok_or_else(|| Why::Value(Wanted::Place, text.to_string()))
+}
+
+/// The web search `prefix` asks at `url`.
+fn engine(prefix: &str, url: &str) -> Result<Engine, Why> {
+    Engine::custom(prefix, url).map_err(|wrong| match wrong {
+        web::Wrong::Prefix => Why::Value(Wanted::Prefix, prefix.to_string()),
+        web::Wrong::Url => Why::Value(Wanted::Address, url.to_string()),
+    })
 }
 
 #[cfg(test)]
@@ -599,7 +666,130 @@ rank_higher = ['notes']
     #[test]
     fn the_lists_go_by_their_keys_in_folders() {
         let keys = List::ALL.map(List::key);
-        assert_eq!(keys, ["exclude", "rank_lower", "rank_higher"]);
+        assert_eq!(keys, ["exclude", "rank_lower", "rank_higher", "search"]);
+        assert_eq!(List::FOLDERS, List::ALL[..3]);
+    }
+
+    const SEARCH: &str = "[search]
+so = 'https://stackoverflow.com/search?q={query}'
+g = \"https://duckduckgo.com/?q={query}\"
+";
+
+    #[test]
+    fn web_searches_are_read_from_the_search_table_by_prefix() {
+        let config = parse(SEARCH).expect("a config");
+        let engines: Vec<(&str, &str, &str)> = config
+            .search
+            .iter()
+            .map(|engine| (&*engine.prefix, &*engine.name, &*engine.url))
+            .collect();
+        assert_eq!(
+            engines,
+            [
+                ("g", "duckduckgo.com", "https://duckduckgo.com/?q={query}"),
+                (
+                    "so",
+                    "stackoverflow.com",
+                    "https://stackoverflow.com/search?q={query}"
+                ),
+            ]
+        );
+        assert_eq!(parse(DEFAULT).expect("the default file").search, []);
+        assert_eq!(parse("").expect("a config").search, []);
+    }
+
+    #[test]
+    fn web_searches_are_listed_as_their_prefix_and_address() {
+        let written = written(SEARCH).expect("a config");
+        assert_eq!(
+            entries(&written, List::Search),
+            [
+                "g https://duckduckgo.com/?q={query}",
+                "so https://stackoverflow.com/search?q={query}"
+            ]
+        );
+        assert!(entries(&written, List::Exclude).len() == 1, "the defaults");
+    }
+
+    #[test]
+    fn an_entry_reads_back_as_its_prefix_and_address() {
+        let listed = entry("so", "https://a.io/{query}");
+        assert_eq!(engine_of(&listed), Some(("so", "https://a.io/{query}")));
+        assert_eq!(
+            engine_of("  so 	 https://a.io/{query} "),
+            Some(("so", "https://a.io/{query}"))
+        );
+        assert_eq!(engine_of("so"), None);
+        assert_eq!(engine_of(" so "), None);
+        assert_eq!(engine_of(""), None);
+    }
+
+    #[test]
+    fn a_web_search_that_is_wrong_is_found_on_its_line() {
+        let found = problem(
+            "[search]
+
+so = 'https://stackoverflow.com/?q='
+",
+        );
+        assert_eq!(found.line, 3);
+        let url = "https://stackoverflow.com/?q=".to_string();
+        assert_eq!(found.why, Why::Value(Wanted::Address, url));
+        let found = problem(
+            "[search]
+'a b' = 'https://a.io/{query}'
+",
+        );
+        assert_eq!(found.line, 2);
+        assert_eq!(found.why, Why::Value(Wanted::Prefix, "a b".to_string()));
+        assert_eq!(
+            problem(
+                "[search]
+so = 5
+"
+            )
+            .line,
+            2
+        );
+        assert_eq!(
+            problem(
+                "search = 'x'
+"
+            )
+            .line,
+            1
+        );
+    }
+
+    #[test]
+    fn what_is_wrong_with_a_web_search_is_said_in_either_language() {
+        let said = |wanted, value: &str| {
+            let why = Why::Value(wanted, value.to_string());
+            (why.said(Language::English), why.said(Language::Russian))
+        };
+        let (english, russian) = said(Wanted::Address, "https://a.io/");
+        assert_eq!(
+            english,
+            "`https://a.io/` is not a web address with {query} where the words go"
+        );
+        assert_eq!(
+            russian,
+            "`https://a.io/` — не веб-адрес с {query} на месте слов"
+        );
+        let (english, _) = said(Wanted::Prefix, ">w");
+        assert_eq!(
+            english,
+            "`>w` is not a prefix: one word, not starting with >"
+        );
+        let (english, russian) = said(Wanted::Engine, "so");
+        assert!(
+            english.starts_with("`so` is not a prefix and an address, such as `so https://"),
+            "{english}"
+        );
+        assert!(
+            russian.starts_with("`so` — не префикс с адресом"),
+            "{russian}"
+        );
     }
 
     #[test]
