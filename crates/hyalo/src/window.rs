@@ -161,6 +161,17 @@ pub struct Services {
     pub hibernates: bool,
 }
 
+/// The icons of Windows' settings. They never change, but the shell may
+/// give none at start, so the ones still missing are asked for again as
+/// often as the apps.
+fn settings_icons() -> Source {
+    Source {
+        provider: Arc::new(catalog::find_system_icons),
+        trusted: catalog::REFRESH_AFTER,
+        excluded: None,
+    }
+}
+
 impl Services {
     /// The apps; the files of the fixed drives, with their snapshot in
     /// `%LOCALAPPDATA%\hyalo`; the bank's rates, kept there too; opened by
@@ -178,12 +189,7 @@ impl Services {
                     trusted: catalog::REFRESH_AFTER,
                     excluded: None,
                 },
-                // The icons of Windows' settings: they never change.
-                Source {
-                    provider: Arc::new(catalog::find_system_icons),
-                    trusted: Duration::MAX,
-                    excluded: None,
-                },
+                settings_icons(),
                 Source {
                     provider: walk,
                     trusted: files::REFRESH_AFTER,
@@ -1811,6 +1817,23 @@ mod tests {
         exit_code_on_hidden_desktop, in_own_window_station, on_hidden_desktop,
     };
     use std::path::Path;
+
+    /// A hyalo started as the screen locked showed Windows' settings
+    /// without icons all morning: the shell gave none at start, and the
+    /// provider was trusted for ever. It skips the icons it has, so asking
+    /// again as often as for the apps costs next to nothing.
+    #[test]
+    fn icons_of_settings_the_shell_did_not_give_are_asked_for_again_later() {
+        let trusted = settings_icons().trusted;
+        let found = Instant::now();
+        let soon = found + Duration::from_secs(60);
+        assert!(
+            !catalog::stale(Some(found), soon, trusted),
+            "not at every show"
+        );
+        let later = found + catalog::REFRESH_AFTER;
+        assert!(catalog::stale(Some(found), later, trusted), "asked again");
+    }
 
     fn app(title: &str) -> Item {
         Item {
