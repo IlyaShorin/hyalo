@@ -202,9 +202,9 @@ impl Walk<'_> {
     /// excluded, before the walk and again after it, for what was
     /// excluded while it went; watches the roots, from before the walk so
     /// nothing that changes during it is missed; walks them and saves the
-    /// snapshot; then follows the watches from what was excluded as the
-    /// walk began, so that what a config saved during the walk no longer
-    /// excludes, which the walk left out, is walked then.
+    /// snapshot; then follows the watches from all the index leaves out,
+    /// what was excluded as the walk began and what its end took out, so
+    /// that what a config saved meanwhile no longer excludes comes back.
     fn serve(&self, shared: &Arc<RwLock<Index>>, report: &dyn Fn(Found)) {
         if read(shared).is_empty() {
             load_into(shared, self.snapshot, report);
@@ -222,18 +222,30 @@ impl Walk<'_> {
             .enumerate()
             .filter_map(|(at, root)| Watch::start(root, tell(sender.clone(), at)))
             .collect();
-        let walked = self.excluded.paths();
-        self.walk(shared, &roots, report);
-        self.follow(shared, &roots, &events, walked, report);
+        // What the index leaves out: what the walk did, as it began, and
+        // what its end took out, which a config saved meanwhile may name.
+        let mut left_out = self.excluded.paths();
+        for path in self.walk(shared, &roots, report) {
+            if !left_out.contains(&path) {
+                left_out.push(path);
+            }
+        }
+        self.follow(shared, &roots, &events, left_out, report);
         drop(watches);
     }
 
     /// Walks the roots, takes out what was excluded while it went, and
-    /// saves the snapshot.
-    fn walk(&self, shared: &RwLock<Index>, roots: &[PathBuf], report: &dyn Fn(Found)) {
+    /// saves the snapshot; what it took out as excluded.
+    fn walk(
+        &self,
+        shared: &RwLock<Index>,
+        roots: &[PathBuf],
+        report: &dyn Fn(Found),
+    ) -> Vec<String> {
         walk_into(shared, roots, self.excluded, report);
-        prune(shared, self.excluded, report);
+        let pruned = prune(shared, self.excluded, report);
         save_to(shared, self.snapshot);
+        pruned
     }
 
     /// Keeps the index in step with what the watches see, until nobody
@@ -434,14 +446,11 @@ fn emptied(index: &mut Index, path: &str) -> Option<EntryId> {
 }
 
 /// Takes what is excluded out of the index, with everything under it,
-/// and says so if anything was there.
-fn prune(shared: &RwLock<Index>, excluded: &Excluded, report: &dyn Fn(Found)) {
+/// and says so if anything was there; what it took out as excluded.
+fn prune(shared: &RwLock<Index>, excluded: &Excluded, report: &dyn Fn(Found)) -> Vec<String> {
+    let paths = excluded.paths();
     let mut index = write(shared);
-    let found: Vec<_> = excluded
-        .paths()
-        .iter()
-        .filter_map(|path| index.find(path))
-        .collect();
+    let found: Vec<_> = paths.iter().filter_map(|path| index.find(path)).collect();
     for entry in &found {
         // An entry under another excluded one went with it.
         let _ = index.remove(*entry);
@@ -450,6 +459,7 @@ fn prune(shared: &RwLock<Index>, excluded: &Excluded, report: &dyn Fn(Found)) {
     if !found.is_empty() {
         report(Found::Files);
     }
+    paths
 }
 
 /// Saves the index at `snapshot`, if there is one.
@@ -1236,6 +1246,51 @@ mod tests {
         });
         let serving = Serving::new(saving, files);
         serving.finds("notes", &[folder.path(r"drop\notes.txt")]);
+    }
+
+    /// A folder excluded while the walk goes is taken out after it; one
+    /// taken off the list again before the following looks must come back.
+    /// The test above made the following start from what was excluded as
+    /// the walk began, and a slow run of the one before that timed out.
+    #[test]
+    fn a_folder_excluded_and_let_back_around_the_walk_s_end_comes_back() {
+        let folder = Scratch::new("excluded-around-walk").with(&[
+            "kept\\",
+            r"kept\notes.txt",
+            "gone\\",
+            r"gone\notes.txt",
+        ]);
+        let (provider, files, excluded) = walking_leaving_out(&folder, None);
+        let index = Arc::downgrade(&files.0);
+        let (gone, notes) = (folder.path("gone"), folder.path(r"gone\notes.txt"));
+        let saved = excluded.clone();
+        let step = AtomicUsize::new(0);
+        // Excluded once the walk has listed it, let back once the walk's
+        // end has taken it out.
+        let saving: Provider = Arc::new(move |request, report| {
+            provider(request, &|found| {
+                let listed = index.upgrade().map(Files);
+                let listed = listed.is_some_and(|files| search(&files, "notes").contains(&notes));
+                match (step.load(SeqCst), listed) {
+                    (0, true) => {
+                        saved.set(std::slice::from_ref(&gone));
+                        step.store(1, SeqCst);
+                    }
+                    (1, false) => {
+                        saved.set(&[]);
+                        step.store(2, SeqCst);
+                    }
+                    _ => {}
+                }
+                report(found);
+            })
+        });
+        let serving = Serving::new(saving, files);
+        let both = [
+            folder.path(r"gone\notes.txt"),
+            folder.path(r"kept\notes.txt"),
+        ];
+        serving.finds("notes", &both);
     }
 
     #[test]
