@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::system_commands::Command;
 use crate::text::Text;
+use crate::uninstall::Uninstall;
 
 /// One row in the results list.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -75,6 +76,8 @@ pub enum Action {
     /// Open a text file, such as the config, in the app Windows has for
     /// its kind, or in Notepad when there is none.
     Edit(String),
+    /// Uninstall an app.
+    Uninstall(Uninstall),
 }
 
 impl Action {

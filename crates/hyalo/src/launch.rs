@@ -7,6 +7,7 @@
 use std::path::Path;
 
 use hyalo_core::item::Action;
+use hyalo_core::uninstall::Uninstall;
 use windows::Win32::Foundation::ERROR_FILE_NOT_FOUND;
 use windows::Win32::UI::Shell::{
     ASSOCF_INIT_IGNOREUNKNOWN, ASSOCSTR_EXECUTABLE, AssocQueryStringW, ILCreateFromPathW, ILFree,
@@ -18,7 +19,7 @@ use windows::core::{HSTRING, PCWSTR, Result, w};
 
 use crate::clipboard::copy;
 use crate::com::Com;
-use crate::system;
+use crate::{system, uninstall};
 
 /// Carries out a picked item's action. Waits for the shell, so call it
 /// off the UI thread.
@@ -33,6 +34,10 @@ pub fn run(action: &Action, as_admin: bool) -> Result<()> {
         // The launcher opens its own window; there is nothing to run.
         Action::Settings => Ok(()),
         Action::Switch(window) => crate::switcher::switch_to(*window),
+        Action::Uninstall(Uninstall::Program {
+            program, arguments, ..
+        }) => execute(program, Some(arguments), verb(as_admin)),
+        Action::Uninstall(Uninstall::Package { full_name, .. }) => uninstall::remove(full_name),
     }
 }
 
@@ -162,6 +167,27 @@ mod tests {
     }
 
     #[test]
+    fn an_uninstaller_that_is_not_there_fails_without_a_message_box() {
+        let missing = Uninstall::Program {
+            name: "Nothing".to_string(),
+            program: r"C:\hyalo-test-no-such-folder\unins000.exe".to_string(),
+            arguments: "/S".to_string(),
+        };
+        let error = run(&Action::Uninstall(missing), false).expect_err("no such program");
+        assert_eq!(error.code(), ERROR_FILE_NOT_FOUND.to_hresult());
+    }
+
+    #[test]
+    fn a_package_that_is_not_there_is_not_removed() {
+        let missing = Uninstall::Package {
+            name: "Nothing".to_string(),
+            full_name: "hyalo.test.NoSuchPackage_1.0.0.0_x64__0000000000000".to_string(),
+        };
+        let error = run(&Action::Uninstall(missing), false).expect_err("no such package");
+        assert_eq!(error.code().0 as u32, 0x8007_3CF1, "{error}");
+    }
+
+    #[test]
     fn the_settings_window_is_the_launchers_to_open() {
         assert_eq!(run(&Action::Settings, false), Ok(()));
     }
@@ -179,6 +205,10 @@ mod tests {
             Action::CopyText("4".to_string()),
             Action::Settings,
             Action::Edit(r"C:\a.toml".to_string()),
+            Action::Uninstall(Uninstall::Package {
+                name: "App".to_string(),
+                full_name: "App_1.0.0.0_x64__0000000000000".to_string(),
+            }),
         ] {
             assert!(!at_once(&action), "{action:?}");
         }

@@ -5,9 +5,12 @@
 //!
 //! No test reads the real Uninstall keys or removes a real package: the
 //! keys are read through `entries_under`, tested on keys of the test's
-//! own, and the apps provider takes what it lists as a stand-in.
+//! own, and the apps provider takes what it lists as a stand-in; `remove`
+//! is asked only for a package no machine has. Window tests see an
+//! uninstall reach their stand-in runner.
 
 use hyalo_core::uninstall::{Entry, Folders};
+use windows::Management::Deployment::PackageManager;
 use windows::Win32::System::Com::CoTaskMemFree;
 use windows::Win32::System::Registry::{
     HKEY, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, RRF_RT_REG_DWORD,
@@ -19,8 +22,9 @@ use windows::Win32::UI::Shell::{
     FOLDERID_UserProfiles, FOLDERID_UserProgramFiles, FOLDERID_Windows, KF_FLAG_DEFAULT,
     SHGetKnownFolderPath,
 };
-use windows::core::GUID;
+use windows::core::{GUID, HSTRING, Result};
 
+use crate::com::Com;
 use crate::registry::{self, STRING};
 
 /// Where Programs and Features finds what it lists: the machine's 64-bit
@@ -75,6 +79,16 @@ fn entry(root: HKEY, key: &str, name: String) -> Entry {
 
 /// A DWORD of 1, as the registry holds it.
 const ONE: [u8; 4] = 1_u32.to_le_bytes();
+
+/// Removes the package `full_name` for the current user, as Start's
+/// Uninstall does, and waits until it is gone: call it off the UI thread.
+pub fn remove(full_name: &str) -> Result<()> {
+    let _com = Com::multithreaded()?;
+    let removing = PackageManager::new()?.RemovePackageAsync(&HSTRING::from(full_name))?;
+    // A removal that failed still hands back its result, with the error
+    // in it.
+    removing.join()?.ExtendedErrorCode()?.ok()
+}
 
 /// The folders many apps are installed in, none of them one app's own.
 const SHARED: [GUID; 13] = [
@@ -162,6 +176,14 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn removing_a_package_that_is_not_there_fails_and_removes_nothing() {
+        let error = remove("hyalo.test.NoSuchPackage_1.0.0.0_x64__0000000000000")
+            .expect_err("no such package");
+        // ERROR_INSTALL_PACKAGE_NOT_FOUND, as an HRESULT.
+        assert_eq!(error.code().0 as u32, 0x8007_3CF1, "{error}");
     }
 
     #[test]
