@@ -4,7 +4,7 @@ A fast, glassy Spotlight-style launcher for Windows 11. Press a hotkey, type a f
 
 *hyalo* comes from Greek ὕαλος, "glass".
 
-> **Status:** 0.2.0, the first release, with all of v0.1 and v0.2 below: finds and opens apps, files and folders (kept current as they change, narrowed by filters), Windows' own settings pages and Control Panel items, answers arithmetic, converts currencies, searches the web, switches windows, locks, restarts or shuts down the PC (asking first); lives in the tray, with a TOML config applied as you save it and a settings window that edits it; speaks English or Russian; updates itself from GitHub Releases. Installing it the first time is still a copy of `hyalo.exe` into `%LOCALAPPDATA%\Programs\hyalo` by hand.
+> **Status:** 0.2.0, the first release, with all of v0.1 and v0.2 below: finds and opens apps, files and folders (kept current as they change, narrowed by filters), Windows' own settings pages and Control Panel items, answers arithmetic, converts currencies, searches the web, switches windows, locks, restarts or shuts down the PC (asking first); lives in the tray, with a TOML config applied as you save it and a settings window that edits it; speaks English or Russian; updates itself from GitHub Releases. Download `hyalo.exe` from the latest release and run it: it installs itself.
 
 ## Goals
 
@@ -51,6 +51,10 @@ The launcher never runs elevated. Only the indexer service does, because MFT acc
 - Preview pane
 - On-demand content search (ripgrep in a chosen folder)
 - Script commands
+
+## Install
+
+Download `hyalo.exe` from the [latest release](https://github.com/IlyaShorin/hyalo/releases/latest) and run it, from Downloads or anywhere else. It copies itself into `%LOCALAPPDATA%\Programs\hyalo` (yours alone, no admin rights, nothing to click through) and starts from there; from then on it updates itself. Run a newer download later and it takes the place of the installed one, whose hyalo it closes; an older or the same one just shows the installed hyalo. `hyalo.exe --portable` stays where it is. Windows 11 22H2 or later for the glass; older systems get a solid background.
 
 ## Build
 

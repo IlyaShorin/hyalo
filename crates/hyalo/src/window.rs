@@ -1399,6 +1399,17 @@ pub fn ask_running(start: Start) {
     }
 }
 
+/// Asks the launcher that runs, perhaps another build in another process,
+/// to end, as an update's old build does once it has started the new
+/// one: it saves the picks and takes its icon away. Not tested: on the
+/// hidden desktop it would reach other tests' launchers.
+pub fn close_running() {
+    // SAFETY: a plain call.
+    if let Ok(hwnd) = unsafe { FindWindowW(WINDOW_CLASS, PCWSTR::null()) } {
+        post(hwnd, WM_CLOSE);
+    }
+}
+
 /// Asks the launcher `hwnd`, perhaps in another process, to show, or to
 /// open its settings. The start was the user's, so it may hand the
 /// foreground on; the launcher, in the background, could not take it on

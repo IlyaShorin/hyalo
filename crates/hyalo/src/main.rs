@@ -11,6 +11,7 @@ mod files;
 mod highlight;
 mod hotkeys;
 mod http;
+mod install;
 mod instance;
 mod keys;
 mod launch;
@@ -48,10 +49,14 @@ use windows::Win32::UI::HiDpi::{
 /// (started with Windows) or with its settings open (`--settings`); a
 /// second start asks the first to show or to open its settings, and goes.
 /// A new build an update started (`--replace`) waits for the old one to
-/// end, then runs in its place.
+/// end, then runs in its place. A release build started from anywhere
+/// but `%LOCALAPPDATA%\Programs\hyalo` installs itself there first.
 fn main() -> windows::core::Result<()> {
     let arguments: Vec<String> = std::env::args().collect();
     let start = instance::Start::from_args(arguments.clone());
+    if install::elsewhere(&arguments, start) {
+        return Ok(());
+    }
     let replace = instance::replacing(&arguments);
     let wait = replace.then_some(instance::REPLACE_WAIT);
     let run = |start| run(start, replace);

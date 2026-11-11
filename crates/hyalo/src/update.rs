@@ -225,9 +225,15 @@ pub fn restart(exe: &Path) -> io::Result<()> {
 
 /// The command that starts `exe` to replace this launcher.
 fn command(exe: &Path) -> Command {
+    detached(exe, &[autostart::HIDDEN, instance::REPLACE])
+}
+
+/// The command that starts `exe` with `flags` and nothing of this
+/// process's: no console, no handles to stdin or stdout.
+pub fn detached(exe: &Path, flags: &[&str]) -> Command {
     let mut command = Command::new(exe);
     command
-        .args([autostart::HIDDEN, instance::REPLACE])
+        .args(flags)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
