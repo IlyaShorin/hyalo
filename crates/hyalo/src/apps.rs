@@ -10,13 +10,15 @@
 //! states the invariant it relies on.
 
 use hyalo_core::item::{Action, Item, ItemId, Kind};
-use windows::Win32::Foundation::{E_INVALIDARG, SIZE};
+use hyalo_core::uninstall::App;
+use windows::Win32::Foundation::{E_INVALIDARG, PROPERTYKEY, SIZE};
 use windows::Win32::Graphics::Gdi::{DIBSECTION, DeleteObject, GetObjectW, HBITMAP};
 use windows::Win32::System::Com::CoTaskMemFree;
+use windows::Win32::UI::Shell::PropertiesSystem::PSGetPropertyKeyFromName;
 use windows::Win32::UI::Shell::{
-    BHID_EnumItems, FOLDERID_AppsFolder, IEnumShellItems, IShellItem, IShellItemImageFactory,
-    KF_FLAG_DEFAULT, SHCreateItemFromParsingName, SHGetKnownFolderItem, SIGDN, SIGDN_NORMALDISPLAY,
-    SIGDN_PARENTRELATIVEPARSING, SIIGBF_ICONONLY,
+    BHID_EnumItems, FOLDERID_AppsFolder, IEnumShellItems, IShellItem, IShellItem2,
+    IShellItemImageFactory, KF_FLAG_DEFAULT, SHCreateItemFromParsingName, SHGetKnownFolderItem,
+    SIGDN, SIGDN_NORMALDISPLAY, SIGDN_PARENTRELATIVEPARSING, SIIGBF_ICONONLY,
 };
 use windows::core::{HSTRING, Interface, Result};
 
@@ -50,16 +52,19 @@ fn subtitle(parsing_name: &str) -> String {
     }
 }
 
-/// One entry of the Applications folder: the item it lists, and the shell
+/// One entry of the Applications folder: the item it lists, what the
+/// shell says about the app (for telling its uninstaller), and the shell
 /// item its icon comes from. Lives on the thread that found it.
 pub struct Entry {
     pub item: Item,
+    pub app: App,
     shell: IShellItem,
 }
 
 /// Every entry of the Applications folder that `item` keeps, in the
 /// shell's order.
 pub fn find() -> Result<Vec<Entry>> {
+    let keys = Keys::new()?;
     // SAFETY: COM is initialized on this thread (see the module docs) and
     // every interface here is a live object owned by this function.
     unsafe {
@@ -75,9 +80,70 @@ pub fn find() -> Result<Vec<Entry>> {
             let name = display_name(&shell, SIGDN_NORMALDISPLAY)?;
             let parsing_name = display_name(&shell, SIGDN_PARENTRELATIVEPARSING)?;
             if let Some(item) = item(&name, &parsing_name) {
-                entries.push(Entry { item, shell });
+                let app = keys.about(&shell, &item);
+                entries.push(Entry { item, app, shell });
             }
         }
+    }
+}
+
+/// The shell's properties that tell an app's uninstaller.
+struct Keys {
+    /// What a shortcut starts: a program's path, an address, a shell
+    /// folder.
+    target: PROPERTYKEY,
+    /// A packaged app's package, and where it is installed.
+    package: PROPERTYKEY,
+    package_path: PROPERTYKEY,
+}
+
+impl Keys {
+    fn new() -> Result<Keys> {
+        Ok(Keys {
+            target: key("System.Link.TargetParsingPath")?,
+            package: key("System.AppUserModel.PackageFullName")?,
+            package_path: key("System.AppUserModel.PackageInstallPath")?,
+        })
+    }
+
+    /// What the shell says about the app `shell` lists as `item`; what
+    /// it does not say is empty.
+    fn about(&self, shell: &IShellItem, item: &Item) -> App {
+        let properties = shell.cast::<IShellItem2>().ok();
+        let text = |key| {
+            properties
+                .as_ref()
+                .map_or_else(String::new, |shell| text(shell, key))
+        };
+        App {
+            title: item.title.clone(),
+            parsing_name: item.id.0.clone(),
+            target: text(&self.target),
+            package: text(&self.package),
+            package_path: text(&self.package_path),
+        }
+    }
+}
+
+/// The key of the shell property named `name`.
+fn key(name: &str) -> Result<PROPERTYKEY> {
+    let mut key = PROPERTYKEY::default();
+    // SAFETY: `key` is a live PROPERTYKEY the call fills.
+    unsafe { PSGetPropertyKeyFromName(&HSTRING::from(name), &mut key)? };
+    Ok(key)
+}
+
+/// The text of property `key` of `shell`; empty when it has none.
+fn text(shell: &IShellItem2, key: &PROPERTYKEY) -> String {
+    // SAFETY: the string GetString allocates with CoTaskMemAlloc is read
+    // once, then freed once.
+    unsafe {
+        let Ok(text) = shell.GetString(key) else {
+            return String::new();
+        };
+        let read = String::from_utf16_lossy(text.as_wide());
+        CoTaskMemFree(Some(text.0.cast()));
+        read
     }
 }
 
@@ -276,6 +342,8 @@ pub(crate) mod tests {
     }
 
     const EXPLORER: &str = "Microsoft.Windows.Explorer";
+    const EDGE: &str = "MSEdge";
+    const STORE: &str = "Microsoft.WindowsStore_8wekyb3d8bbwe!App";
     const SETTINGS: &str =
         "windows.immersivecontrolpanel_cw5n1h2txyewy!microsoft.windows.immersivecontrolpanel";
 
@@ -302,6 +370,40 @@ pub(crate) mod tests {
             shell(|| (find().expect("list the apps").len(), entry(EXPLORER).item));
         assert!(apps > 1);
         assert_eq!(explorer.kind, Kind::App);
+    }
+
+    #[test]
+    fn the_shell_says_what_an_app_starts_and_which_package_it_is_in() {
+        let apps = shell(|| {
+            let found = find().expect("list the apps");
+            let about = |id| {
+                found
+                    .iter()
+                    .find(|entry| entry.item.id.0 == id)
+                    .map(|entry| entry.app.clone())
+            };
+            [EXPLORER, EDGE, STORE].map(|id| about(id).unwrap_or_else(|| panic!("{id} is listed")))
+        });
+        let [explorer, edge, store] = apps;
+        assert_eq!(explorer.parsing_name, EXPLORER);
+        assert!(
+            explorer.target.starts_with("::{"),
+            "a shell folder: {}",
+            explorer.target
+        );
+        assert!(explorer.package.is_empty() && explorer.package_path.is_empty());
+        assert_eq!(edge.title, "Microsoft Edge");
+        let target = edge.target.to_lowercase();
+        assert!(target.ends_with(r"\msedge.exe"), "a program: {target}");
+        assert!(edge.package.is_empty());
+        assert!(store.target.is_empty(), "{}", store.target);
+        assert!(
+            store.package.starts_with("Microsoft.WindowsStore_"),
+            "{}",
+            store.package
+        );
+        let place = store.package_path.to_lowercase();
+        assert!(place.ends_with(&store.package.to_lowercase()), "{place}");
     }
 
     #[test]

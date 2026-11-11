@@ -77,7 +77,7 @@ use crate::settings::{self, Loaded};
 use crate::switcher;
 use crate::tray::{self, Tray};
 use crate::update::Updates;
-use crate::{http, launch, rates, store, system, update};
+use crate::{http, launch, rates, store, system, uninstall, update};
 
 mod settings_window;
 
@@ -185,7 +185,7 @@ impl Services {
         Self {
             sources: vec![
                 Source {
-                    provider: Arc::new(catalog::find_apps),
+                    provider: catalog::apps(Arc::new(uninstall::entries)),
                     trusted: catalog::REFRESH_AFTER,
                     excluded: None,
                 },
