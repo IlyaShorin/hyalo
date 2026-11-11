@@ -268,12 +268,7 @@ impl Directory {
             self.cancel(&raw const overlapped);
             return Err(Ended::Stopped);
         }
-        let event = match self.wait(&raw const overlapped, stop) {
-            Waited::Read(0) | Waited::Overflowed => Event::Lost,
-            Waited::Read(length) => Event::Changed(records(&bytes(buffer)[..length], top)),
-            Waited::Stopped => return Err(Ended::Stopped),
-            Waited::Failed => return Err(Ended::Broken),
-        };
+        let event = event_of(self.wait(&raw const overlapped, stop), buffer, top)?;
         let nothing = event == Event::Changed(Vec::new());
         match nothing || tell(event) {
             true => Ok(()),
@@ -342,6 +337,18 @@ enum Waited {
     Overflowed,
     Stopped,
     Failed,
+}
+
+/// What a finished wait says: the changes it read into `buffer`, their
+/// names joined to `top`, or that the watch lost track; a wait stopped or
+/// failed ends the watch.
+fn event_of(waited: Waited, buffer: &[u64], top: &str) -> Result<Event, Ended> {
+    match waited {
+        Waited::Read(0) | Waited::Overflowed => Ok(Event::Lost),
+        Waited::Read(length) => Ok(Event::Changed(records(&bytes(buffer)[..length], top))),
+        Waited::Stopped => Err(Ended::Stopped),
+        Waited::Failed => Err(Ended::Broken),
+    }
 }
 
 /// The buffer's bytes.
