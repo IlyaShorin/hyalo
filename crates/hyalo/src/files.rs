@@ -202,7 +202,9 @@ impl Walk<'_> {
     /// excluded, before the walk and again after it, for what was
     /// excluded while it went; watches the roots, from before the walk so
     /// nothing that changes during it is missed; walks them and saves the
-    /// snapshot; then follows the watches.
+    /// snapshot; then follows the watches from what was excluded as the
+    /// walk began, so that what a config saved during the walk no longer
+    /// excludes, which the walk left out, is walked then.
     fn serve(&self, shared: &Arc<RwLock<Index>>, report: &dyn Fn(Found)) {
         if read(shared).is_empty() {
             load_into(shared, self.snapshot, report);
@@ -220,8 +222,9 @@ impl Walk<'_> {
             .enumerate()
             .filter_map(|(at, root)| Watch::start(root, tell(sender.clone(), at)))
             .collect();
+        let walked = self.excluded.paths();
         self.walk(shared, &roots, report);
-        self.follow(shared, &roots, &events, report);
+        self.follow(shared, &roots, &events, walked, report);
         drop(watches);
     }
 
@@ -235,21 +238,23 @@ impl Walk<'_> {
 
     /// Keeps the index in step with what the watches see, until nobody
     /// but the provider holds it: changes as they come, a walk of a root
-    /// whose watch lost track, what is excluded as it changes. Tells
-    /// the window, and saves the snapshot, now and then when the index
+    /// whose watch lost track, what is excluded as it changes from
+    /// `excluded`, what the index was last made to leave out. Tells the
+    /// window, and saves the snapshot, now and then when the index
     /// changed, and once more at the end.
     fn follow(
         &self,
         shared: &Arc<RwLock<Index>>,
         roots: &[PathBuf],
         events: &Receiver<(usize, Event)>,
+        excluded: Vec<String>,
         report: &dyn Fn(Found),
     ) {
         let version = read(shared).version();
         let mut kept = Kept {
             told: Mark::new(version),
             saved: Mark::new(version),
-            excluded: self.excluded.paths(),
+            excluded,
         };
         while Arc::strong_count(shared) > 1 {
             // Out of the match, which would hold the lock through it.
@@ -1200,6 +1205,39 @@ mod tests {
         );
     }
 
+    /// A config saved while the first walk goes, which on the fixed drives
+    /// takes minutes: the walk has left out what was excluded when it
+    /// listed it, so what is no longer excluded must be walked once it
+    /// ends. A window test timed out here under the whole suite's load.
+    #[test]
+    fn a_folder_no_longer_excluded_while_the_walk_went_is_walked_once_it_ends() {
+        let folder = Scratch::new("excluded-mid-walk").with(&[
+            "keep\\",
+            r"keep\notes.txt",
+            "drop\\",
+            r"drop\notes.txt",
+        ]);
+        let (provider, files, excluded) = walking_leaving_out(&folder, None);
+        excluded.set(&[folder.path("drop")]);
+        // Once the walk has listed `keep`, so the folder holding both,
+        // `keep` is excluded instead of `drop`. Weak: a provider whose
+        // report holds the index never ends.
+        let index = Arc::downgrade(&files.0);
+        let (listed, keep) = (folder.path(r"keep\notes.txt"), folder.path("keep"));
+        let saved = excluded.clone();
+        let saving: Provider = Arc::new(move |request, report| {
+            provider(request, &|found| {
+                let walked = index.upgrade().map(Files);
+                if walked.is_some_and(|files| search(&files, "notes").contains(&listed)) {
+                    saved.set(std::slice::from_ref(&keep));
+                }
+                report(found);
+            })
+        });
+        let serving = Serving::new(saving, files);
+        serving.finds("notes", &[folder.path(r"drop\notes.txt")]);
+    }
+
     #[test]
     fn a_watch_that_lost_track_walks_its_root_again_and_that_one_alone() {
         let (lost, kept) = (Scratch::new("lost"), Scratch::new("lost-not"));
@@ -1226,7 +1264,7 @@ mod tests {
             }
             search(&files, "unseen")
         });
-        walk.follow(&writer.0, &roots, &events, &|_| {});
+        walk.follow(&writer.0, &roots, &events, Vec::new(), &|_| {});
         let found = searching.join().expect("the search");
         assert_eq!(
             found,
