@@ -1,7 +1,8 @@
 //! Ranking: which items a query shows, best first.
 //!
 //! An item's score is how well its title matches, plus a weight for its
-//! kind (apps above folders above files), plus a boost from frecency.
+//! kind (apps above every file and folder, folders above files), plus a
+//! boost from frecency.
 
 use crate::frecency::{Frecency, Timestamp};
 use crate::item::{Item, Kind};
@@ -66,10 +67,16 @@ fn find(pattern: &matcher::Pattern, item: &Item) -> Option<(Match, f64)> {
     title.into_iter().chain(others).max_by(best)
 }
 
-/// Points per step up the kind ladder (file, folder, app, calculator): a
-/// little more than one kind of match, so an app outranks a file that
-/// matches one kind better, but not two.
+/// Points a folder has over a file, and an answer over an app: a little
+/// more than half a kind of match.
 const KIND_STEP: f64 = 12.0;
+
+/// Points an app has over a file: more than an exact match of a folder in
+/// a favoured place (100 + 12 + 3) has over the weakest match of an app
+/// (a substring of another name in the wrong layout: 20 - 2 - 5). What
+/// matches among the apps comes first, unless a file or folder was picked
+/// for the query.
+const LAUNCHED: f64 = 104.0;
 
 /// An item's score: the `points` its match is worth, its kind, the
 /// points of the place it lives in (see `places`) and its frecency score.
@@ -78,17 +85,16 @@ pub fn score(points: f64, kind: Kind, place: f64, picks: f64) -> f64 {
 }
 
 fn kind_weight(kind: Kind) -> f64 {
-    let step = match kind {
-        Kind::File => 0,
-        Kind::Folder => 1,
+    match kind {
+        Kind::File => 0.0,
+        Kind::Folder => KIND_STEP,
         // Windows' settings rank like apps: a page should not drown
         // under files.
-        Kind::App | Kind::Setting | Kind::Command => 2,
+        Kind::App | Kind::Setting | Kind::Command => LAUNCHED,
         // A notice or a web search is never ranked; it goes first, as an
         // answer does. Windows are ranked only among themselves.
-        Kind::Calculator | Kind::Web | Kind::Window | Kind::Notice => 3,
-    };
-    f64::from(step) * KIND_STEP
+        Kind::Calculator | Kind::Web | Kind::Window | Kind::Notice => LAUNCHED + KIND_STEP,
+    }
 }
 
 /// The most frecency can add: four kinds of match, so the weakest match
@@ -276,15 +282,37 @@ mod tests {
         );
     }
 
+    /// `docker` listed five folders of that name above Docker Desktop:
+    /// people open the app far more often than such a folder.
     #[test]
-    fn a_file_that_matches_two_kinds_better_outranks_an_app() {
+    fn a_matching_app_outranks_every_file_and_folder_never_picked_however_well_they_match() {
         let items = [
-            item("vscode", "Visual Studio Code", Kind::App),
-            item("vsc.log", "vsc.log", Kind::File),
+            Item::file(r"C:\Users\Me\Desktop\docker".to_string(), true),
+            at(r"C:\Users\Me\Desktop\docker"),
+            known_as("Containers", &["undockered"]),
+            item("app", "Docker Desktop", Kind::App),
         ];
         assert_eq!(
-            order("vsc", &items, &Frecency::default()),
-            ["vsc.log", "vscode"]
+            order_in("docker", &items, &Frecency::default(), &desktop()),
+            [
+                "app",
+                "Containers",
+                r"C:\Users\Me\Desktop\docker",
+                r"C:\Users\Me\Desktop\docker",
+            ]
+        );
+        let ranked = rank("docker", &items, &Frecency::default(), &desktop(), NOW);
+        let kinds: Vec<Kind> = ranked.iter().map(|ranked| ranked.item.kind).collect();
+        assert_eq!(kinds, [Kind::App, Kind::App, Kind::Folder, Kind::File]);
+    }
+
+    #[test]
+    fn a_folder_picked_for_the_query_rises_above_an_app_that_only_contains_it() {
+        let folder = Item::file(r"D:\docker".to_string(), true);
+        let items = [item("app", "Undockered", Kind::App), folder.clone()];
+        assert_eq!(
+            order("docker", &items, &picked(&folder.id.0, "docker", 1)),
+            [r"D:\docker", "app"]
         );
     }
 

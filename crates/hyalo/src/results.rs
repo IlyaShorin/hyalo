@@ -301,13 +301,15 @@ mod tests {
         Item::file(path.to_string(), false)
     }
 
+    /// By score, which puts the apps that match above every file never
+    /// picked, even one that matches better.
     #[test]
     fn files_found_join_the_items_by_score() {
         let files = [file(r"C:\notes"), file(r"C:\my notes.md")];
         let results = found("notes", &apps(&["Sticky Notes", "Notes"]), &files);
         assert_eq!(
             titles(&results),
-            ["Notes", "notes", "Sticky Notes", "my notes.md"]
+            ["Notes", "Sticky Notes", "notes", "my notes.md"]
         );
     }
 
