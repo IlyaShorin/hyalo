@@ -1,0 +1,40 @@
+#!/bin/sh
+# The ub-mode checks a push must pass, cheapest first, so the first
+# failure stops the push: the format, clippy's warnings, the tests, then
+# scripts/gates.sh (every function under CRAP 10, no duplicate candidates
+# at similarity 0.8 or above). Once per push rather than per commit:
+# commits stay quick, and what leaves the machine is checked.
+#
+# The tests run on their own before the gates: crapper scores the
+# functions of a coverage run that failed at 0 % and fails only on what
+# that does to their CRAP, which hides the test that broke.
+#
+# It checks the tree checked out, so it refuses while tracked files have
+# changes not committed: what it checks is then what HEAD holds. Mutation
+# testing stays by hand (`scripts/gates.sh mutate`): a run takes up to an
+# hour.
+#
+# Git runs it once `git config core.hooksPath .githooks` is set in the
+# clone.
+set -eu
+
+cd "$(git rev-parse --show-toplevel)"
+# Git's own shell may start without cargo on its PATH.
+export PATH="$HOME/.cargo/bin:$PATH"
+
+step() {
+  printf '\npre-push: %s\n' "$1" >&2
+}
+
+if ! git diff --quiet HEAD --; then
+  step "tracked files have changes not committed: commit or stash them, so the checks see what is pushed"
+  exit 1
+fi
+step "cargo fmt --all --check"
+cargo fmt --all --check
+step "cargo clippy --workspace --all-targets -- -D warnings"
+cargo clippy --workspace --all-targets -- -D warnings
+step "cargo test --workspace"
+cargo test --workspace
+step "scripts/gates.sh"
+scripts/gates.sh
