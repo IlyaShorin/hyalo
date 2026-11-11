@@ -6,6 +6,7 @@
 //! a window that hangs cannot hold the launcher up.
 
 use std::collections::HashMap;
+use std::num::NonZeroU32;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -178,11 +179,19 @@ fn process_of(window: HWND) -> u32 {
 /// another process: that one is the app.
 fn program(window: HWND, process: u32) -> Option<String> {
     let exe = image(process)?;
-    if !frame_host(&exe) {
-        return Some(exe);
+    Some(belongs_to(exe, || {
+        child_of_another(window, process).and_then(image)
+    }))
+}
+
+/// The program a window of `exe` belongs to: `exe`, unless that hosts
+/// Store apps' frames; then the app `inside` finds in the frame, while
+/// it is there.
+fn belongs_to(exe: String, inside: impl FnOnce() -> Option<String>) -> String {
+    match frame_host(&exe) {
+        true => inside().unwrap_or(exe),
+        false => exe,
     }
-    let app = child_of_another(window, process).and_then(image);
-    Some(app.unwrap_or(exe))
 }
 
 /// Whether `exe` is the host of Store apps' frames.
@@ -259,10 +268,8 @@ fn description(exe: &str) -> Option<String> {
     // SAFETY: the buffer is as long as the call said; the values read
     // from it point into it and are read while it lives.
     unsafe {
-        let size = GetFileVersionInfoSizeW(&path, None);
-        if size == 0 {
-            return None;
-        }
+        // A file with no version information measures 0.
+        let size = NonZeroU32::new(GetFileVersionInfoSizeW(&path, None))?.get();
         let mut block = vec![0_u8; size as usize];
         GetFileVersionInfoW(&path, None, size, block.as_mut_ptr().cast()).ok()?;
         let (pointer, length) = value(&block, "\\VarFileInfo\\Translation")?;
@@ -314,9 +321,9 @@ pub fn switch_to(window: isize) -> Result<()> {
         let flash = FLASHWINFO {
             cbSize: size_of::<FLASHWINFO>() as u32,
             hwnd: window,
+            // Until the window comes forward, at the cursor's blink rate.
             dwFlags: FLASHW_TRAY | FLASHW_TIMERNOFG,
-            uCount: 0,
-            dwTimeout: 0,
+            ..Default::default()
         };
         let _ = FlashWindowEx(&flash);
     }
@@ -333,7 +340,8 @@ mod tests {
     use windows::Win32::UI::WindowsAndMessaging::{
         CreateWindowExW, DestroyWindow, DispatchMessageW, GetForegroundWindow, HWND_TOP, MSG,
         PM_REMOVE, PeekMessageW, SW_MINIMIZE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SetWindowPos,
-        ShowWindow, WINDOW_EX_STYLE, WS_OVERLAPPEDWINDOW, WS_VISIBLE,
+        ShowWindow, WINDOW_EX_STYLE, WINDOW_STYLE, WS_CHILD, WS_EX_APPWINDOW, WS_OVERLAPPEDWINDOW,
+        WS_VISIBLE,
     };
     use windows::core::w;
 
@@ -349,27 +357,49 @@ mod tests {
             } else {
                 Default::default()
             };
+            Made::under(title, extra, WS_OVERLAPPEDWINDOW | visible, None)
+        }
+
+        fn shown(title: &str) -> Made {
+            Made::new(title, WINDOW_EX_STYLE::default(), true)
+        }
+
+        /// A shown window owned by `owner`, with `extra` styles.
+        fn owned(title: &str, owner: &Made, extra: WINDOW_EX_STYLE) -> Made {
+            let style = WS_OVERLAPPEDWINDOW | WS_VISIBLE;
+            Made::under(title, extra, style, Some(owner.0))
+        }
+
+        /// A child window of `parent`.
+        fn child_of(parent: &Made) -> Made {
+            Made::under("", WINDOW_EX_STYLE::default(), WS_CHILD, Some(parent.0))
+        }
+
+        /// A window with these styles: owned by `above`, or its child for
+        /// `WS_CHILD`.
+        fn under(
+            title: &str,
+            extra: WINDOW_EX_STYLE,
+            style: WINDOW_STYLE,
+            above: Option<HWND>,
+        ) -> Made {
             let window = unsafe {
                 CreateWindowExW(
                     extra,
                     w!("STATIC"),
                     &HSTRING::from(title),
-                    WS_OVERLAPPEDWINDOW | visible,
+                    style,
                     0,
                     0,
                     200,
                     100,
-                    None,
+                    above,
                     None,
                     None,
                     None,
                 )
             };
             Made(window.expect("a window"))
-        }
-
-        fn shown(title: &str) -> Made {
-            Made::new(title, WINDOW_EX_STYLE::default(), true)
         }
 
         fn id(&self) -> isize {
@@ -426,6 +456,49 @@ mod tests {
             let exe = exe.to_string_lossy().to_string();
             assert_eq!(mine.and_then(|open| open.exe.clone()), Some(exe));
         });
+    }
+
+    #[test]
+    fn an_owned_window_is_listed_only_when_it_asks_to_be_an_app_window() {
+        on_hidden_desktop(|| {
+            let owner = Made::shown("hyalo switcher owner");
+            let dialog = Made::owned("hyalo switcher dialog", &owner, WINDOW_EX_STYLE::default());
+            let app = Made::owned("hyalo switcher app window", &owner, WS_EX_APPWINDOW);
+            let listed = listed(&[&owner, &dialog, &app], 0);
+            assert_eq!(listed.len(), 2, "{listed:?}");
+            assert!(listed.contains(&"hyalo switcher owner".to_string()));
+            assert!(listed.contains(&"hyalo switcher app window".to_string()));
+        });
+    }
+
+    #[test]
+    fn a_child_counts_when_another_process_than_the_one_named_owns_it() {
+        on_hidden_desktop(|| {
+            let ours = unsafe { GetCurrentProcessId() };
+            let lone = Made::shown("hyalo switcher lone");
+            assert_eq!(child_of_another(lone.0, 0), None, "no child at all");
+            let parent = Made::shown("hyalo switcher parent");
+            let _child = Made::child_of(&parent);
+            assert_eq!(child_of_another(parent.0, ours), None, "our own child");
+            assert_eq!(child_of_another(parent.0, 0), Some(ours));
+        });
+    }
+
+    #[test]
+    fn a_store_apps_frame_is_named_by_the_app_inside_and_any_other_by_itself() {
+        let host = r"C:\Windows\System32\ApplicationFrameHost.exe";
+        let calculator = r"C:\Program Files\WindowsApps\Calculator\CalculatorApp.exe";
+        let explorer = r"C:\Windows\explorer.exe";
+        let inside = |exe: &str| {
+            let exe = exe.to_string();
+            move || Some(exe)
+        };
+        assert_eq!(belongs_to(host.to_string(), inside(calculator)), calculator);
+        assert_eq!(belongs_to(host.to_string(), || None), host, "app gone");
+        assert_eq!(
+            belongs_to(explorer.to_string(), inside(calculator)),
+            explorer
+        );
     }
 
     #[test]

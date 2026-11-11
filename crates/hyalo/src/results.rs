@@ -152,8 +152,7 @@ impl Results {
         let rows = ranked.map(|(item, matched)| Listed { item, matched });
         Self {
             rows: rows.take(MAX_ROWS).collect(),
-            selected: 0,
-            asking: false,
+            ..Self::default()
         }
     }
 
