@@ -44,9 +44,10 @@ impl Engine {
         let Some(scheme) = scheme.filter(|_| !blank(url) && url.contains(QUERY)) else {
             return Err(Wrong::Url);
         };
+        let host = host(&url[scheme.len()..]);
         Ok(Engine {
             prefix: prefix.to_string(),
-            name: host(&url[scheme.len()..]).to_string(),
+            name: known(host).unwrap_or(host).to_string(),
             url: url.to_string(),
         })
     }
@@ -55,6 +56,19 @@ impl Engine {
     /// that is not a letter, a digit or one of `-._~` percent-encoded.
     pub fn address(&self, words: &str) -> String {
         self.url.replace(QUERY, &encoded(words))
+    }
+}
+
+/// What the row calls the site at `host`, when it is one people know by
+/// name: those the config writes at first.
+fn known(host: &str) -> Option<&'static str> {
+    match host {
+        "google.com" => Some("Google"),
+        "github.com" => Some("GitHub"),
+        "youtube.com" => Some("YouTube"),
+        "yandex.ru" => Some("Yandex"),
+        host if host.ends_with(".wikipedia.org") => Some("Wikipedia"),
+        _ => None,
     }
 }
 
@@ -247,6 +261,34 @@ mod tests {
         );
         assert_eq!(named("https://docs.rs/{query}"), Ok("docs.rs".to_string()));
         assert_eq!(named("https://a.io#{query}"), Ok("a.io".to_string()));
+    }
+
+    /// The five the config writes are the user's like any other now, and
+    /// their rows still say Google, not google.com.
+    #[test]
+    fn an_engine_at_a_known_site_is_named_after_it() {
+        let named = |url| Engine::custom("x", url).map(|engine| engine.name);
+        for (url, name) in [
+            ("https://www.google.com/search?q={query}", "Google"),
+            ("https://github.com/search?q={query}", "GitHub"),
+            (
+                "https://www.youtube.com/results?search_query={query}",
+                "YouTube",
+            ),
+            (
+                "https://ru.wikipedia.org/w/index.php?search={query}",
+                "Wikipedia",
+            ),
+            (
+                "https://en.wikipedia.org/w/index.php?search={query}",
+                "Wikipedia",
+            ),
+            ("https://yandex.ru/search/?text={query}", "Yandex"),
+        ] {
+            assert_eq!(named(url), Ok(name.to_string()), "{url}");
+        }
+        let near = named("https://notwikipedia.org/?q={query}");
+        assert_eq!(near, Ok("notwikipedia.org".to_string()), "not a subdomain");
     }
 
     #[test]
