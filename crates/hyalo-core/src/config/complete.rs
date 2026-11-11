@@ -101,7 +101,8 @@ fn said(document: &mut DocumentMut, text: &str, first: &DocumentMut, language: L
         .iter_mut()
         .filter_map(|(_, item)| item.as_table_mut())
         .collect();
-    tables.sort_by_key(|table| table.position());
+    // A table written in has no place and comes after the file's own.
+    tables.sort_by_key(|table| table.position().unwrap_or(isize::MAX));
     // `tables` wrote in every table the first file has.
     let table = tables.into_iter().next().expect("a table");
     let before = table.decor().prefix().and_then(|prefix| prefix.as_str());
@@ -157,7 +158,13 @@ rank_higher = []
         assert!(kept(OLDER, &after), "{after}");
         assert!(after.contains("\n# Looks for a new version of hyalo on GitHub once a day"));
         assert!(after.contains("\ncheck_for_updates = true\n"), "{after}");
-        assert!(after.contains("\n# language = \"ru\"\n"), "{after}");
+        let at = |text: &str| after.find(text).expect(text);
+        // On the user's file it went before [search], the table written in
+        // without a place, which sorted first.
+        assert!(
+            at("\n# language = \"ru\"\n") < at("\n[folders]\n"),
+            "among the settings at the top: {after}"
+        );
         let config = parse(&after).expect("good settings");
         assert_eq!(config.hotkey.to_string(), "F4");
         assert_eq!(config.language, None, "still the language Windows speaks");
