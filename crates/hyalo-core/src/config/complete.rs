@@ -55,7 +55,9 @@ fn tables(document: &mut DocumentMut, first: &DocumentMut) -> bool {
             Some(_) => {}
             None => {
                 let mut table = item.as_table().expect("a table").clone();
-                table.set_position(Some(last(document) + 1));
+                // Without a place of its own a table follows the one
+                // before it, and it comes after the document's tables.
+                table.set_position(None);
                 document.insert_formatted(key, Item::Table(table));
                 changed = true;
             }
@@ -77,12 +79,6 @@ fn keys(table: &mut Table, first: &Table) -> bool {
     !missing.is_empty()
 }
 
-/// Where the last of `document`'s tables stands.
-fn last(document: &DocumentMut) -> isize {
-    let tables = document.iter().filter_map(|(_, item)| item.as_table());
-    tables.filter_map(Table::position).max().unwrap_or(0)
-}
-
 /// Says the language in a comment before the first table, with the words
 /// `first` has on it, unless `text` names it or says it in a comment
 /// already; whether it did.
@@ -99,31 +95,17 @@ fn said(document: &mut DocumentMut, text: &str, first: &DocumentMut, language: L
         .get_key_value("language")
         .expect("a language");
     let words = key.leaf_decor().prefix().and_then(|prefix| prefix.as_str());
-    let comment = format!(
-        "{}# language = \"{}\"
-",
-        words.unwrap_or(
-            "
-"
-        ),
-        language.code()
-    );
+    let words = words.unwrap_or("\n");
+    let comment = format!("{words}# language = \"{}\"\n", language.code());
     let mut tables: Vec<&mut Table> = document
         .iter_mut()
         .filter_map(|(_, item)| item.as_table_mut())
         .collect();
     tables.sort_by_key(|table| table.position());
-    let Some(table) = tables.into_iter().next() else {
-        return false;
-    };
+    // `tables` wrote in every table the first file has.
+    let table = tables.into_iter().next().expect("a table");
     let before = table.decor().prefix().and_then(|prefix| prefix.as_str());
-    let prefix = format!(
-        "{comment}{}",
-        before.unwrap_or(
-            "
-"
-        )
-    );
+    let prefix = format!("{comment}{}", before.unwrap_or("\n"));
     table.decor_mut().set_prefix(prefix);
     true
 }
@@ -224,5 +206,34 @@ rank_higher = []
     fn a_file_with_windows_line_endings_keeps_them() {
         let after = complete(&OLDER.replace('\n', "\r\n"));
         assert!(!after.replace("\r\n", "").contains('\n'), "only CRLF");
+    }
+
+    #[test]
+    fn tables_written_in_follow_the_file_s_own_in_the_first_file_s_order() {
+        let after = complete("hotkey = 'F4'\n");
+        let at = |header: &str| after.find(header).expect(header);
+        assert!(at("\n[folders]\n") < at("\n[search]\n"), "{after}");
+    }
+
+    #[test]
+    fn a_file_that_leaves_out_only_its_web_searches_gets_them() {
+        let russian = default_file(Language::Russian);
+        let (without, _) = russian.split_once("\n# Web searches").expect("the table");
+        let after = complete(&format!("{without}\n"));
+        assert!(after.contains("\n[search]\ng = "), "{after}");
+    }
+
+    #[test]
+    fn a_file_that_leaves_out_only_the_language_gets_it_in_a_comment() {
+        let language = "# What the settings window, the tray menu and the launcher's rows say:
+# \"en\" for English or \"ru\" for Russian. Left out, the language Windows
+# is shown in.
+language = \"en\"
+
+";
+        let without = DEFAULT.replacen(language, "", 1);
+        assert_ne!(without, DEFAULT, "the language taken out");
+        let after = complete(&without);
+        assert!(after.contains("\n# language = \"ru\"\n"), "{after}");
     }
 }

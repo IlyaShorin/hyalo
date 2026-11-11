@@ -750,20 +750,12 @@ g = \"https://duckduckgo.com/?q={query}\"
 
     #[test]
     fn a_file_without_web_searches_searches_the_five_and_an_empty_table_none() {
-        let left_out = parse(
-            "hotkey = 'F4'
-",
-        )
-        .expect("a config");
+        let left_out = parse("hotkey = 'F4'\n").expect("a config");
         assert_eq!(
             left_out.engines(Language::Russian),
             web::defaults(Language::Russian)
         );
-        let emptied = parse(
-            "[search]
-",
-        )
-        .expect("a config");
+        let emptied = parse("[search]\n").expect("a config");
         assert_eq!(emptied.engines(Language::Russian), []);
     }
 
