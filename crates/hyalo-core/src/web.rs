@@ -91,34 +91,28 @@ fn encoded(text: &str) -> String {
     out
 }
 
-/// The engines hyalo knows without being told: Google, GitHub, YouTube,
-/// Wikipedia in the language hyalo speaks, and Yandex.
-pub fn built_in(language: Language) -> [Engine; 5] {
-    let wikipedia = match language {
-        Language::English => "https://en.wikipedia.org/w/index.php?search={query}",
-        Language::Russian => "https://ru.wikipedia.org/w/index.php?search={query}",
-    };
+/// The engines the config writes at first, and searches when it names
+/// none: Google, GitHub, Wikipedia in `language`, Yandex and YouTube, in
+/// the order of their prefixes, as the file reads them.
+pub fn defaults(language: Language) -> Vec<Engine> {
+    let wikipedia = format!(
+        "https://{}.wikipedia.org/w/index.php?search={QUERY}",
+        language.code()
+    );
     [
-        ("g", "Google", "https://www.google.com/search?q={query}"),
-        ("gh", "GitHub", "https://github.com/search?q={query}"),
-        (
-            "yt",
-            "YouTube",
-            "https://www.youtube.com/results?search_query={query}",
-        ),
-        ("w", "Wikipedia", wikipedia),
-        ("ya", "Yandex", "https://yandex.ru/search/?text={query}"),
+        ("g", "https://www.google.com/search?q={query}"),
+        ("gh", "https://github.com/search?q={query}"),
+        ("w", wikipedia.as_str()),
+        ("ya", "https://yandex.ru/search/?text={query}"),
+        ("yt", "https://www.youtube.com/results?search_query={query}"),
     ]
-    .map(|(prefix, name, url)| Engine {
-        prefix: prefix.to_string(),
-        name: name.to_string(),
-        url: url.to_string(),
-    })
+    .into_iter()
+    .map(|(prefix, url)| Engine::custom(prefix, url).expect("a good engine"))
+    .collect()
 }
 
 /// The engine `query` asks and the words it asks for: a prefix, in any
-/// case, then a space and words. The user's engines come before the
-/// built-in ones, so one of theirs takes a built-in prefix over.
+/// case, then a space and words.
 pub fn asked<'a>(query: &'a str, engines: &'a [Engine]) -> Option<(&'a Engine, &'a str)> {
     let (prefix, words) = query.trim_start().split_once(' ')?;
     let words = words.trim();
@@ -131,11 +125,10 @@ pub fn asked<'a>(query: &'a str, engines: &'a [Engine]) -> Option<(&'a Engine, &
     Some((engine, words))
 }
 
-/// The row for `query` when it asks one of the user's `custom` engines
-/// or a built-in one, said in `language`: Enter opens the search.
-pub fn answer(query: &str, custom: &[Engine], language: Language) -> Option<Item> {
-    let engines: Vec<Engine> = custom.iter().cloned().chain(built_in(language)).collect();
-    let (engine, words) = asked(query, &engines)?;
+/// The row for `query` when it asks one of `engines`, said in
+/// `language`: Enter opens the search.
+pub fn answer(query: &str, engines: &[Engine], language: Language) -> Option<Item> {
+    let (engine, words) = asked(query, engines)?;
     Some(Item {
         id: ItemId(format!("hyalo:web:{}", engine.prefix)),
         title: language.fill(Text::SearchWeb, &[&engine.name, words]),
@@ -150,8 +143,8 @@ pub fn answer(query: &str, custom: &[Engine], language: Language) -> Option<Item
 mod tests {
     use super::*;
 
-    fn engines() -> [Engine; 5] {
-        built_in(Language::English)
+    fn engines() -> Vec<Engine> {
+        defaults(Language::English)
     }
 
     fn opened(item: &Item) -> &str {
@@ -163,7 +156,7 @@ mod tests {
 
     #[test]
     fn a_prefix_a_space_and_words_search_the_web_for_the_words() {
-        let item = answer("g rust lifetimes", &[], Language::English).expect("a search");
+        let item = answer("g rust lifetimes", &engines(), Language::English).expect("a search");
         assert_eq!(item.title, "Search Google for “rust lifetimes”");
         assert_eq!(item.subtitle, "Web search · Enter to open in the browser");
         assert_eq!(item.kind, Kind::Web);
@@ -175,7 +168,7 @@ mod tests {
 
     #[test]
     fn the_row_speaks_russian_too() {
-        let item = answer("g rust lifetimes", &[], Language::Russian).expect("a search");
+        let item = answer("g rust lifetimes", &engines(), Language::Russian).expect("a search");
         assert_eq!(item.title, "Искать в Google: «rust lifetimes»");
         assert_eq!(
             item.subtitle,
@@ -184,9 +177,9 @@ mod tests {
     }
 
     #[test]
-    fn each_built_in_prefix_asks_its_engine() {
+    fn each_of_the_five_prefixes_asks_its_engine() {
         let address = |query| {
-            let item = answer(query, &[], Language::English).expect("a search");
+            let item = answer(query, &engines(), Language::English).expect("a search");
             opened(&item).to_string()
         };
         assert_eq!(address("gh hyalo"), "https://github.com/search?q=hyalo");
@@ -202,7 +195,8 @@ mod tests {
             address("ya погода"),
             "https://yandex.ru/search/?text=%D0%BF%D0%BE%D0%B3%D0%BE%D0%B4%D0%B0"
         );
-        let russian = answer("w стекло", &[], Language::Russian).expect("a search");
+        let russian = defaults(Language::Russian);
+        let russian = answer("w стекло", &russian, Language::Russian).expect("a search");
         assert!(opened(&russian).starts_with("https://ru.wikipedia.org/"));
     }
 
@@ -221,7 +215,11 @@ mod tests {
     #[test]
     fn a_prefix_alone_or_a_word_that_starts_like_one_is_no_search() {
         for query in ["g", "g ", "g   ", "git", "github desktop", "gh", "", " "] {
-            assert_eq!(answer(query, &[], Language::English), None, "{query:?}");
+            assert_eq!(
+                answer(query, &engines(), Language::English),
+                None,
+                "{query:?}"
+            );
         }
     }
 
@@ -233,7 +231,7 @@ mod tests {
     }
 
     #[test]
-    fn the_users_engine_comes_before_a_built_in_one() {
+    fn only_the_engines_given_are_asked() {
         let ddg = Engine::custom("g", "https://duckduckgo.com/?q={query}").expect("an engine");
         let so =
             Engine::custom("so", "https://stackoverflow.com/search?q={query}").expect("an engine");
@@ -244,8 +242,12 @@ mod tests {
         let item = answer("so borrow", &custom, Language::English).expect("a search");
         assert_eq!(opened(&item), "https://stackoverflow.com/search?q=borrow");
         assert_eq!(item.id, ItemId("hyalo:web:so".to_string()));
-        let item = answer("gh rust", &custom, Language::English).expect("a search");
-        assert_eq!(opened(&item), "https://github.com/search?q=rust");
+        assert_eq!(
+            answer("gh rust", &custom, Language::English),
+            None,
+            "none built in"
+        );
+        assert_eq!(answer("g rust", &[], Language::English), None);
     }
 
     #[test]

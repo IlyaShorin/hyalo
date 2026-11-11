@@ -425,14 +425,16 @@ mod tests {
     #[test]
     fn a_prefix_and_words_are_answered_with_a_web_search_and_the_rows_follow() {
         let query = "g it";
+        let engines = web::defaults(Language::English);
+        let answer = |query| answer(query, None, &engines, Language::English);
         let rows = search(query, &apps(&["Git Bash", "Paint"]));
-        let results = rows.answered(answer(query, None, &[], Language::English));
+        let results = rows.answered(answer(query));
         assert_eq!(titles(&results), ["Search Google for “it”"]);
         let git = search("git", &apps(&["Git Bash"]));
-        let results = git.answered(answer("git", None, &[], Language::English));
+        let results = git.answered(answer("git"));
         assert_eq!(titles(&results), ["Git Bash"], "no web row for a word");
         let notes = search("w notes", &apps(&["w notes app"]));
-        let results = notes.answered(answer("w notes", None, &[], Language::English));
+        let results = notes.answered(answer("w notes"));
         assert_eq!(
             titles(&results),
             ["Search Wikipedia for “notes”", "w notes app"]
@@ -454,7 +456,7 @@ mod tests {
     }
 
     #[test]
-    fn the_users_engines_are_asked_before_the_built_in_ones() {
+    fn a_web_search_is_answered_before_the_calculator() {
         let ddg = Engine::custom("g", "https://duckduckgo.com/?q={query}").expect("an engine");
         let item = answer("g 2+2", None, &[ddg], Language::English).expect("a search");
         assert_eq!(item.title, "Search duckduckgo.com for “2+2”");

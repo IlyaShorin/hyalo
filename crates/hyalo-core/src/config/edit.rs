@@ -473,7 +473,8 @@ mod tests {
     #[test]
     fn a_language_takes_the_place_of_the_one_written_and_keeps_its_comment() {
         let after = edited(DEFAULT, Change::Language(Language::Russian));
-        assert_eq!(after, crate::config::default_file(Language::Russian));
+        let russian = DEFAULT.replacen("language = \"en\"", "language = \"ru\"", 1);
+        assert_eq!(after, russian, "that line alone");
         assert_eq!(edited(&after, Change::Language(Language::Russian)), after);
     }
 
@@ -502,7 +503,9 @@ mod tests {
         );
         assert_eq!(after, expected);
         let back = written(&after).expect("good settings");
-        assert_eq!(back.list(List::Search), [SO]);
+        let listed = back.list(List::Search);
+        assert_eq!(listed.len(), 6, "the five, then it: {listed:?}");
+        assert!(listed.contains(&SO.to_string()), "{listed:?}");
     }
 
     #[test]

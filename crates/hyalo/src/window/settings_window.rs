@@ -1207,8 +1207,8 @@ mod tests {
             assert_eq!(title(settings.0), "hyalo settings");
             assert!(settings.shows("Hotkey"));
             settings.click(Target::Language(Language::Russian));
-            let russian = config::default_file(Language::Russian);
-            assert_eq!(setup.file(), russian);
+            let russian = DEFAULT.replacen("language = \"en\"", "language = \"ru\"", 1);
+            assert_eq!(setup.file(), russian, "that line alone");
             assert!(settings.shows("Сочетание клавиш"));
             assert_eq!(title(settings.0), "Параметры hyalo");
             setup
@@ -1373,7 +1373,10 @@ mod tests {
             let line = "so = \"https://stackoverflow.com/search?q={query}\"\n";
             assert_eq!(setup.file(), format!("{DEFAULT}{line}"));
             assert!(settings.shows(so));
-            settings.click(Target::Remove(List::Search, 0));
+            let written = config::written(&setup.file()).expect("good settings");
+            let listed = written.list(List::Search);
+            let at = listed.iter().position(|entry| entry == so).expect("listed");
+            settings.click(Target::Remove(List::Search, at));
             assert_eq!(setup.file(), DEFAULT, "the comments survive both");
         });
     }

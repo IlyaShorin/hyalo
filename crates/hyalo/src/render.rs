@@ -759,7 +759,8 @@ mod tests {
         on_hidden_desktop(|| {
             let query = "g rust lifetimes";
             let language = hyalo_core::text::Language::English;
-            let item = hyalo_core::web::answer(query, &[], language).expect("a search");
+            let engines = hyalo_core::web::defaults(language);
+            let item = hyalo_core::web::answer(query, &engines, language).expect("a search");
             let scene = Scene {
                 rows: vec![Row {
                     id: &item.id,

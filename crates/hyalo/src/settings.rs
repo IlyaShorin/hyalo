@@ -177,6 +177,7 @@ mod tests {
         let path = config_in(&scratch);
         let english = Config {
             language: Some(Language::English),
+            search: Some(hyalo_core::web::defaults(Language::English)),
             ..Config::default()
         };
         assert_eq!(load(&path), Some(Ok(english)));

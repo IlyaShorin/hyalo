@@ -915,6 +915,11 @@ mod tests {
             "Rank higher",
             "Web search",
             "Search prefixes",
+            "g https://www.google.com/search?q={query}",
+            "gh https://github.com/search?q={query}",
+            "w https://en.wikipedia.org/w/index.php?search={query}",
+            "ya https://yandex.ru/search/?text={query}",
+            "yt https://www.youtube.com/results?search_query={query}",
             "config.toml",
             "Edit the file instead",
         ];
@@ -984,10 +989,12 @@ mod tests {
         let change = Change::Add(List::Search, SO.to_string());
         let after = config::edit(DEFAULT, &change).expect("edited");
         panel.done(&change, Some(written(&after)));
-        assert_eq!(after_searches(&panel), Some(SO.to_string()));
+        assert!(texts(&panel).contains(&SO.to_string()), "shown");
+        let listed = written(&after).list(List::Search).to_vec();
+        let at = listed.iter().position(|entry| entry == SO).expect("listed");
         let remove = Change::Remove(List::Search, SO.to_string());
         assert_eq!(
-            click(&mut panel, Target::Remove(List::Search, 0)),
+            click(&mut panel, Target::Remove(List::Search, at)),
             Some(Effect::Change(remove))
         );
     }
@@ -1665,6 +1672,11 @@ notes
             "Показывать выше",
             "Поиск в интернете",
             "Префиксы поиска",
+            "g https://www.google.com/search?q={query}",
+            "gh https://github.com/search?q={query}",
+            "w https://ru.wikipedia.org/w/index.php?search={query}",
+            "ya https://yandex.ru/search/?text={query}",
+            "yt https://www.youtube.com/results?search_query={query}",
             "config.toml",
             "Редактировать файл напрямую",
         ];

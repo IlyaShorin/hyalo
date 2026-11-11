@@ -223,8 +223,8 @@ table! {
     FolderName => "A folder name, such as {0}", "Имя папки, например {0}";
     Web => "Web search", "Поиск в интернете";
     Searches => "Search prefixes", "Префиксы поиска";
-    SearchesHelp => "Type a prefix, a space and words: g, gh, yt, w and ya are built in",
-        "Префикс, пробел и слова: g, gh, yt, w и ya уже есть";
+    SearchesHelp => "Type a prefix, a space and words; × takes a search out",
+        "Префикс, пробел и слова; × убирает поиск";
     Engine => "A prefix and an address with {query}", "Префикс и адрес с {query}";
     EditFile => "Edit the file instead", "Редактировать файл напрямую";
     EditFileHelp => "Changes here are saved to it at once, and what you save there shows up here",

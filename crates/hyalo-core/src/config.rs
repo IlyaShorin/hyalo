@@ -53,19 +53,28 @@ rank_lower = ['target']
 # and the project folders in your profile: a folder name or a full path.
 rank_higher = []
 
-# Web searches of your own: a prefix, then the address with {query} where
-# the words go, such as so = "https://stackoverflow.com/search?q={query}".
-# Type the prefix, a space and the words. Built in are g (Google), gh
-# (GitHub), yt (YouTube), w (Wikipedia) and ya (Yandex); one of yours with
-# the same prefix takes its place.
+# Web searches: a prefix, then the address with {query} where the words
+# go. Type the prefix, a space and the words, such as g rust lifetimes.
+# Add your own, such as so = "https://stackoverflow.com/search?q={query}",
+# change an address, or take a line out to drop that search.
 [search]
+g = "https://www.google.com/search?q={query}"
+gh = "https://github.com/search?q={query}"
+w = "https://en.wikipedia.org/w/index.php?search={query}"
+ya = "https://yandex.ru/search/?text={query}"
+yt = "https://www.youtube.com/results?search_query={query}"
 "#;
 
 /// The file written the first time, in `language`: the defaults, with the
-/// language Windows is shown in.
+/// language Windows is shown in, and Wikipedia in it.
 pub fn default_file(language: Language) -> String {
     let named = format!("language = \"{}\"", language.code());
-    DEFAULT.replacen("language = \"en\"", &named, 1)
+    let wikipedia = format!("https://{}.wikipedia.org/", language.code());
+    DEFAULT.replacen("language = \"en\"", &named, 1).replacen(
+        "https://en.wikipedia.org/",
+        &wikipedia,
+        1,
+    )
 }
 
 /// The settings.
@@ -84,8 +93,19 @@ pub struct Config {
     pub rank_lower: Vec<Place>,
     /// Places whose files rank higher, besides the built-in ones.
     pub rank_higher: Vec<Place>,
-    /// The user's web searches, besides the built-in ones.
-    pub search: Vec<Engine>,
+    /// The web searches `[search]` lists; `None` when the file has no
+    /// `[search]`, which searches the defaults.
+    pub search: Option<Vec<Engine>>,
+}
+
+impl Config {
+    /// The web searches a query may ask: those the file lists, or, when it
+    /// lists none, the defaults, Wikipedia in `language`.
+    pub fn engines(&self, language: Language) -> Vec<Engine> {
+        self.search
+            .clone()
+            .unwrap_or_else(|| web::defaults(language))
+    }
 }
 
 impl Default for Config {
@@ -100,7 +120,7 @@ impl Default for Config {
             exclude: strings(List::Exclude).collect(),
             rank_lower: places(List::RankLower),
             rank_higher: places(List::RankHigher),
-            search: Vec::new(),
+            search: None,
         }
     }
 }
@@ -291,10 +311,8 @@ fn read(text: &str) -> Result<(Config, [Vec<String>; 4]), Problem> {
     let lists = [&folders.exclude, &folders.rank_lower, &folders.rank_higher];
     let [exclude, rank_lower, rank_higher] =
         List::FOLDERS.map(|list| as_written(lists[list.index()].as_deref(), list));
-    let search = file.search.unwrap_or_default();
-    let engines = search
-        .iter()
-        .map(|(prefix, url)| entry(prefix, url.get_ref()));
+    let engines = file.search.iter().flatten();
+    let engines = engines.map(|(prefix, url)| entry(prefix, url.get_ref()));
     let written = [exclude, rank_lower, rank_higher, engines.collect()];
     let defaults = Config::default();
     let at = Lines(text);
@@ -310,10 +328,15 @@ fn read(text: &str) -> Result<(Config, [Vec<String>; 4]), Problem> {
         exclude: at.each(folders.exclude, defaults.exclude, excluded)?,
         rank_lower: at.each(folders.rank_lower, defaults.rank_lower, place)?,
         rank_higher: at.each(folders.rank_higher, defaults.rank_higher, place)?,
-        search: search
-            .into_iter()
-            .map(|(prefix, url)| at.read(url, &|url| engine(&prefix, url)))
-            .collect::<Result<_, _>>()?,
+        search: file
+            .search
+            .map(|search| {
+                search
+                    .into_iter()
+                    .map(|(prefix, url)| at.read(url, &|url| engine(&prefix, url)))
+                    .collect::<Result<_, _>>()
+            })
+            .transpose()?,
     };
     Ok((config, written))
 }
@@ -478,6 +501,7 @@ mod tests {
             config,
             Config {
                 language: english,
+                search: Some(web::defaults(Language::English)),
                 ..Config::default()
             }
         );
@@ -642,6 +666,7 @@ rank_higher = ['notes']
         let config = parse(&russian).expect("the default file");
         let expected = Config {
             language: Some(Language::Russian),
+            search: Some(web::defaults(Language::Russian)),
             ..Config::default()
         };
         assert_eq!(config, expected);
@@ -681,6 +706,7 @@ g = \"https://duckduckgo.com/?q={query}\"
         let engines: Vec<(&str, &str, &str)> = config
             .search
             .iter()
+            .flatten()
             .map(|engine| (&*engine.prefix, &*engine.name, &*engine.url))
             .collect();
         assert_eq!(
@@ -694,8 +720,49 @@ g = \"https://duckduckgo.com/?q={query}\"
                 ),
             ]
         );
-        assert_eq!(parse(DEFAULT).expect("the default file").search, []);
-        assert_eq!(parse("").expect("a config").search, []);
+        assert_eq!(parse("").expect("a config").search, None);
+    }
+
+    /// The five hyalo knew without being told are written in the file
+    /// like any other, so they can be seen, changed and taken out.
+    #[test]
+    fn the_file_written_at_first_lists_five_web_searches_wikipedia_in_its_language() {
+        let engines = |text: &str, language| {
+            let config = parse(text).expect("a config");
+            let engines = config.engines(language).into_iter();
+            engines
+                .map(|engine| (engine.prefix, engine.url))
+                .collect::<Vec<_>>()
+        };
+        let english = engines(DEFAULT, Language::English);
+        let prefixes: Vec<&str> = english.iter().map(|(prefix, _)| prefix.as_str()).collect();
+        assert_eq!(prefixes, ["g", "gh", "w", "ya", "yt"]);
+        let russian = engines(&default_file(Language::Russian), Language::Russian);
+        let wikipedia = russian.iter().find(|(prefix, _)| prefix == "w");
+        let url = wikipedia.map(|(_, url)| url.as_str());
+        assert_eq!(
+            url,
+            Some("https://ru.wikipedia.org/w/index.php?search={query}")
+        );
+    }
+
+    #[test]
+    fn a_file_without_web_searches_searches_the_five_and_an_empty_table_none() {
+        let left_out = parse(
+            "hotkey = 'F4'
+",
+        )
+        .expect("a config");
+        assert_eq!(
+            left_out.engines(Language::Russian),
+            web::defaults(Language::Russian)
+        );
+        let emptied = parse(
+            "[search]
+",
+        )
+        .expect("a config");
+        assert_eq!(emptied.engines(Language::Russian), []);
     }
 
     #[test]
@@ -799,9 +866,12 @@ so = 5
         assert_eq!(entries(&written, List::Exclude), [r"C:\Windows\WinSxS"]);
         assert_eq!(entries(&written, List::RankLower), ["target"]);
         assert!(entries(&written, List::RankHigher).is_empty());
-        for list in List::ALL {
+        for list in List::FOLDERS {
             assert_eq!(entries(&written, list), list.defaults());
         }
+        let searches = entries(&written, List::Search);
+        assert_eq!(searches.len(), 5, "{searches:?}");
+        assert_eq!(searches[0], "g https://www.google.com/search?q={query}");
     }
 
     #[test]

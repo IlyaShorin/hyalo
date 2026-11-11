@@ -912,7 +912,8 @@ impl App {
             true => self.notice_row(),
             false => {
                 let rates = self.catalog.rates.as_ref();
-                results::answer(text, rates, &self.config.search, self.language())
+                let engines = self.config.engines(self.language());
+                results::answer(text, rates, &engines, self.language())
             }
         };
         found.answered(answer)

@@ -889,9 +889,10 @@ mod tests {
             panel.wheel(-12000, 2000.0, 300.0);
             let scrolled = painted(&mut panel, (640, 300), 96);
             assert!(bar(&scrolled, 290) > 40, "at the bottom, scrolled down");
-            let tall = painted(&mut panel, (640, 1200), 96);
+            // The page's five web searches make it taller than 1200.
+            let tall = painted(&mut panel, (640, 1600), 96);
             assert!(
-                (0..1200).all(|y| bar(&tall, y) == 0),
+                (0..1600).all(|y| bar(&tall, y) == 0),
                 "no bar when all fits"
             );
         });
