@@ -1038,7 +1038,7 @@ fn scene<'a>(
         subtitle: results.subtitle(index, language),
         highlights: utf16_ranges(&listed.item.title, &listed.matched),
         icon: icons.get(&listed.item.id),
-        glyph: results::glyph(&listed.item.action),
+        glyph: results::glyph(listed.item.kind, &listed.item.action),
     };
     Scene {
         query: query.text(),

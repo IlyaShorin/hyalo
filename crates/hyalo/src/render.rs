@@ -667,7 +667,7 @@ mod tests {
                     subtitle: "Calculator · Enter to copy",
                     highlights: Vec::new(),
                     icon: None,
-                    glyph: None,
+                    glyph: Some('\u{E8EF}'),
                 }],
                 selected: 0,
                 ..Scene::bar("1234567+0,5")
@@ -723,7 +723,7 @@ mod tests {
                     subtitle: "hyalo keeps its last good settings · Enter to open config.toml",
                     highlights: Vec::new(),
                     icon: None,
-                    glyph: None,
+                    glyph: Some('\u{E7BA}'),
                 }],
                 selected: 0,
                 ..Scene::bar("")
@@ -744,7 +744,7 @@ mod tests {
                     subtitle: "100 USD → RUB · Bank of Russia, 10.11.2026 · Enter to copy",
                     highlights: Vec::new(),
                     icon: None,
-                    glyph: None,
+                    glyph: Some('\u{E8EF}'),
                 }],
                 selected: 0,
                 ..Scene::bar("100 usd")
@@ -767,7 +767,7 @@ mod tests {
                     subtitle: &item.subtitle,
                     highlights: Vec::new(),
                     icon: None,
-                    glyph: None,
+                    glyph: Some('\u{E774}'),
                 }],
                 selected: 0,
                 ..Scene::bar(query)

@@ -42,13 +42,23 @@ pub fn subtitle(item: &Item, language: Language) -> &str {
     }
 }
 
-/// The symbol a row shows where an icon goes: a system command's, from
-/// Segoe Fluent Icons; `None` for the rest, which have icons.
-pub fn glyph(action: &Action) -> Option<char> {
-    let Action::System(command) = action else {
-        return None;
-    };
-    Some(match command {
+/// The symbol a row of `kind` shows where an icon goes, from Segoe Fluent
+/// Icons: a calculator for answers, a globe for web searches, a warning
+/// for a notice, a system command's own; `None` for the rest, which have
+/// icons (apps, files, settings pages, windows).
+pub fn glyph(kind: Kind, action: &Action) -> Option<char> {
+    match (kind, action) {
+        (Kind::Calculator, _) => Some('\u{E8EF}'),
+        (Kind::Web, _) => Some('\u{E774}'),
+        (Kind::Notice, _) => Some('\u{E7BA}'),
+        (_, Action::System(command)) => Some(command_glyph(*command)),
+        _ => None,
+    }
+}
+
+/// A system command's symbol.
+fn command_glyph(command: Command) -> char {
+    match command {
         Command::Lock => '\u{E72E}',
         Command::Sleep => '\u{E708}',
         Command::Hibernate => '\u{E823}',
@@ -56,7 +66,7 @@ pub fn glyph(action: &Action) -> Option<char> {
         Command::ShutDown => '\u{E7E8}',
         Command::SignOut => '\u{F3B1}',
         Command::EmptyRecycleBin => '\u{E74D}',
-    })
+    }
 }
 
 /// One row of the list: an item, and the letters of its title the query
@@ -664,10 +674,10 @@ mod tests {
     }
 
     #[test]
-    fn each_system_command_shows_a_symbol_of_its_own_and_nothing_else_does() {
+    fn each_system_command_shows_a_symbol_of_its_own() {
         let glyphs: std::collections::HashSet<char> = Command::ALL
             .into_iter()
-            .filter_map(|command| glyph(&Action::System(command)))
+            .filter_map(|command| glyph(Kind::Command, &Action::System(command)))
             .collect();
         assert_eq!(glyphs.len(), Command::ALL.len());
         assert!(
@@ -675,11 +685,20 @@ mod tests {
                 .iter()
                 .all(|glyph| ('\u{E000}'..='\u{F8FF}').contains(glyph))
         );
-        assert_eq!(glyph(&Action::System(Command::Lock)), Some('\u{E72E}'));
-        assert_eq!(
-            glyph(&Action::Open("ms-settings:display".to_string())),
-            None
-        );
+        let lock = glyph(Kind::Command, &Action::System(Command::Lock));
+        assert_eq!(lock, Some('\u{E72E}'));
+    }
+
+    #[test]
+    fn rows_without_an_icon_of_their_own_show_a_symbol_and_the_rest_their_icons() {
+        let copy = Action::CopyText("4".to_string());
+        assert_eq!(glyph(Kind::Calculator, &copy), Some('\u{E8EF}'));
+        let search = Action::Open("https://www.google.com/search?q=x".to_string());
+        assert_eq!(glyph(Kind::Web, &search), Some('\u{E774}'));
+        assert_eq!(glyph(Kind::Notice, &Action::Settings), Some('\u{E7BA}'));
+        let page = Action::Open("ms-settings:display".to_string());
+        assert_eq!(glyph(Kind::Setting, &page), None);
+        assert_eq!(glyph(Kind::App, &Action::Open("x".to_string())), None);
     }
 
     #[test]
