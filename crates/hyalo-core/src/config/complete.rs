@@ -4,16 +4,18 @@
 use toml_edit::{DocumentMut, Item, Table};
 
 use super::edit::line_endings;
-use super::{List, default_file, written};
+use super::{List, default_file, parse, written};
 use crate::text::Language;
 
 /// `text` with the settings it leaves out written in, each with the
-/// words the file written at first has on it; `None` when it leaves out
-/// nothing, or does not read. The language goes in as a comment: written,
+/// words the file written at first has on it, Wikipedia in the language
+/// the file names, else in `language`, the one Windows speaks; `None`
+/// when it leaves out nothing, or does not read. The language goes in as
+/// a comment: written,
 /// it would stop following the language Windows speaks. A `[search]` the
 /// file has stays as it is, even empty: that is no web searches.
 pub fn completed(text: &str, language: Language) -> Option<String> {
-    written(text).ok()?;
+    let language = parse(text).ok()?.language.unwrap_or(language);
     let mut document: DocumentMut = text.parse().ok()?;
     let first: DocumentMut = default_file(language)
         .parse()
@@ -206,6 +208,8 @@ rank_higher = []
     fn a_language_written_or_said_in_a_comment_is_not_added_again() {
         let named = complete("language = 'en'\n");
         assert!(!named.contains("# language"), "{named}");
+        let wikipedia = "\nw = \"https://en.wikipedia.org/";
+        assert!(named.contains(wikipedia), "the file's language: {named}");
         let commented = complete("# language = \"en\"\nhotkey = 'F4'\n");
         assert_eq!(commented.matches("language =").count(), 1, "{commented}");
     }
