@@ -4,7 +4,7 @@ A fast, glassy Spotlight-style launcher for Windows 11. Press a hotkey, type a f
 
 *hyalo* comes from Greek ὕαλος, "glass".
 
-> **Status:** early prototype: finds and opens apps, files and folders (kept current as they change, narrowed by filters), Windows' own settings pages and Control Panel items, answers arithmetic, converts currencies, searches the web, switches windows, locks, restarts or shuts down the PC (asking first); lives in the tray, with a TOML config applied as you save it and a settings window that edits it; speaks English or Russian; updates itself from GitHub Releases. Installing it the first time is still a copy of `hyalo.exe` into `%LOCALAPPDATA%\Programs\hyalo` by hand.
+> **Status:** 0.2.0, the first release, with all of v0.1 and v0.2 below: finds and opens apps, files and folders (kept current as they change, narrowed by filters), Windows' own settings pages and Control Panel items, answers arithmetic, converts currencies, searches the web, switches windows, locks, restarts or shuts down the PC (asking first); lives in the tray, with a TOML config applied as you save it and a settings window that edits it; speaks English or Russian; updates itself from GitHub Releases. Installing it the first time is still a copy of `hyalo.exe` into `%LOCALAPPDATA%\Programs\hyalo` by hand.
 
 ## Goals
 
@@ -27,7 +27,7 @@ The launcher never runs elevated. Only the indexer service does, because MFT acc
 
 ## Roadmap
 
-**v0.1: daily driver**
+**v0.1: daily driver** (done, in 0.2.0)
 - Global hotkey (Alt+Space by default, configurable)
 - Apps: Start Menu shortcuts and Store/UWP apps, with icons
 - Files and folders from every NTFS drive, live updates
@@ -40,7 +40,7 @@ The launcher never runs elevated. Only the indexer service does, because MFT acc
 - Settings window in the same glass, for those who would rather not edit the file: every change is written to `config.toml` at once, keeping your comments and layout, and edits made to the file show up in the open window
 - Installs for the current user without admin rights and updates itself from GitHub Releases: a quiet "new version" notice in the launcher and the tray menu, with the release notes; one click downloads the new build, checks it, swaps it in and restarts hyalo
 
-**v0.2**
+**v0.2** (done, in 0.2.0)
 - Windows Settings pages (`ms-settings:`) and Control Panel items
 - Web search prefixes (`g`, `gh`, `yt`, custom)
 - Window switcher (`>`)
