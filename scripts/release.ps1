@@ -74,8 +74,13 @@ if ($DryRun) {
     exit 0
 }
 
+# gh says "release not found" on its error output, and Windows PowerShell
+# 5.1 stops on that while errors stop the script.
+$ErrorActionPreference = "Continue"
 gh release view $Tag *> $null
-if ($LASTEXITCODE -eq 0) { Fail "the release $Tag is out already" }
+$out = $LASTEXITCODE -eq 0
+$ErrorActionPreference = "Stop"
+if ($out) { Fail "the release $Tag is out already" }
 gh release create $Tag $exe $sum --target $commit --title "hyalo $version" --notes-file $notes
 if ($LASTEXITCODE -ne 0) { Fail "gh could not create the release" }
 git fetch --quiet origin "refs/tags/${Tag}:refs/tags/${Tag}"

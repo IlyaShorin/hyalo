@@ -687,6 +687,17 @@ mod tests {
         }
     }
 
+    /// Windows PowerShell 5.1 stops a script whose errors stop it on any
+    /// line a native command writes to its error output, and gh writes
+    /// "release not found" there for a release not out yet: 0.2.1's run
+    /// stopped there, before publishing.
+    #[test]
+    fn the_release_script_asks_whether_the_release_is_out_without_stopping_on_the_answer() {
+        let script = include_str!("../../../scripts/release.ps1");
+        let asked = "$ErrorActionPreference = \"Continue\"\ngh release view $Tag *> $null\n$out = $LASTEXITCODE -eq 0\n$ErrorActionPreference = \"Stop\"\n";
+        assert!(script.contains(asked), "{asked}");
+    }
+
     #[test]
     fn the_sum_file_is_named_after_the_exe() {
         assert_eq!(SUM, format!("{EXE}.sha256"));
