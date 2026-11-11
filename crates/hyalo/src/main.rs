@@ -23,6 +23,7 @@ mod panel;
 mod picker;
 mod rates;
 mod recorder;
+mod registry;
 mod render;
 mod results;
 mod settings;
@@ -31,6 +32,7 @@ mod surface;
 mod switcher;
 mod system;
 mod tray;
+mod uninstall;
 mod update;
 mod window;
 
