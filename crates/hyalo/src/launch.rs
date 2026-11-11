@@ -28,16 +28,27 @@ pub fn run(action: &Action, as_admin: bool) -> Result<()> {
         Action::Open(target) => open(target, as_admin),
         Action::Launch { program, arguments } => execute(program, Some(arguments), verb(as_admin)),
         Action::Reveal(path) => reveal(path),
-        Action::System(command) => system::run(*command, &system::System),
+        Action::System(_) | Action::Uninstall(_) => change(action, as_admin),
         Action::CopyText(text) => copy(text),
         Action::Edit(path) => edit(path),
         // The launcher opens its own window; there is nothing to run.
         Action::Settings => Ok(()),
         Action::Switch(window) => crate::switcher::switch_to(*window),
+    }
+}
+
+/// Carries out what changes the machine, which its row asked about
+/// first: a system command, or an uninstall, whose uninstaller starts as
+/// any program does (as administrator only when asked) or whose package
+/// is removed. `run` hands it nothing else.
+fn change(action: &Action, as_admin: bool) -> Result<()> {
+    match action {
+        Action::System(command) => system::run(*command, &system::System),
         Action::Uninstall(Uninstall::Program {
             program, arguments, ..
         }) => execute(program, Some(arguments), verb(as_admin)),
         Action::Uninstall(Uninstall::Package { full_name, .. }) => uninstall::remove(full_name),
+        _ => Ok(()),
     }
 }
 
