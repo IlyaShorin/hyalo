@@ -146,6 +146,8 @@ table! {
         "Нажмите Enter ещё раз, чтобы выйти из системы";
     AskEmptyRecycleBin => "Press Enter again to empty the Recycle Bin",
         "Нажмите Enter ещё раз, чтобы очистить корзину";
+    /// An app's second line after Shift+Delete: what is uninstalled.
+    AskUninstall => "Press Enter to uninstall {0}", "Нажмите Enter, чтобы удалить {0}";
     /// An amount, its currency, the target, the rates' date.
     Currency => "{0} {1} → {2} · Bank of Russia, {3} · Enter to copy",
         "{0} {1} → {2} · Банк России, {3} · Enter — скопировать";

@@ -763,15 +763,38 @@ impl App {
         Ok(!asked)
     }
 
-    /// Enter on the selected row: opens it, unless it asks first and has
-    /// not asked yet; then it asks, in place. Whether it asked: the
+    /// Enter on the selected row: carries out what the row asked about,
+    /// if it asks; else what `command` does with it (opens it), unless
+    /// that asks first: then the row asks, in place. Whether it asked: the
     /// launcher stays, waiting for the next Enter.
     fn enter(&mut self, command: Command) -> Result<bool> {
-        if self.results.confirm() {
-            self.act(command);
+        let Some((item, (wanted, as_admin))) = self.wanted(command) else {
             return Ok(false);
+        };
+        match self.results.confirm(wanted) {
+            Some(action) => {
+                self.perform(item, action, as_admin);
+                Ok(false)
+            }
+            None => self.redraw().map(|()| true),
         }
-        self.redraw().map(|()| true)
+    }
+
+    /// Shift+Delete: cuts the text selected in the bar, as in any field;
+    /// with none, the selected app asks, in place, to be uninstalled, if
+    /// hyalo knows what uninstalls it. Only the next Enter uninstalls.
+    fn uninstall(&mut self) -> Result<()> {
+        if !self.query.selected().is_empty() {
+            return self.edit(field::Key::Cut).map(drop);
+        }
+        let picked = self.results.picked().map(|row| &row.item.id);
+        let found = picked
+            .and_then(|id| self.catalog.uninstallers.get(id))
+            .cloned();
+        match found.is_some_and(|found| self.results.ask(Action::Uninstall(found))) {
+            true => self.redraw(),
+            false => Ok(()),
+        }
     }
 
     /// Stops the selected row asking, as anything but Enter does, and
@@ -786,12 +809,25 @@ impl App {
     /// Carries out what `command` does with the selected row and notes
     /// the pick; whether it did anything.
     fn act(&mut self, command: Command) -> bool {
-        let Some(item) = self.results.picked().map(|row| row.item.clone()) else {
+        let Some((item, (action, as_admin))) = self.wanted(command) else {
             return false;
         };
-        let Some((action, as_admin)) = keys::action(command, &item) else {
-            return false;
-        };
+        self.perform(item, action, as_admin);
+        true
+    }
+
+    /// The selected row's item, what `command` does with it and whether
+    /// as administrator; `None` with no row, or when `command` does
+    /// nothing with it.
+    fn wanted(&self, command: Command) -> Option<(Item, (Action, bool))> {
+        let item = self.results.picked()?.item.clone();
+        let wanted = keys::action(command, &item)?;
+        Some((item, wanted))
+    }
+
+    /// Carries out `action` for `item`, as administrator or not, and notes
+    /// the pick.
+    fn perform(&mut self, item: Item, action: Action, as_admin: bool) {
         match action {
             // Later, from the message loop: opening a window here, with
             // the app state borrowed, would lose its first messages.
@@ -799,7 +835,6 @@ impl App {
             action => (self.services.run)(&action, as_admin),
         }
         self.note(item);
-        true
     }
 
     /// Carries out a key that edits the query or copies from it, and
@@ -1624,6 +1659,7 @@ fn on_other_key(
             hide(hwnd);
             None
         }
+        Some(Command::Uninstall) => with_app(App::uninstall),
         Some(command) => {
             if with_app(|app| app.act(command)) == Some(true) {
                 hide(hwnd);
@@ -1798,6 +1834,7 @@ mod tests {
 
     use hyalo_core::config::DEFAULT;
     use hyalo_core::item::{Action, Item, Kind};
+    use hyalo_core::uninstall::Uninstall;
     use windows::Win32::Foundation::RECT;
     use windows::Win32::Graphics::Dwm::DwmGetWindowAttribute;
     use windows::Win32::Graphics::Gdi::MonitorFromWindow;
@@ -3892,6 +3929,146 @@ mod tests {
             launcher.press(VK_RETURN);
             launcher.click(60.0, layout::BAR_HEIGHT / 2.0);
             assert_eq!(first_shown().1, "System command");
+        });
+    }
+
+    /// What uninstalls the app `title` in these tests: an MSI, named as
+    /// Everything's is.
+    fn uninstaller(title: &str) -> Uninstall {
+        Uninstall::Program {
+            name: format!("{title} 1.4.1.1032 (x64)"),
+            program: "msiexec.exe".to_string(),
+            arguments: format!("/x {{{title}}}"),
+        }
+    }
+
+    fn uninstalled(title: &str) -> (Action, bool) {
+        (Action::Uninstall(uninstaller(title)), false)
+    }
+
+    /// A launcher that lists apps titled `titles`, icons too, and knows
+    /// what uninstalls those `uninstallable` names, one at least; and
+    /// what it was asked to run.
+    fn uninstalling(titles: &[&str], uninstallable: &[&str]) -> (Launcher, Ran) {
+        let listed = listing(titles).0;
+        let found: HashMap<ItemId, Uninstall> = uninstallable
+            .iter()
+            .map(|title| (app(title).id, uninstaller(title)))
+            .collect();
+        let provider: Provider = Arc::new(move |request: &Request, report: &dyn Fn(Found)| {
+            listed(request, report);
+            report(Found::Uninstallers(found.clone()));
+        });
+        let (services, ran) = services(provider, None);
+        let launcher = Launcher::serving(services);
+        let all = uninstallable.len();
+        launcher.pump_until(|app| app.catalog.uninstallers.len() == all);
+        (launcher, ran)
+    }
+
+    /// Shift+Delete, then no key held.
+    fn shift_delete(launcher: &Launcher) {
+        hold(&[VK_SHIFT]);
+        launcher.press(VK_DELETE);
+        hold(&[]);
+    }
+
+    #[test]
+    fn shift_delete_asks_to_uninstall_the_app_and_enter_uninstalls_it() {
+        on_hidden_desktop(|| {
+            let (launcher, ran) = uninstalling(&["Everything", "Notepad"], &["Everything"]);
+            launcher.type_text("every");
+            assert_eq!(first_shown().1, "App");
+            assert!(!asks_in_amber(&launcher));
+            shift_delete(&launcher);
+            let asks = "Press Enter to uninstall Everything 1.4.1.1032 (x64)";
+            assert_eq!(first_shown().1, asks, "names what it uninstalls");
+            assert!(asks_in_amber(&launcher), "the question, in amber");
+            assert!(ran.borrow().is_empty(), "not yet");
+            assert!(launcher.visible());
+            launcher.press(VK_RETURN);
+            assert_eq!(*ran.borrow(), [uninstalled("Everything")]);
+            assert!(!launcher.visible());
+        });
+    }
+
+    #[test]
+    fn a_click_on_the_row_asking_to_uninstall_uninstalls() {
+        on_hidden_desktop(|| {
+            let (launcher, ran) = uninstalling(&["Everything"], &["Everything"]);
+            launcher.type_text("every");
+            shift_delete(&launcher);
+            launcher.click(200.0, middle_of(0));
+            assert_eq!(*ran.borrow(), [uninstalled("Everything")]);
+            assert!(!launcher.visible());
+        });
+    }
+
+    #[test]
+    fn any_other_key_typing_or_a_click_elsewhere_calls_the_uninstall_off() {
+        on_hidden_desktop(|| {
+            let (launcher, ran) = uninstalling(&["Everything"], &["Everything"]);
+            launcher.type_text("every");
+            for key in [VK_DOWN, VK_UP, VK_END] {
+                shift_delete(&launcher);
+                launcher.press(key);
+                assert_eq!(first_shown().1, "App", "{key:?}");
+            }
+            shift_delete(&launcher);
+            launcher.type_text("t");
+            assert_eq!(first_shown().1, "App", "typing");
+            shift_delete(&launcher);
+            launcher.click(60.0, layout::BAR_HEIGHT / 2.0);
+            assert_eq!(first_shown().1, "App", "a click in the query");
+            launcher.press(VK_RETURN);
+            assert_eq!(
+                *ran.borrow(),
+                [opened("Everything", false)],
+                "Enter opens it"
+            );
+        });
+    }
+
+    #[test]
+    fn shift_delete_with_text_selected_cuts_it_as_in_any_field() {
+        on_hidden_desktop(|| {
+            let (launcher, ran) = uninstalling(&["Everything"], &["Everything"]);
+            launcher.search_for("every", 1);
+            hold(&[VK_CONTROL]);
+            launcher.press(VK_A);
+            shift_delete(&launcher);
+            let cut = (Action::CopyText("every".to_string()), false);
+            assert_eq!(*ran.borrow(), [cut]);
+            assert_eq!(launcher.query(), "");
+            assert!(!with_app(|app| app.results.asking()).expect("app state"));
+        });
+    }
+
+    #[test]
+    fn shift_delete_where_hyalo_knows_no_uninstaller_does_nothing() {
+        on_hidden_desktop(|| {
+            let (launcher, ran) = uninstalling(&["Everything", "Notepad"], &["Everything"]);
+            launcher.type_text("notepad");
+            shift_delete(&launcher);
+            assert_eq!(first_shown().1, "App");
+            launcher.type_text(" xyz");
+            shift_delete(&launcher);
+            assert!(ran.borrow().is_empty());
+            assert!(launcher.visible());
+            assert_eq!(launcher.query(), "notepad xyz");
+        });
+    }
+
+    #[test]
+    fn shift_delete_on_a_row_asking_to_restart_asks_nothing_more() {
+        on_hidden_desktop(|| {
+            let (launcher, ran) = uninstalling(&["Everything"], &["Everything"]);
+            launcher.type_text("restart");
+            launcher.press(VK_RETURN);
+            shift_delete(&launcher);
+            assert_eq!(first_shown().1, "System command", "called off");
+            launcher.press(VK_RETURN);
+            assert!(ran.borrow().is_empty(), "asks anew");
         });
     }
 

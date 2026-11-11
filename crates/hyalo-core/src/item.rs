@@ -6,7 +6,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::system_commands::Command;
-use crate::text::Text;
+use crate::text::{Language, Text};
 use crate::uninstall::Uninstall;
 
 /// One row in the results list.
@@ -81,14 +81,23 @@ pub enum Action {
 }
 
 impl Action {
-    /// What the row says after the first Enter, for an action that asks
-    /// before it runs (a system command such as Restart); `None` for one
+    /// What the row says, in `language`, once asked to do this, for an
+    /// action that asks before it runs: a system command such as Restart,
+    /// or an uninstall, which names what it uninstalls; `None` for one
     /// that runs at once.
-    pub fn asking(&self) -> Option<Text> {
+    pub fn asking(&self, language: Language) -> Option<String> {
         match self {
-            Action::System(command) => command.asking(),
+            Action::System(command) => command.asking().map(|text| language.say(text).to_string()),
+            Action::Uninstall(uninstall) => {
+                Some(language.fill(Text::AskUninstall, &[uninstall.name()]))
+            }
             _ => None,
         }
+    }
+
+    /// Whether this asks before it runs.
+    pub fn asks(&self) -> bool {
+        self.asking(Language::default()).is_some()
     }
 }
 
@@ -153,14 +162,30 @@ mod tests {
     }
 
     #[test]
-    fn only_a_system_command_that_asks_first_asks() {
+    fn a_system_command_that_asks_first_and_an_uninstall_ask_and_nothing_else_does() {
         let restart = Action::System(Command::Restart);
-        assert_eq!(restart.asking(), Some(Text::AskRestart));
-        assert_eq!(Action::System(Command::Lock).asking(), None);
-        assert_eq!(
-            Action::Open("ms-settings:display".to_string()).asking(),
-            None
-        );
+        let asked = restart.asking(Language::Russian);
+        let restarts = "Нажмите Enter ещё раз, чтобы перезагрузить компьютер";
+        assert_eq!(asked.as_deref(), Some(restarts));
+        assert!(restart.asks());
+        let uninstall = Action::Uninstall(Uninstall::Program {
+            name: "Everything 1.4.1.1032 (x64)".to_string(),
+            program: "msiexec.exe".to_string(),
+            arguments: "/x {B5F500BB-4625-445D-A2E7-E7FE5E1E7E85}".to_string(),
+        });
+        let asked = uninstall.asking(Language::English);
+        let uninstalls = "Press Enter to uninstall Everything 1.4.1.1032 (x64)";
+        assert_eq!(asked.as_deref(), Some(uninstalls));
+        let asked = uninstall.asking(Language::Russian);
+        let removes = "Нажмите Enter, чтобы удалить Everything 1.4.1.1032 (x64)";
+        assert_eq!(asked.as_deref(), Some(removes));
+        assert!(uninstall.asks());
+        let lock = Action::System(Command::Lock);
+        let page = Action::Open("ms-settings:display".to_string());
+        for runs in [lock, page] {
+            assert_eq!(runs.asking(Language::English), None, "{runs:?}");
+            assert!(!runs.asks(), "{runs:?}");
+        }
     }
 
     #[test]

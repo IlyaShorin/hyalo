@@ -13,6 +13,7 @@
 //! them rely on: each interface is a live COM object owned by `Renderer`,
 //! used only from the UI thread that created it.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::ops::Range;
 
@@ -61,7 +62,7 @@ pub struct Row<'a> {
     /// Keys the icon bitmaps the renderer keeps.
     pub id: &'a ItemId,
     pub title: &'a str,
-    pub subtitle: &'a str,
+    pub subtitle: Cow<'a, str>,
     /// The letters the query matched, as UTF-16 ranges of `title`.
     pub highlights: Vec<Range<u32>>,
     pub icon: Option<&'a Icon>,
@@ -378,7 +379,7 @@ impl Renderer {
         let (subtitle_top, subtitle_height) = SUBTITLE_LINE;
         let subtitle =
             self.surface
-                .layout(row.subtitle, &self.fonts.subtitle, width, subtitle_height)?;
+                .layout(&row.subtitle, &self.fonts.subtitle, width, subtitle_height)?;
         self.surface
             .draw_text(&subtitle, TEXT_LEFT, top + subtitle_top, said)
     }
@@ -618,7 +619,7 @@ mod tests {
                     Row {
                         id: &ids[0],
                         title: "Notepad",
-                        subtitle: "App",
+                        subtitle: "App".into(),
                         highlights: utf16_ranges("Notepad", &[0, 1, 2, 3]),
                         icon: Some(&blue),
                         glyph: None,
@@ -626,7 +627,7 @@ mod tests {
                     Row {
                         id: &ids[1],
                         title: "Sticky Notes",
-                        subtitle: "App",
+                        subtitle: "App".into(),
                         highlights: utf16_ranges("Sticky Notes", &[7, 8, 9, 10]),
                         icon: Some(&green),
                         glyph: None,
@@ -634,7 +635,7 @@ mod tests {
                     Row {
                         id: &ids[2],
                         title: "A name so long that it cannot fit in the window and has to end in an ellipsis just before the right edge",
-                        subtitle: r"C:\Program Files\Some Vendor\Some Product\a path long enough that it, too, has to be cut short with an ellipsis\bin\app.exe",
+                        subtitle: r"C:\Program Files\Some Vendor\Some Product\a path long enough that it, too, has to be cut short with an ellipsis\bin\app.exe".into(),
                         highlights: Vec::new(),
                         icon: None,
                         glyph: None,
@@ -664,7 +665,7 @@ mod tests {
                 rows: vec![Row {
                     id: &id,
                     title: "1\u{A0}234\u{A0}567,5",
-                    subtitle: "Calculator · Enter to copy",
+                    subtitle: "Calculator · Enter to copy".into(),
                     highlights: Vec::new(),
                     icon: None,
                     glyph: Some('\u{E8EF}'),
@@ -696,7 +697,7 @@ mod tests {
                 .map(|(&(title, subtitle, glyph), id)| Row {
                     id,
                     title,
-                    subtitle,
+                    subtitle: subtitle.into(),
                     highlights: Vec::new(),
                     icon: None,
                     glyph: Some(glyph),
@@ -720,7 +721,8 @@ mod tests {
                 rows: vec![Row {
                     id: &id,
                     title: "config.toml, line 2: unknown field `hotkye`, expected `hotkey` or `folders`",
-                    subtitle: "hyalo keeps its last good settings · Enter to open config.toml",
+                    subtitle: "hyalo keeps its last good settings · Enter to open config.toml"
+                        .into(),
                     highlights: Vec::new(),
                     icon: None,
                     glyph: Some('\u{E7BA}'),
@@ -741,7 +743,7 @@ mod tests {
                 rows: vec![Row {
                     id: &id,
                     title: "8\u{A0}275.36\u{A0}₽",
-                    subtitle: "100 USD → RUB · Bank of Russia, 10.11.2026 · Enter to copy",
+                    subtitle: "100 USD → RUB · Bank of Russia, 10.11.2026 · Enter to copy".into(),
                     highlights: Vec::new(),
                     icon: None,
                     glyph: Some('\u{E8EF}'),
@@ -765,7 +767,7 @@ mod tests {
                 rows: vec![Row {
                     id: &item.id,
                     title: &item.title,
-                    subtitle: &item.subtitle,
+                    subtitle: item.subtitle.as_str().into(),
                     highlights: Vec::new(),
                     icon: None,
                     glyph: Some('\u{E774}'),
@@ -806,7 +808,7 @@ mod tests {
                 .map(|(listed, icon)| Row {
                     id: &listed.item.id,
                     title: &listed.item.title,
-                    subtitle: &listed.item.subtitle,
+                    subtitle: listed.item.subtitle.as_str().into(),
                     highlights: utf16_ranges(&listed.item.title, &listed.matched),
                     icon: Some(icon),
                     glyph: None,
@@ -819,6 +821,70 @@ mod tests {
             };
             let frame = drawn(&scene, (720, 176), 96);
             assert_looks_like("windows-100", &frame);
+        });
+    }
+
+    #[test]
+    fn an_app_asked_to_uninstall_names_what_goes_in_amber_at_100_percent() {
+        use hyalo_core::frecency::{Frecency, Timestamp};
+        use hyalo_core::item::{Action, Item, Kind};
+        use hyalo_core::places::Places;
+        use hyalo_core::text::Language;
+        use hyalo_core::uninstall::Uninstall;
+        on_hidden_desktop(|| {
+            let apps = [
+                ("Everything", r"C:\Program Files\Everything\Everything.exe"),
+                ("Everything Toolbar", ""),
+            ];
+            let items: Vec<Item> = apps
+                .iter()
+                .map(|&(title, path)| Item {
+                    id: hyalo_core::item::ItemId(title.to_string()),
+                    title: title.to_string(),
+                    subtitle: path.to_string(),
+                    keywords: Vec::new(),
+                    kind: Kind::App,
+                    action: Action::Open(title.to_string()),
+                })
+                .collect();
+            let ranking = (Frecency::default(), Places::default());
+            let mut found = crate::results::Results::search(
+                "every",
+                &items,
+                Vec::new(),
+                &ranking.0,
+                &ranking.1,
+                Timestamp(0),
+            );
+            let everything = Uninstall::Program {
+                name: "Everything 1.4.1.1032 (x64)".to_string(),
+                program: "msiexec.exe".to_string(),
+                arguments: "/x {B5F500BB-4625-445D-A2E7-E7FE5E1E7E85}".to_string(),
+            };
+            assert!(found.ask(Action::Uninstall(everything)));
+            let icons = [disc(32, [40, 140, 240]), disc(32, [90, 200, 80])];
+            let rows = found
+                .rows()
+                .iter()
+                .zip(&icons)
+                .enumerate()
+                .map(|(index, (listed, icon))| Row {
+                    id: &listed.item.id,
+                    title: &listed.item.title,
+                    subtitle: found.subtitle(index, Language::English),
+                    highlights: utf16_ranges(&listed.item.title, &listed.matched),
+                    icon: Some(icon),
+                    glyph: None,
+                })
+                .collect();
+            let scene = Scene {
+                rows,
+                selected: 0,
+                asking: found.asking(),
+                ..Scene::bar("every")
+            };
+            let frame = drawn(&scene, (720, 176), 96);
+            assert_looks_like("uninstall-100", &frame);
         });
     }
 

@@ -4,7 +4,7 @@
 
 use hyalo_core::item::{Action, Item};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    VIRTUAL_KEY, VK_DOWN, VK_ESCAPE, VK_F4, VK_RETURN, VK_UP,
+    VIRTUAL_KEY, VK_DELETE, VK_DOWN, VK_ESCAPE, VK_F4, VK_RETURN, VK_UP,
 };
 
 /// A key that does something besides typing.
@@ -22,6 +22,10 @@ pub enum Command {
     /// Copy the selected file's or folder's full path: Ctrl+C with no
     /// text selected in the bar (the field says which keys copy).
     Copy,
+    /// Ask to uninstall the selected app: Shift+Delete, Windows' key for
+    /// deleting for good. With text selected in the bar it cuts the text,
+    /// as in any field: the window decides, and knows the uninstallers.
+    Uninstall,
 }
 
 /// Which modifier keys are held.
@@ -39,6 +43,7 @@ pub fn command(key: VIRTUAL_KEY, held: Held) -> Option<Command> {
         VK_UP => Some(Command::Up),
         VK_DOWN => Some(Command::Down),
         VK_RETURN => Some(enter(held)),
+        VK_DELETE if held.shift && !held.ctrl => Some(Command::Uninstall),
         _ => None,
     }
 }
@@ -62,14 +67,14 @@ fn enter(held: Held) -> Command {
 
 /// What `command` does with `item`, and whether as administrator; `None`
 /// when it does nothing with it: only files and folders are shown in
-/// their folder or have a path to copy, and moving or hiding acts on no
-/// row.
+/// their folder or have a path to copy, moving or hiding acts on no row,
+/// and what uninstalls an app the item does not say.
 pub fn action(command: Command, item: &Item) -> Option<(Action, bool)> {
     match command {
         Command::Open { as_admin } => Some((item.action.clone(), as_admin)),
         Command::Reveal => Some((Action::Reveal(item.path()?.to_string()), false)),
         Command::Copy => Some((Action::CopyText(item.path()?.to_string()), false)),
-        Command::Hide | Command::Up | Command::Down => None,
+        Command::Hide | Command::Up | Command::Down | Command::Uninstall => None,
     }
 }
 
@@ -134,6 +139,23 @@ mod tests {
     #[test]
     fn ctrl_enter_shows_the_row_in_its_folder() {
         assert_eq!(command(VK_RETURN, CTRL), Some(Command::Reveal));
+    }
+
+    #[test]
+    fn shift_delete_asks_to_uninstall_and_delete_with_ctrl_or_alone_is_the_fields() {
+        let shift = Held {
+            ctrl: false,
+            shift: true,
+        };
+        let both = Held {
+            ctrl: true,
+            shift: true,
+        };
+        assert_eq!(command(VK_DELETE, shift), Some(Command::Uninstall));
+        assert_eq!(command(VK_DELETE, NONE), None);
+        assert_eq!(command(VK_DELETE, CTRL), None);
+        assert_eq!(command(VK_DELETE, both), None);
+        assert_eq!(action(Command::Uninstall, &app()), None, "the window's");
     }
 
     #[test]
