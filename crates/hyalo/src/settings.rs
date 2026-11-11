@@ -48,6 +48,26 @@ pub fn contents(path: &Path, language: Language) -> Option<Vec<u8>> {
     }
 }
 
+/// What the file at `path` holds as hyalo starts: what `contents` gives,
+/// with what an older file leaves out written in first (in `language`,
+/// the one Windows speaks, unless the file names one), so the file shows
+/// every setting the settings window does. A file that does not read
+/// stays as it is.
+pub fn at_start(path: &Path, language: Language) -> Option<Vec<u8>> {
+    let bytes = contents(path, language)?;
+    let text = std::str::from_utf8(&bytes).ok();
+    let Some(fuller) = text.and_then(|text| config::completed(text, language)) else {
+        return Some(bytes);
+    };
+    match store::replace(path, fuller.as_bytes()) {
+        Ok(()) => Some(fuller.into_bytes()),
+        Err(error) => {
+            eprintln!("hyalo: cannot write {}: {error}", path.display());
+            Some(bytes)
+        }
+    }
+}
+
 /// The settings the file's bytes give.
 pub fn read(bytes: Vec<u8>) -> Loaded {
     text(bytes).and_then(|text| config::parse(&text))
@@ -165,6 +185,33 @@ mod tests {
 
     fn hotkey(loaded: &Loaded) -> String {
         loaded.as_ref().expect("settings").hotkey.to_string()
+    }
+
+    /// The user's file from 10.11.2026 lacked the update check, the
+    /// language and the web searches, which only the settings window
+    /// showed.
+    #[test]
+    fn at_start_an_older_file_has_what_it_leaves_out_written_in_and_a_full_one_stays() {
+        let scratch = Scratch::new("settings-at-start");
+        let path = config_in(&scratch);
+        fs::create_dir_all(path.parent().expect("a folder")).expect("the folder");
+        let older = "hotkey = 'F4'\n\n[folders]\nexclude = []\n";
+        fs::write(&path, older).expect("an older file");
+        let bytes = at_start(&path, Language::Russian).expect("read");
+        let on_disk = fs::read(&path).expect("written");
+        assert_eq!(bytes, on_disk, "what it gives is what it wrote");
+        let text = String::from_utf8(on_disk).expect("text");
+        assert!(text.starts_with("hotkey = 'F4'\n"), "{text}");
+        assert!(text.contains("\n[search]\n"), "{text}");
+        assert_eq!(
+            at_start(&path, Language::Russian),
+            Some(bytes),
+            "nothing more"
+        );
+        let broken = "hotkye = 'F4'\n";
+        fs::write(&path, broken).expect("a broken file");
+        assert_eq!(at_start(&path, Language::Russian), Some(broken.into()));
+        assert_eq!(fs::read(&path).expect("kept"), broken.as_bytes());
     }
 
     fn load(path: &Path) -> Option<Loaded> {

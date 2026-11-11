@@ -1138,7 +1138,7 @@ fn open(services: Services, shown: bool) -> Result<HWND> {
     let seen = services
         .config
         .as_deref()
-        .and_then(|path| settings::contents(path, language));
+        .and_then(|path| settings::at_start(path, language));
     let position = services.position.as_deref().and_then(read_position);
     APP.with_borrow_mut(|app| {
         let mut opened = App {
@@ -3962,6 +3962,23 @@ mod tests {
             launcher.pump_until(|app| {
                 app.results.rows()[0].item.title == "Search sourcegraph.com for “borrow”"
             });
+        });
+    }
+
+    #[test]
+    fn an_older_config_has_what_it_leaves_out_written_in_at_start() {
+        on_hidden_desktop(|| {
+            let older = "hotkey = 'F4'\n\n[folders]\nexclude = []\n";
+            let (_scratch, path) = config_file("window-config-older", older);
+            let keyboard = Rc::new(Keyboard::default());
+            let (launcher, _, _) = configured(&path, &keyboard);
+            let text = std::fs::read_to_string(&path).expect("the file");
+            assert!(text.starts_with("hotkey = 'F4'\n"), "{text}");
+            assert!(text.contains("\n[folders]\nexclude = []\n"), "kept: {text}");
+            assert!(text.contains("\ncheck_for_updates = true\n"), "{text}");
+            assert!(text.contains("\ng = \"https://www.google.com/"), "{text}");
+            launcher.type_text("gh hyalo");
+            assert_eq!(first_row().0, "Search GitHub for “hyalo”");
         });
     }
 
