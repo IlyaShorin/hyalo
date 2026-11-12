@@ -135,7 +135,28 @@ pub struct Source {
     /// config's to set.
     pub excluded: Option<Excluded>,
     /// Whether it lists the apps, which an uninstall changes.
-    pub apps: bool,
+    apps: bool,
+}
+
+impl Source {
+    /// A source of what `provider` finds, trusted for `trusted`, leaving
+    /// `excluded` out of the folders it walks, if it walks any.
+    pub fn new(provider: Provider, trusted: Duration, excluded: Option<Excluded>) -> Source {
+        Source {
+            provider,
+            trusted,
+            excluded,
+            apps: false,
+        }
+    }
+
+    /// The source that lists the apps, which an uninstall changes.
+    pub fn apps(provider: Provider, trusted: Duration) -> Source {
+        Source {
+            apps: true,
+            ..Source::new(provider, trusted, None)
+        }
+    }
 }
 
 /// What the window relies on from outside: the real ones in `run`,
@@ -180,12 +201,11 @@ pub struct Services {
 /// give none at start, so the ones still missing are asked for again as
 /// often as the apps.
 fn settings_icons() -> Source {
-    Source {
-        provider: Arc::new(catalog::find_system_icons),
-        trusted: catalog::REFRESH_AFTER,
-        excluded: None,
-        apps: false,
-    }
+    Source::new(
+        Arc::new(catalog::find_system_icons),
+        catalog::REFRESH_AFTER,
+        None,
+    )
 }
 
 impl Services {
@@ -200,36 +220,23 @@ impl Services {
         let walk = files::provider(writer, drives, snapshot, excluded.clone());
         Self {
             sources: vec![
-                Source {
-                    provider: catalog::apps(Arc::new(uninstall::entries)),
-                    trusted: catalog::REFRESH_AFTER,
-                    excluded: None,
-                    apps: true,
-                },
+                Source::apps(
+                    catalog::apps(Arc::new(uninstall::entries)),
+                    catalog::REFRESH_AFTER,
+                ),
                 settings_icons(),
-                Source {
-                    provider: walk,
-                    trusted: files::REFRESH_AFTER,
-                    excluded: Some(excluded),
-                    apps: false,
-                },
-                Source {
-                    provider: rates::provider(
+                Source::new(walk, files::REFRESH_AFTER, Some(excluded)),
+                Source::new(
+                    rates::provider(
                         Arc::new(|| http::get(&rates::bank())),
                         rates::default_cache(),
                         Arc::new(rates::moscow_today),
                     ),
-                    trusted: rates::REFRESH_AFTER,
-                    excluded: None,
-                    apps: false,
-                },
+                    rates::REFRESH_AFTER,
+                    None,
+                ),
                 // Looked for at every show: windows come and go.
-                Source {
-                    provider: switcher::provider(),
-                    trusted: Duration::ZERO,
-                    excluded: None,
-                    apps: false,
-                },
+                Source::new(switcher::provider(), Duration::ZERO, None),
             ],
             files,
             icons: Arc::new(catalog::file_icons),
@@ -2198,12 +2205,7 @@ mod tests {
             }
         });
         let services = Services {
-            sources: vec![Source {
-                provider,
-                trusted: catalog::REFRESH_AFTER,
-                excluded: None,
-                apps: true,
-            }],
+            sources: vec![Source::apps(provider, catalog::REFRESH_AFTER)],
             files: Files::default(),
             icons,
             places: Places::default(),
@@ -2232,12 +2234,11 @@ mod tests {
         let (files, writer) = Files::new();
         services.files = files;
         let excluded = Excluded::default();
-        services.sources.push(Source {
-            provider: files::provider(writer, roots, None, excluded.clone()),
-            trusted: files::REFRESH_AFTER,
-            excluded: Some(excluded),
-            apps: false,
-        });
+        services.sources.push(Source::new(
+            files::provider(writer, roots, None, excluded.clone()),
+            files::REFRESH_AFTER,
+            Some(excluded),
+        ));
         (services, ran)
     }
 
@@ -3521,12 +3522,7 @@ mod tests {
                 report(Found::Icon(item.id.clone(), red(request.icon_size)));
             }
         });
-        let source = Source {
-            provider,
-            trusted: Duration::ZERO,
-            excluded: None,
-            apps: false,
-        };
+        let source = Source::new(provider, Duration::ZERO, None);
         (source, runs)
     }
 
@@ -4348,6 +4344,15 @@ mod tests {
             let gone = Arc::new(AtomicBool::new(false));
             let (provider, runs) = installed(gone.clone());
             let (mut services, ran) = services(provider, None);
+            // Another source, which lists no apps: an uninstall leaves it.
+            let others = Arc::new(AtomicUsize::new(0));
+            let counted = others.clone();
+            let other: Provider = Arc::new(move |_: &Request, _: &dyn Fn(Found)| {
+                counted.fetch_add(1, Ordering::SeqCst);
+            });
+            services
+                .sources
+                .push(Source::new(other, catalog::REFRESH_AFTER, None));
             // The runner keeps what to do once it is done: the uninstaller
             // is still at work until the test says it ended.
             let working: Rc<RefCell<Vec<Done>>> = Rc::default();
@@ -4382,6 +4387,7 @@ mod tests {
             launcher.pump_until(|_| runs.load(Ordering::SeqCst) == 3);
             launcher.type_text("every");
             assert!(with_app(|app| app.results.rows().is_empty()).expect("app state"));
+            assert_eq!(others.load(Ordering::SeqCst), 1, "the other source, once");
         });
     }
 
@@ -4792,12 +4798,7 @@ mod tests {
             let _ = gate.lock().expect("the gate").recv();
             report(Found::Rates(rates::tests::fixture()));
         });
-        let source = Source {
-            provider,
-            trusted: rates::REFRESH_AFTER,
-            excluded: None,
-            apps: false,
-        };
+        let source = Source::new(provider, rates::REFRESH_AFTER, None);
         (source, release)
     }
 
