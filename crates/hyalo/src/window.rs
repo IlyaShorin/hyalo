@@ -4594,10 +4594,12 @@ mod tests {
         }
     }
 
-    /// Reported on 0.2.5: a folder row's menu went away after about a
-    /// second. A refresh (here the provider's next piece; for a folder,
-    /// its icon) arrives while the menu is open and draws the launcher
-    /// again: that must leave the menu up and above it.
+    /// Reported on 0.2.5: every row's menu went away within about a
+    /// second. A refresh arrives while the menu is open and draws the
+    /// launcher again (here a provider's next piece; on a live machine
+    /// the files provider's, up to twice a second while the index
+    /// changes, or a folder's icon): that must leave the menu up and
+    /// above it.
     #[test]
     fn a_refresh_while_the_real_menu_is_open_leaves_the_menu_up_above_the_launcher() {
         on_hidden_desktop(|| {
