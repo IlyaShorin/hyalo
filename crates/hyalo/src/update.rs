@@ -687,6 +687,47 @@ mod tests {
         }
     }
 
+    /// The DLLs the running exe imports from, as its import table names
+    /// them, in lower case.
+    fn imported_dlls() -> Vec<String> {
+        use windows::Win32::System::Diagnostics::Debug::{
+            IMAGE_DIRECTORY_ENTRY_IMPORT, IMAGE_NT_HEADERS64,
+        };
+        use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+        use windows::Win32::System::SystemServices::{IMAGE_DOS_HEADER, IMAGE_IMPORT_DESCRIPTOR};
+        // SAFETY: the loader mapped the running exe at its module handle,
+        // each part at the offset from it (RVA) the headers give, and
+        // keeps it mapped while the process runs; the import table ends
+        // with an entry naming nothing.
+        unsafe {
+            let base = GetModuleHandleW(None).expect("the exe").0 as *const u8;
+            let dos = &*base.cast::<IMAGE_DOS_HEADER>();
+            let nt = &*base.add(dos.e_lfanew as usize).cast::<IMAGE_NT_HEADERS64>();
+            let table = nt.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT.0 as usize];
+            let mut entry = base
+                .add(table.VirtualAddress as usize)
+                .cast::<IMAGE_IMPORT_DESCRIPTOR>();
+            let mut dlls = Vec::new();
+            while (*entry).Name != 0 {
+                let name = std::ffi::CStr::from_ptr(base.add((*entry).Name as usize).cast());
+                dlls.push(name.to_string_lossy().to_lowercase());
+                entry = entry.add(1);
+            }
+            dlls
+        }
+    }
+
+    /// A fresh Windows 10 or 11 has no Visual C++ Redistributable, whose
+    /// vcruntime140.dll a Rust exe imports unless it carries the C
+    /// runtime itself. The tests are built as hyalo.exe is.
+    #[test]
+    fn the_exe_carries_the_c_runtime_a_fresh_windows_lacks() {
+        let dlls = imported_dlls();
+        assert!(dlls.iter().any(|dll| dll == "kernel32.dll"), "{dlls:?}");
+        let runtime = dlls.iter().find(|dll| dll.starts_with("vcruntime"));
+        assert_eq!(runtime, None, "{dlls:?}");
+    }
+
     /// Windows PowerShell 5.1 stops a script whose errors stop it on any
     /// line a native command writes to its error output, and gh writes
     /// "release not found" there for a release not out yet: 0.2.1's run

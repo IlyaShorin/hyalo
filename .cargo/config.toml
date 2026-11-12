@@ -1,0 +1,6 @@
+# hyalo.exe carries the C runtime in itself: a Rust exe otherwise imports
+# vcruntime140.dll, which comes with the Visual C++ Redistributable, not
+# with Windows, and a fresh Windows 10 or 11 has none. Tests, the release
+# script and the release workflow all build with this.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

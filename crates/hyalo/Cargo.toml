@@ -17,4 +17,4 @@ windows-numerics = "0.3.1"
 
 [dev-dependencies]
 png = "0.18.1"
-windows = { version = "0.62.2", features = ["Win32_Security", "Win32_System_StationsAndDesktops"] }
+windows = { version = "0.62.2", features = ["Win32_Security", "Win32_System_Diagnostics_Debug", "Win32_System_StationsAndDesktops", "Win32_System_SystemInformation", "Win32_System_SystemServices"] }
