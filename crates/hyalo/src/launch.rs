@@ -8,11 +8,12 @@ use std::path::Path;
 
 use hyalo_core::item::Action;
 use hyalo_core::uninstall::Uninstall;
-use windows::Win32::Foundation::ERROR_FILE_NOT_FOUND;
+use windows::Win32::Foundation::{CloseHandle, ERROR_FILE_NOT_FOUND, HANDLE};
+use windows::Win32::System::Threading::{INFINITE, WaitForSingleObject};
 use windows::Win32::UI::Shell::{
     ASSOCF_INIT_IGNOREUNKNOWN, ASSOCSTR_EXECUTABLE, AssocQueryStringW, ILCreateFromPathW, ILFree,
-    SEE_MASK_FLAG_NO_UI, SEE_MASK_NOASYNC, SHELLEXECUTEINFOW, SHOpenFolderAndSelectItems,
-    ShellExecuteExW,
+    SEE_MASK_DEFAULT, SEE_MASK_FLAG_NO_UI, SEE_MASK_NOASYNC, SEE_MASK_NOCLOSEPROCESS,
+    SHELLEXECUTEINFOW, SHOpenFolderAndSelectItems, ShellExecuteExW,
 };
 use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 use windows::core::{HSTRING, PCWSTR, Result, w};
@@ -39,14 +40,14 @@ pub fn run(action: &Action, as_admin: bool) -> Result<()> {
 
 /// Carries out what changes the machine, which its row asked about
 /// first: a system command, or an uninstall, whose uninstaller starts as
-/// any program does (as administrator only when asked) or whose package
-/// is removed. `run` hands it nothing else.
+/// any program does (as administrator only when asked) and is waited
+/// for, or whose package is removed. `run` hands it nothing else.
 fn change(action: &Action, as_admin: bool) -> Result<()> {
     match action {
         Action::System(command) => system::run(*command, &system::System),
         Action::Uninstall(Uninstall::Program {
             program, arguments, ..
-        }) => execute(program, Some(arguments), verb(as_admin)),
+        }) => uninstall_with(program, arguments, as_admin),
         Action::Uninstall(Uninstall::Package { full_name, .. }) => uninstall::remove(full_name),
         _ => Ok(()),
     }
@@ -132,16 +133,36 @@ fn verb(as_admin: bool) -> PCWSTR {
     }
 }
 
+/// Starts the uninstaller `program` with `arguments`, as administrator
+/// only when asked, and waits until it ends: the launcher looks for the
+/// apps again then.
+fn uninstall_with(program: &str, arguments: &str, as_admin: bool) -> Result<()> {
+    let process = started(
+        program,
+        Some(arguments),
+        verb(as_admin),
+        SEE_MASK_NOCLOSEPROCESS,
+    )?;
+    wait(process)
+}
+
 /// Has the shell carry out `verb` (none: the usual one) on `file`, with
 /// `argument` if it is a program.
 fn execute(file: &str, argument: Option<&str>, verb: PCWSTR) -> Result<()> {
+    started(file, argument, verb, SEE_MASK_DEFAULT).map(drop)
+}
+
+/// The same, with `mask` besides the usual flags; the process the shell
+/// started, when `mask` asks to keep it and there is one, else a null
+/// handle.
+fn started(file: &str, argument: Option<&str>, verb: PCWSTR, mask: u32) -> Result<HANDLE> {
     let _com = Com::init()?;
     let file = HSTRING::from(file);
     let argument = argument.map(HSTRING::from);
     let mut info = SHELLEXECUTEINFOW {
         cbSize: size_of::<SHELLEXECUTEINFOW>() as u32,
         // NOASYNC: this thread may end as soon as the call returns.
-        fMask: SEE_MASK_NOASYNC | SEE_MASK_FLAG_NO_UI,
+        fMask: SEE_MASK_NOASYNC | SEE_MASK_FLAG_NO_UI | mask,
         lpVerb: verb,
         lpFile: PCWSTR(file.as_ptr()),
         lpParameters: argument
@@ -151,7 +172,21 @@ fn execute(file: &str, argument: Option<&str>, verb: PCWSTR) -> Result<()> {
         ..Default::default()
     };
     // SAFETY: `info` and the strings it points to outlive the call.
-    unsafe { ShellExecuteExW(&mut info) }
+    unsafe { ShellExecuteExW(&mut info)? };
+    Ok(info.hProcess)
+}
+
+/// Waits until `process` ends, then closes it; a null one (the shell
+/// started no process of its own) is done already.
+fn wait(process: HANDLE) -> Result<()> {
+    if process.is_invalid() {
+        return Ok(());
+    }
+    // SAFETY: the handle is ours: waited on once, then closed once.
+    unsafe {
+        WaitForSingleObject(process, INFINITE);
+        CloseHandle(process)
+    }
 }
 
 #[cfg(test)]
@@ -196,6 +231,50 @@ mod tests {
         };
         let error = run(&Action::Uninstall(missing), false).expect_err("no such package");
         assert_eq!(error.code().0 as u32, 0x8007_3CF1, "{error}");
+    }
+
+    /// A handle of this process's own to the thread `worker` runs on.
+    fn own_handle(worker: &std::thread::JoinHandle<()>) -> HANDLE {
+        use std::os::windows::io::AsRawHandle;
+        use windows::Win32::Foundation::{DUPLICATE_SAME_ACCESS, DuplicateHandle};
+        use windows::Win32::System::Threading::GetCurrentProcess;
+        let mut own = HANDLE::default();
+        let thread = HANDLE(worker.as_raw_handle());
+        // SAFETY: plain calls; the copy is ours, for `wait` to close.
+        unsafe {
+            let this = GetCurrentProcess();
+            DuplicateHandle(
+                this,
+                thread,
+                this,
+                &mut own,
+                0,
+                false,
+                DUPLICATE_SAME_ACCESS,
+            )
+        }
+        .expect("a handle of its own");
+        own
+    }
+
+    #[test]
+    fn waiting_for_an_uninstaller_lasts_until_it_ends() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let ended = Arc::new(AtomicBool::new(false));
+        let ending = ended.clone();
+        let worker = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            ending.store(true, Ordering::SeqCst);
+        });
+        wait(own_handle(&worker)).expect("waited and closed");
+        assert!(ended.load(Ordering::SeqCst), "back only once it ended");
+        worker.join().expect("ended");
+        assert_eq!(
+            wait(HANDLE::default()),
+            Ok(()),
+            "no process, nothing to wait for"
+        );
     }
 
     #[test]
