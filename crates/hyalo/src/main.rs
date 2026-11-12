@@ -27,6 +27,7 @@ mod recorder;
 mod registry;
 mod render;
 mod results;
+mod row_menu;
 mod settings;
 mod store;
 mod surface;

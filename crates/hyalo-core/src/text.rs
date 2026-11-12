@@ -156,6 +156,17 @@ table! {
     WebSearch => "Web search · Enter to open in the browser",
         "Поиск в интернете · Enter — открыть в браузере";
 
+    // A row's menu: what Enter does with the row, then what other keys do.
+    Open => "Open", "Открыть";
+    Copy => "Copy", "Копировать";
+    Run => "Run", "Выполнить";
+    SwitchTo => "Switch to", "Перейти";
+    RunAsAdministrator => "Run as administrator", "Запуск от имени администратора";
+    ShowInFolder => "Show in folder", "Показать в папке";
+    CopyPath => "Copy path", "Копировать путь";
+    /// It asks first, as Shift+Delete does.
+    Uninstall => "Uninstall…", "Удалить…";
+
     // The tray.
     Show => "Show hyalo", "Показать hyalo";
     Settings => "Settings", "Параметры";
