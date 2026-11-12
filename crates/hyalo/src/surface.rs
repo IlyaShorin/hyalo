@@ -71,6 +71,11 @@ pub const fn rgba(r: f32, g: f32, b: f32, a: f32) -> D2D1_COLOR_F {
     D2D1_COLOR_F { r, g, b, a }
 }
 
+/// Whether DirectWrite looks again for fonts installed since it started:
+/// no, every family hyalo draws in comes with Windows. No test pins this:
+/// one would have to install a font.
+const NEW_FONTS: bool = false;
+
 /// A font family to draw in, and the one to draw in instead where
 /// Windows does not have it.
 #[derive(Clone, Copy, Debug)]
@@ -86,9 +91,10 @@ impl Family {
     fn installed(self, dwrite: &IDWriteFactory) -> Result<PCWSTR> {
         let mut collection = None;
         // SAFETY: `collection` is a live Option the call fills.
-        unsafe { dwrite.GetSystemFontCollection(&mut collection, false)? };
+        unsafe { dwrite.GetSystemFontCollection(&mut collection, NEW_FONTS)? };
         let collection = collection.ok_or_else(windows::core::Error::empty)?;
-        let (mut index, mut exists) = (0, BOOL::default());
+        // Whatever they hold, the call fills them.
+        let (mut index, mut exists): (u32, BOOL) = Default::default();
         // SAFETY: `wanted` is a nul-terminated literal; `index` and
         // `exists` are live and filled by the call.
         unsafe { collection.FindFamilyName(self.wanted, &mut index, &mut exists)? };
