@@ -41,6 +41,9 @@ pub enum Found {
     Latest(std::result::Result<Option<Release>, String>),
     /// How installing an update went.
     Installed(std::result::Result<(), Failure>),
+    /// An uninstaller ended, whether it uninstalled or was called off:
+    /// the apps may have changed.
+    UninstallEnded,
 }
 
 /// What the window asks a provider for.
@@ -94,7 +97,7 @@ impl Catalog {
             Found::Windows(windows) => self.open(windows),
             // The window puts settings in force and updates hyalo; there
             // is nothing to list.
-            Found::Config(_) | Found::Latest(_) | Found::Installed(_) => {}
+            Found::Config(_) | Found::Latest(_) | Found::Installed(_) | Found::UninstallEnded => {}
         }
     }
 

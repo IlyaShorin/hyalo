@@ -115,8 +115,17 @@ impl Placement {
     }
 }
 
-/// Carries out a picked item's action, as administrator or not.
-pub type Runner = Box<dyn Fn(&Action, bool)>;
+/// Carries out a picked item's action, as administrator or not, then
+/// calls its `Done`, on the thread that carried it out.
+pub type Runner = Box<dyn Fn(&Action, bool, Done)>;
+
+/// What to do once an action was carried out.
+pub type Done = Box<dyn FnOnce() + Send>;
+
+/// Nothing to do once an action was carried out.
+fn nothing() -> Done {
+    Box::new(|| ())
+}
 
 /// A provider, and how long what it found is trusted.
 pub struct Source {
@@ -125,6 +134,29 @@ pub struct Source {
     /// What it leaves out of the folders it walks, if it walks any: the
     /// config's to set.
     pub excluded: Option<Excluded>,
+    /// Whether it lists the apps, which an uninstall changes.
+    apps: bool,
+}
+
+impl Source {
+    /// A source of what `provider` finds, trusted for `trusted`, leaving
+    /// `excluded` out of the folders it walks, if it walks any.
+    pub fn new(provider: Provider, trusted: Duration, excluded: Option<Excluded>) -> Source {
+        Source {
+            provider,
+            trusted,
+            excluded,
+            apps: false,
+        }
+    }
+
+    /// The source that lists the apps, which an uninstall changes.
+    pub fn apps(provider: Provider, trusted: Duration) -> Source {
+        Source {
+            apps: true,
+            ..Source::new(provider, trusted, None)
+        }
+    }
 }
 
 /// What the window relies on from outside: the real ones in `run`,
@@ -169,11 +201,11 @@ pub struct Services {
 /// give none at start, so the ones still missing are asked for again as
 /// often as the apps.
 fn settings_icons() -> Source {
-    Source {
-        provider: Arc::new(catalog::find_system_icons),
-        trusted: catalog::REFRESH_AFTER,
-        excluded: None,
-    }
+    Source::new(
+        Arc::new(catalog::find_system_icons),
+        catalog::REFRESH_AFTER,
+        None,
+    )
 }
 
 impl Services {
@@ -188,32 +220,23 @@ impl Services {
         let walk = files::provider(writer, drives, snapshot, excluded.clone());
         Self {
             sources: vec![
-                Source {
-                    provider: catalog::apps(Arc::new(uninstall::entries)),
-                    trusted: catalog::REFRESH_AFTER,
-                    excluded: None,
-                },
+                Source::apps(
+                    catalog::apps(Arc::new(uninstall::entries)),
+                    catalog::REFRESH_AFTER,
+                ),
                 settings_icons(),
-                Source {
-                    provider: walk,
-                    trusted: files::REFRESH_AFTER,
-                    excluded: Some(excluded),
-                },
-                Source {
-                    provider: rates::provider(
+                Source::new(walk, files::REFRESH_AFTER, Some(excluded)),
+                Source::new(
+                    rates::provider(
                         Arc::new(|| http::get(&rates::bank())),
                         rates::default_cache(),
                         Arc::new(rates::moscow_today),
                     ),
-                    trusted: rates::REFRESH_AFTER,
-                    excluded: None,
-                },
+                    rates::REFRESH_AFTER,
+                    None,
+                ),
                 // Looked for at every show: windows come and go.
-                Source {
-                    provider: switcher::provider(),
-                    trusted: Duration::ZERO,
-                    excluded: None,
-                },
+                Source::new(switcher::provider(), Duration::ZERO, None),
             ],
             files,
             icons: Arc::new(catalog::file_icons),
@@ -239,19 +262,20 @@ impl Services {
 /// while, and the UAC prompt waits for the user. Switching to a window
 /// happens at once, while the launcher is still in front: Windows lets
 /// the foreground hand the foreground on, and the launcher hides next.
-fn run_in_background(action: &Action, as_admin: bool) {
+fn run_in_background(action: &Action, as_admin: bool, done: Done) {
     let action = action.clone();
     if launch::at_once(&action) {
-        return carry_out(&action, as_admin);
+        return carry_out(&action, as_admin, done);
     }
-    std::thread::spawn(move || carry_out(&action, as_admin));
+    std::thread::spawn(move || carry_out(&action, as_admin, done));
 }
 
-/// Carries out `action`, telling the log when it cannot.
-fn carry_out(action: &Action, as_admin: bool) {
+/// Carries out `action`, telling the log when it cannot, then `done`.
+fn carry_out(action: &Action, as_admin: bool, done: Done) {
     if let Err(error) = launch::run(action, as_admin) {
         eprintln!("hyalo: cannot run {action:?}: {error}");
     }
+    done();
 }
 
 struct App {
@@ -536,7 +560,7 @@ impl App {
     fn open_config(&mut self) {
         if let Some(path) = &self.services.config {
             let path = path.to_string_lossy().into_owned();
-            (self.services.run)(&Action::Edit(path), false);
+            self.run_action(&Action::Edit(path));
         }
     }
 
@@ -904,9 +928,26 @@ impl App {
             // Later, from the message loop: opening a window here, with
             // the app state borrowed, would lose its first messages.
             Action::Settings => post(self.hwnd, WM_SETTINGS),
-            action => (self.services.run)(&action, as_admin),
+            action => (self.services.run)(&action, as_admin, self.after(&action)),
         }
         self.note(item);
+    }
+
+    /// What to do once `action` was carried out: after an uninstall, tell
+    /// the window it ended, so it looks for the apps again; after anything
+    /// else, nothing.
+    fn after(&self, action: &Action) -> Done {
+        if !matches!(action, Action::Uninstall(_)) {
+            return nothing();
+        }
+        let (sender, window) = (self.found.0.clone(), self.hwnd.0 as isize);
+        Box::new(move || hand_over(&sender, window, Found::UninstallEnded))
+    }
+
+    /// Carries out `action` on the runner, not as administrator, with
+    /// nothing to do once it is done.
+    fn run_action(&self, action: &Action) {
+        (self.services.run)(action, false, nothing());
     }
 
     /// Carries out a key that edits the query or copies from it, and
@@ -931,7 +972,7 @@ impl App {
         match self.query.selected() {
             "" => self.act(Command::Copy),
             selected => {
-                (self.services.run)(&Action::CopyText(selected.to_string()), false);
+                self.run_action(&Action::CopyText(selected.to_string()));
                 false
             }
         }
@@ -942,7 +983,7 @@ impl App {
         let Some(text) = self.query.cut() else {
             return Edited::Nothing;
         };
-        (self.services.run)(&Action::CopyText(text), false);
+        self.run_action(&Action::CopyText(text));
         Edited::Text
     }
 
@@ -1079,20 +1120,37 @@ impl App {
     /// it last found is still fresh.
     fn find_if_stale(&mut self) {
         let now = Instant::now();
-        for (source, found_at) in self.services.sources.iter().zip(&mut self.found_at) {
-            if !catalog::stale(*found_at, now, source.trusted) {
-                continue;
+        for index in 0..self.services.sources.len() {
+            let trusted = self.services.sources[index].trusted;
+            if catalog::stale(self.found_at[index], now, trusted) {
+                self.found_at[index] = Some(now);
+                self.find(index);
             }
-            *found_at = Some(now);
-            let request = Request {
-                icon_size: layout::icon_pixels(self.placement.dpi),
-                known: self.catalog.icons.keys().cloned().collect(),
-            };
-            let (provider, sender) = (source.provider.clone(), self.found.0.clone());
-            let window = self.hwnd.0 as isize;
-            let find = move || provider(&request, &|found| hand_over(&sender, window, found));
-            std::thread::spawn(find);
         }
+    }
+
+    /// Looks for the apps again now, an uninstaller having ended, and once
+    /// more at the next show: an uninstaller may hand its work to a copy
+    /// of itself and end before the app is gone.
+    fn look_again_for_apps(&mut self) {
+        for index in 0..self.services.sources.len() {
+            if self.services.sources[index].apps {
+                self.found_at[index] = None;
+                self.find(index);
+            }
+        }
+    }
+
+    /// Starts source `index`'s provider on a thread of its own.
+    fn find(&self, index: usize) {
+        let request = Request {
+            icon_size: layout::icon_pixels(self.placement.dpi),
+            known: self.catalog.icons.keys().cloned().collect(),
+        };
+        let provider = self.services.sources[index].provider.clone();
+        let (sender, window) = (self.found.0.clone(), self.hwnd.0 as isize);
+        let find = move || provider(&request, &|found| hand_over(&sender, window, found));
+        std::thread::spawn(find);
     }
 
     /// Looks, on a thread of its own, for the picked files and folders
@@ -1117,6 +1175,7 @@ impl App {
                 }
                 Found::Latest(answer) => self.take_latest(answer),
                 Found::Installed(installed) => self.take_installed(installed),
+                Found::UninstallEnded => self.look_again_for_apps(),
                 found => self.catalog.take(found),
             }
         }
@@ -1961,7 +2020,7 @@ mod tests {
     use std::path::PathBuf;
     use std::rc::Rc;
     use std::sync::Mutex;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::Duration;
 
     use hyalo_core::config::DEFAULT;
@@ -2159,16 +2218,13 @@ mod tests {
             }
         });
         let services = Services {
-            sources: vec![Source {
-                provider,
-                trusted: catalog::REFRESH_AFTER,
-                excluded: None,
-            }],
+            sources: vec![Source::apps(provider, catalog::REFRESH_AFTER)],
             files: Files::default(),
             icons,
             places: Places::default(),
-            run: Box::new(move |action: &Action, as_admin| {
+            run: Box::new(move |action: &Action, as_admin, done: Done| {
                 noted.borrow_mut().push((action.clone(), as_admin));
+                done();
             }),
             picks,
             hotkeys: Box::new(Rc::new(Keyboard::default())),
@@ -2191,11 +2247,11 @@ mod tests {
         let (files, writer) = Files::new();
         services.files = files;
         let excluded = Excluded::default();
-        services.sources.push(Source {
-            provider: files::provider(writer, roots, None, excluded.clone()),
-            trusted: files::REFRESH_AFTER,
-            excluded: Some(excluded),
-        });
+        services.sources.push(Source::new(
+            files::provider(writer, roots, None, excluded.clone()),
+            files::REFRESH_AFTER,
+            Some(excluded),
+        ));
         (services, ran)
     }
 
@@ -3510,11 +3566,7 @@ mod tests {
                 report(Found::Icon(item.id.clone(), red(request.icon_size)));
             }
         });
-        let source = Source {
-            provider,
-            trusted: Duration::ZERO,
-            excluded: None,
-        };
+        let source = Source::new(provider, Duration::ZERO, None);
         (source, runs)
     }
 
@@ -4306,6 +4358,117 @@ mod tests {
         });
     }
 
+    /// Apps as the shell lists them while an uninstaller works: Everything,
+    /// with its uninstaller, and Notepad, until `gone` is set, then
+    /// Notepad alone; and how often they were looked for.
+    fn installed(gone: Arc<AtomicBool>) -> (Provider, Arc<AtomicUsize>) {
+        let runs = Arc::new(AtomicUsize::new(0));
+        let counted = runs.clone();
+        let provider: Provider = Arc::new(move |request: &Request, report: &dyn Fn(Found)| {
+            counted.fetch_add(1, Ordering::SeqCst);
+            let gone = gone.load(Ordering::SeqCst);
+            let titles: &[&str] = match gone {
+                true => &["Notepad"],
+                false => &["Everything", "Notepad"],
+            };
+            let items: Vec<Item> = titles.iter().map(|title| app(title)).collect();
+            report(Found::Items(items.clone()));
+            let everything = (!gone).then(|| (app("Everything").id, uninstaller("Everything")));
+            report(Found::Uninstallers(everything.into_iter().collect()));
+            for item in &items {
+                report(Found::Icon(item.id.clone(), red(request.icon_size)));
+            }
+        });
+        (provider, runs)
+    }
+
+    #[test]
+    fn once_the_uninstaller_ends_the_apps_are_looked_for_at_once_and_at_the_next_show() {
+        on_hidden_desktop(|| {
+            let gone = Arc::new(AtomicBool::new(false));
+            let (provider, runs) = installed(gone.clone());
+            let (mut services, ran) = services(provider, None);
+            // Another source, which lists no apps: an uninstall leaves it.
+            let others = Arc::new(AtomicUsize::new(0));
+            let counted = others.clone();
+            let other: Provider = Arc::new(move |_: &Request, _: &dyn Fn(Found)| {
+                counted.fetch_add(1, Ordering::SeqCst);
+            });
+            services
+                .sources
+                .push(Source::new(other, catalog::REFRESH_AFTER, None));
+            // The runner keeps what to do once it is done: the uninstaller
+            // is still at work until the test says it ended.
+            let working: Rc<RefCell<Vec<Done>>> = Rc::default();
+            let (noted, kept) = (ran.clone(), working.clone());
+            services.run = Box::new(move |action: &Action, as_admin, done: Done| {
+                noted.borrow_mut().push((action.clone(), as_admin));
+                kept.borrow_mut().push(done);
+            });
+            let launcher = knowing(services, 1);
+            launcher.type_text("every");
+            shift_delete(&launcher);
+            launcher.press(VK_RETURN);
+            assert_eq!(*ran.borrow(), [uninstalled("Everything")]);
+            launcher.hotkey();
+            launcher.type_text("every");
+            assert_eq!(first_shown().0, "Everything", "still there while it works");
+            assert_eq!(runs.load(Ordering::SeqCst), 1);
+            launcher.press(VK_ESCAPE);
+            gone.store(true, Ordering::SeqCst);
+            let ended = working.borrow_mut().pop().expect("the uninstall's done");
+            ended();
+            let listed = |app: &App| {
+                !app.catalog
+                    .items
+                    .iter()
+                    .any(|item| item.title == "Everything")
+            };
+            launcher.pump_until(listed);
+            assert_eq!(runs.load(Ordering::SeqCst), 2, "at once, while hidden");
+            assert!(with_app(|app| app.catalog.uninstallers.is_empty()).expect("app state"));
+            launcher.hotkey();
+            launcher.pump_until(|_| runs.load(Ordering::SeqCst) == 3);
+            launcher.type_text("every");
+            assert!(with_app(|app| app.results.rows().is_empty()).expect("app state"));
+            assert_eq!(others.load(Ordering::SeqCst), 1, "the other source, once");
+        });
+    }
+
+    #[test]
+    fn opening_an_app_leaves_the_apps_as_they_were_found() {
+        on_hidden_desktop(|| {
+            let (launcher, ran) = Launcher::listing_with(&["Notepad"], None);
+            launcher.type_text("note");
+            launcher.press(VK_RETURN);
+            assert_eq!(*ran.borrow(), [opened("Notepad", false)]);
+            drain();
+            let found = with_app(|app| app.found_at[0].is_some()).expect("app state");
+            assert!(found, "not to be looked for again");
+        });
+    }
+
+    #[test]
+    fn the_runner_is_done_once_it_carried_the_action_out_even_when_that_failed() {
+        let (sender, done) = channel();
+        let missing = Action::Open(r"shell:AppsFolder\hyalo.test.no-such-app".to_string());
+        run_in_background(
+            &missing,
+            false,
+            Box::new(move || sender.send(()).expect("told")),
+        );
+        done.recv_timeout(PATIENCE)
+            .expect("done, on a thread of its own");
+        let (sender, done) = channel();
+        let gone = Action::Switch(0x7FFF_FFF0);
+        run_in_background(
+            &gone,
+            false,
+            Box::new(move || sender.send(()).expect("told")),
+        );
+        done.try_recv().expect("done at once, on this thread");
+    }
+
     /// A launcher that lists apps titled `titles`, knows what uninstalls
     /// those `uninstallable` names, one at least, and opens rows' menus
     /// through `Choices`; what it was asked to run, and the menus.
@@ -4793,11 +4956,7 @@ mod tests {
             let _ = gate.lock().expect("the gate").recv();
             report(Found::Rates(rates::tests::fixture()));
         });
-        let source = Source {
-            provider,
-            trusted: rates::REFRESH_AFTER,
-            excluded: None,
-        };
+        let source = Source::new(provider, rates::REFRESH_AFTER, None);
         (source, release)
     }
 
