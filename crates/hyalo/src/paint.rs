@@ -29,8 +29,8 @@ use crate::page::{
 };
 use crate::panel::Look;
 use crate::surface::{
-    DISPLAY_FONT, SELECTED_TEXT, Surface, TEXT_FONT, caret_x, hit, line_width, rgba, text_format,
-    trimmed,
+    Behind, DISPLAY_FONT, SELECTED_TEXT, Surface, TEXT_FONT, caret_x, hit, line_width, rgba,
+    text_format, trimmed,
 };
 
 const TEXT: D2D1_COLOR_F = rgba(1.0, 1.0, 1.0, 0.92);
@@ -53,6 +53,9 @@ fn scrolled(layout: &IDWriteTextLayout, caret: u32, inside: Area) -> Result<f32>
 const ACCENT: D2D1_COLOR_F = rgba(0.45, 0.68, 1.0, 1.0);
 const ACCENT_HOVER: D2D1_COLOR_F = rgba(0.55, 0.76, 1.0, 1.0);
 const CARD: D2D1_COLOR_F = rgba(1.0, 1.0, 1.0, 0.05);
+/// What Mica is drawn as where DWM gives none: the grey Windows shows for
+/// dark Mica with transparency turned off, #202020.
+const SOLID: D2D1_COLOR_F = rgba(0.125, 0.125, 0.125, 1.0);
 const CARD_EDGE: D2D1_COLOR_F = rgba(0.0, 0.0, 0.0, 0.18);
 const ALARM: D2D1_COLOR_F = rgba(0.86, 0.32, 0.28, 0.22);
 const ALARM_EDGE: D2D1_COLOR_F = rgba(1.0, 0.45, 0.40, 0.40);
@@ -124,8 +127,9 @@ fn centred(dwrite: &IDWriteFactory) -> Result<IDWriteTextFormat> {
 }
 
 impl Painter {
-    pub fn new(hwnd: HWND, width: u32, height: u32, dpi: u32) -> Result<Self> {
-        let surface = Surface::new(hwnd, width, height, dpi)?;
+    /// A painter for the settings window over what is `behind` it.
+    pub fn new(hwnd: HWND, width: u32, height: u32, dpi: u32, behind: Behind) -> Result<Self> {
+        let surface = Surface::new(hwnd, width, height, dpi, behind.ground(SOLID))?;
         let fonts = Fonts::new(&surface.dwrite)?;
         Ok(Self { surface, fonts })
     }
@@ -693,9 +697,19 @@ mod tests {
 
     /// What `panel` looks like `width` by `height` pixels at `dpi`, its
     /// scroll kept within the page, as the window keeps it.
-    fn painted(panel: &mut Panel, (width, height): (u32, u32), dpi: u32) -> Frame {
+    fn painted(panel: &mut Panel, size: (u32, u32), dpi: u32) -> Frame {
+        painted_over(panel, size, dpi, Behind::Glass)
+    }
+
+    /// The same, over what is `behind` the window.
+    fn painted_over(
+        panel: &mut Panel,
+        (width, height): (u32, u32),
+        dpi: u32,
+        behind: Behind,
+    ) -> Frame {
         let canvas = Canvas::new();
-        let painter = Painter::new(canvas.0, width, height, dpi).expect("a painter");
+        let painter = Painter::new(canvas.0, width, height, dpi, behind).expect("a painter");
         let (view, tall) = painter.view();
         let laid = lay_out(&panel.page(), view, &|text| painter.measure(text));
         panel.fit(laid.height, tall);
@@ -734,6 +748,15 @@ mod tests {
             panel.hover(Some(Target::Language(Language::English)));
             let frame = painted(&mut panel, (640, 1040), 96);
             assert_looks_like("settings-ru-100", &frame);
+        });
+    }
+
+    #[test]
+    fn over_the_desktop_the_settings_are_solid_at_100_percent() {
+        on_hidden_desktop(|| {
+            let mut panel = Panel::new(Ok(written(DEFAULT)), Some(true), Language::English);
+            let frame = painted_over(&mut panel, (640, 1040), 96, Behind::Desktop);
+            assert_looks_like("settings-desktop-100", &frame);
         });
     }
 
@@ -861,7 +884,7 @@ mod tests {
     fn a_page_as_tall_as_the_view_has_no_scrollbar() {
         on_hidden_desktop(|| {
             let canvas = Canvas::new();
-            let painter = Painter::new(canvas.0, 640, 300, 96).expect("a painter");
+            let painter = Painter::new(canvas.0, 640, 300, 96, Behind::Glass).expect("a painter");
             let bar = |height: f32| {
                 let laid = Laid {
                     marks: Vec::new(),

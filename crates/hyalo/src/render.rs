@@ -35,8 +35,8 @@ use crate::apps::Icon;
 use crate::field;
 use crate::layout::{BAR_HEIGHT, ICON_SIZE, ROW_HEIGHT, TEXT_LEFT, TEXT_RIGHT_PAD, row_top};
 use crate::surface::{
-    DISPLAY_FONT, PREMULTIPLIED_BGRA, SELECTED_TEXT, Surface, TEXT_FONT, caret_x, hit, line_width,
-    rgba, text_format, trimmed,
+    Behind, DISPLAY_FONT, PREMULTIPLIED_BGRA, SELECTED_TEXT, Surface, TEXT_FONT, caret_x, hit,
+    line_width, rgba, text_format, trimmed,
 };
 
 /// What to draw.
@@ -94,6 +94,9 @@ const SELECTION_RADIUS: f32 = 6.0;
 
 /// Darkens the acrylic slightly so white text keeps its contrast.
 const TINT: D2D1_COLOR_F = rgba(0.06, 0.06, 0.08, 0.28);
+/// What the glass is drawn as where DWM gives none: the grey Windows
+/// shows for dark acrylic with transparency turned off, #2C2C2C.
+const SOLID: D2D1_COLOR_F = rgba(0.173, 0.173, 0.173, 1.0);
 const TEXT: D2D1_COLOR_F = rgba(1.0, 1.0, 1.0, 0.95);
 const PLACEHOLDER_TEXT: D2D1_COLOR_F = rgba(1.0, 1.0, 1.0, 0.42);
 const ICON: D2D1_COLOR_F = rgba(1.0, 1.0, 1.0, 0.6);
@@ -126,8 +129,9 @@ struct Fonts {
 }
 
 impl Renderer {
-    pub fn new(hwnd: HWND, width: u32, height: u32, dpi: u32) -> Result<Self> {
-        let surface = Surface::new(hwnd, width, height, dpi)?;
+    /// A picture of the launcher over what is `behind` it.
+    pub fn new(hwnd: HWND, width: u32, height: u32, dpi: u32, behind: Behind) -> Result<Self> {
+        let surface = Surface::new(hwnd, width, height, dpi, behind.ground(SOLID))?;
         let fonts = Fonts::new(&surface.dwrite)?;
         Ok(Self {
             surface,
@@ -523,9 +527,15 @@ mod tests {
     }
 
     /// `scene` drawn at `width` x `height` pixels and `dpi`.
-    fn drawn(scene: &Scene, (width, height): (u32, u32), dpi: u32) -> Frame {
+    fn drawn(scene: &Scene, size: (u32, u32), dpi: u32) -> Frame {
+        drawn_over(scene, size, dpi, Behind::Glass)
+    }
+
+    /// The same, over what is `behind` the launcher.
+    fn drawn_over(scene: &Scene, (width, height): (u32, u32), dpi: u32, behind: Behind) -> Frame {
         let canvas = Canvas::new();
-        let mut renderer = Renderer::new(canvas.0, width, height, dpi).expect("a renderer");
+        let renderer = Renderer::new(canvas.0, width, height, dpi, behind);
+        let mut renderer = renderer.expect("a renderer");
         renderer.draw(scene).expect("draw");
         renderer.read_frame().expect("read the frame back")
     }
@@ -567,7 +577,8 @@ mod tests {
     fn a_query_longer_than_the_bar_scrolls_to_its_caret_and_back() {
         on_hidden_desktop(|| {
             let canvas = Canvas::new();
-            let mut renderer = Renderer::new(canvas.0, 720, 64, 96).expect("a renderer");
+            let mut renderer =
+                Renderer::new(canvas.0, 720, 64, 96, Behind::Glass).expect("a renderer");
             let long = r"C:\Users\Me\Documents\Projects\hyalo\crates\hyalo\reference\bar.png";
             renderer.draw(&Scene::bar(long)).expect("draw");
             let frame = renderer.read_frame().expect("read the frame back");
@@ -643,7 +654,8 @@ mod tests {
                 ]
             };
             let canvas = Canvas::new();
-            let mut renderer = Renderer::new(canvas.0, 1080, 336, 144).expect("a renderer");
+            let mut renderer =
+                Renderer::new(canvas.0, 1080, 336, 144, Behind::Glass).expect("a renderer");
             for _ in 0..2 {
                 let scene = Scene {
                     rows: rows(),
@@ -678,38 +690,48 @@ mod tests {
         });
     }
 
+    /// The system commands, the first one asking, as the launcher lists
+    /// them for "restart", drawn at 100 % over what is `behind` it.
+    fn commands(behind: Behind) -> Frame {
+        let commands = [
+            ("Restart", "Press Enter again to restart", '\u{E777}'),
+            ("Shut down", "System command", '\u{E7E8}'),
+            ("Sleep", "System command", '\u{E708}'),
+            ("Hibernate", "System command", '\u{E823}'),
+            ("Lock", "System command", '\u{E72E}'),
+            ("Sign out", "System command", '\u{F3B1}'),
+            ("Empty Recycle Bin", "System command", '\u{E74D}'),
+        ];
+        let ids = commands.map(|(title, _, _)| ItemId(format!("system:{title}")));
+        let rows = commands
+            .iter()
+            .zip(&ids)
+            .map(|(&(title, subtitle, glyph), id)| Row {
+                id,
+                title,
+                subtitle: subtitle.into(),
+                highlights: Vec::new(),
+                icon: None,
+                glyph: Some(glyph),
+            });
+        let scene = Scene {
+            rows: rows.collect(),
+            selected: 0,
+            asking: true,
+            ..Scene::bar("restart")
+        };
+        drawn_over(&scene, (720, 416), 96, behind)
+    }
+
     #[test]
     fn system_commands_show_their_symbols_and_the_asking_row_asks_at_100_percent() {
+        on_hidden_desktop(|| assert_looks_like("commands-100", &commands(Behind::Glass)));
+    }
+
+    #[test]
+    fn over_the_desktop_the_launcher_is_solid_at_100_percent() {
         on_hidden_desktop(|| {
-            let commands = [
-                ("Restart", "Press Enter again to restart", '\u{E777}'),
-                ("Shut down", "System command", '\u{E7E8}'),
-                ("Sleep", "System command", '\u{E708}'),
-                ("Hibernate", "System command", '\u{E823}'),
-                ("Lock", "System command", '\u{E72E}'),
-                ("Sign out", "System command", '\u{F3B1}'),
-                ("Empty Recycle Bin", "System command", '\u{E74D}'),
-            ];
-            let ids = commands.map(|(title, _, _)| ItemId(format!("system:{title}")));
-            let rows = commands
-                .iter()
-                .zip(&ids)
-                .map(|(&(title, subtitle, glyph), id)| Row {
-                    id,
-                    title,
-                    subtitle: subtitle.into(),
-                    highlights: Vec::new(),
-                    icon: None,
-                    glyph: Some(glyph),
-                });
-            let scene = Scene {
-                rows: rows.collect(),
-                selected: 0,
-                asking: true,
-                ..Scene::bar("restart")
-            };
-            let frame = drawn(&scene, (720, 416), 96);
-            assert_looks_like("commands-100", &frame);
+            assert_looks_like("commands-desktop-100", &commands(Behind::Desktop));
         });
     }
 
@@ -892,7 +914,8 @@ mod tests {
     fn a_resized_renderer_draws_at_its_new_size_and_scale() {
         on_hidden_desktop(|| {
             let canvas = Canvas::new();
-            let mut renderer = Renderer::new(canvas.0, 720, 64, 96).expect("a renderer");
+            let mut renderer =
+                Renderer::new(canvas.0, 720, 64, 96, Behind::Glass).expect("a renderer");
             renderer.draw(&Scene::bar("notepad")).expect("draw");
             renderer.resize(900, 80, 120).expect("resize");
             renderer.draw(&Scene::bar("notepad")).expect("draw again");

@@ -76,6 +76,35 @@ pub const fn rgba(r: f32, g: f32, b: f32, a: f32) -> D2D1_COLOR_F {
 pub const DISPLAY_FONT: PCWSTR = w!("Segoe UI Variable Display");
 pub const TEXT_FONT: PCWSTR = w!("Segoe UI Variable Text");
 
+/// What a window's picture is drawn over.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Behind {
+    /// The glass DWM draws behind the window: what the picture leaves
+    /// clear shows it.
+    Glass,
+    /// Nothing but the desktop, where DWM gives no glass (Windows 10,
+    /// Windows 11 before 22H2): the picture starts from a solid colour.
+    Desktop,
+}
+
+impl Behind {
+    /// What DWM's answer to the backdrop a window asked for means.
+    pub fn of(answer: Result<()>) -> Self {
+        match answer {
+            Ok(()) => Self::Glass,
+            Err(_) => Self::Desktop,
+        }
+    }
+
+    /// The colour a frame starts from: clear over the glass, else `solid`.
+    pub fn ground(self, solid: D2D1_COLOR_F) -> D2D1_COLOR_F {
+        match self {
+            Self::Glass => TRANSPARENT,
+            Self::Desktop => solid,
+        }
+    }
+}
+
 pub struct Surface {
     swap_chain: IDXGISwapChain1,
     pub dc: ID2D1DeviceContext,
@@ -89,12 +118,21 @@ pub struct Surface {
     width: u32,
     height: u32,
     dpi: u32,
+    /// The colour each frame starts from.
+    ground: D2D1_COLOR_F,
 }
 
 impl Surface {
     /// A picture `width` by `height` pixels, at least one each way: a
-    /// minimized window has no size, and a swap chain must have one.
-    pub fn new(hwnd: HWND, width: u32, height: u32, dpi: u32) -> Result<Self> {
+    /// minimized window has no size, and a swap chain must have one. Its
+    /// frames start from `ground`.
+    pub fn new(
+        hwnd: HWND,
+        width: u32,
+        height: u32,
+        dpi: u32,
+        ground: D2D1_COLOR_F,
+    ) -> Result<Self> {
         let (width, height) = (width.max(1), height.max(1));
         let d3d = create_d3d_device()?;
         let dxgi_device: IDXGIDevice = d3d.cast()?;
@@ -112,6 +150,7 @@ impl Surface {
             width,
             height,
             dpi,
+            ground,
         };
         surface.bind_target()?;
         Ok(surface)
@@ -142,11 +181,11 @@ impl Surface {
         (self.width as f32 / scale, self.height as f32 / scale)
     }
 
-    /// Starts a frame, cleared to transparent.
+    /// Starts a frame, cleared to its ground.
     pub fn begin(&self) {
         unsafe {
             self.dc.BeginDraw();
-            self.dc.Clear(Some(&TRANSPARENT));
+            self.dc.Clear(Some(&self.ground));
         }
     }
 
@@ -528,7 +567,7 @@ mod tests {
     fn the_picture_is_composed_above_the_window_content() {
         on_hidden_desktop(|| {
             let canvas = Canvas::new();
-            let _surface = Surface::new(canvas.0, 720, 64, 96).expect("a surface");
+            let _surface = Surface::new(canvas.0, 720, 64, 96, TRANSPARENT).expect("a surface");
             // A window has one topmost composition target; the surface's
             // should be it, so a second one is refused.
             let device: IDCompositionDevice =
@@ -543,7 +582,7 @@ mod tests {
     fn its_size_in_dips_is_its_pixels_over_the_scale() {
         on_hidden_desktop(|| {
             let canvas = Canvas::new();
-            let mut surface = Surface::new(canvas.0, 720, 64, 96).expect("a surface");
+            let mut surface = Surface::new(canvas.0, 720, 64, 96, TRANSPARENT).expect("a surface");
             assert_eq!(surface.size(), (720.0, 64.0));
             surface.resize(900, 300, 144).expect("resize");
             assert_eq!(surface.size(), (600.0, 200.0));
@@ -562,10 +601,40 @@ mod tests {
     }
 
     #[test]
+    fn over_the_desktop_a_frame_starts_from_the_solid_colour_over_the_glass_clear() {
+        on_hidden_desktop(|| {
+            let canvas = Canvas::new();
+            let first_pixel = |behind: Behind| {
+                let ground = behind.ground(rgba(0.5, 0.5, 0.5, 1.0));
+                let surface = Surface::new(canvas.0, 64, 64, 96, ground).expect("a surface");
+                surface.begin();
+                surface.end(Ok(())).expect("a frame");
+                surface.read_frame().expect("read back").pixel(32, 32)
+            };
+            assert_eq!(first_pixel(Behind::Glass), [0, 0, 0, 0]);
+            let [b, g, r, a] = first_pixel(Behind::Desktop);
+            assert_eq!(a, 255, "opaque");
+            assert!(
+                [b, g, r].iter().all(|c| c.abs_diff(128) <= 1),
+                "{b} {g} {r}"
+            );
+        });
+    }
+
+    #[test]
+    fn behind_a_backdrop_dwm_refused_is_the_desktop() {
+        assert_eq!(Behind::of(Ok(())), Behind::Glass);
+        let refused = Err(windows::core::Error::from_hresult(
+            windows::Win32::Foundation::E_INVALIDARG,
+        ));
+        assert_eq!(Behind::of(refused), Behind::Desktop);
+    }
+
+    #[test]
     fn a_surface_asked_for_no_size_keeps_one_pixel_each_way() {
         on_hidden_desktop(|| {
             let canvas = Canvas::new();
-            let mut surface = Surface::new(canvas.0, 0, 0, 96).expect("a surface");
+            let mut surface = Surface::new(canvas.0, 0, 0, 96, TRANSPARENT).expect("a surface");
             assert_eq!(surface.size(), (1.0, 1.0));
             surface.resize(300, 200, 96).expect("resize");
             surface.resize(0, 0, 96).expect("minimized");
@@ -579,7 +648,7 @@ mod tests {
     fn a_frame_that_failed_to_draw_is_not_shown_and_the_next_one_draws() {
         on_hidden_desktop(|| {
             let canvas = Canvas::new();
-            let surface = Surface::new(canvas.0, 64, 64, 96).expect("a surface");
+            let surface = Surface::new(canvas.0, 64, 64, 96, TRANSPARENT).expect("a surface");
             surface.begin();
             let failed = surface.end(Err(windows::core::Error::empty()));
             assert!(failed.is_err());

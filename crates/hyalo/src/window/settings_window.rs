@@ -41,8 +41,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use windows::core::{BOOL, HSTRING, PCWSTR, Result, w};
 
 use super::{
-    App, MOUSE_SHIFT, Placement, client_point, double_click_room, double_click_time, down,
-    placement_under_cursor, set_attribute, with_app,
+    App, Dwm, MOUSE_SHIFT, Placement, client_point, double_click_room, double_click_time, down,
+    placement_under_cursor, with_app,
 };
 use crate::field;
 use crate::layout;
@@ -50,6 +50,7 @@ use crate::page::{self, Laid, Target, What};
 use crate::paint::Painter;
 use crate::panel::{Effect, Panel, Versions};
 use crate::recorder::Mods;
+use crate::surface::Behind;
 use crate::{clipboard, settings, tray};
 
 const CLASS: PCWSTR = w!("hyalo.settings");
@@ -84,13 +85,15 @@ pub(super) fn open_settings() -> Result<()> {
         bring_forward(hwnd);
         return Ok(());
     }
-    let Some(panel) = with_app(|app| app.fresh_panel()).flatten() else {
+    let Some((panel, dwm)) =
+        with_app(|app| app.fresh_panel().zip(Some(app.services.dwm))).flatten()
+    else {
         return Ok(());
     };
-    let hwnd = create(placement_under_cursor()?)?;
+    let (hwnd, behind) = create(placement_under_cursor()?, dwm)?;
     // A window that cannot be drawn is not left behind, hidden.
     // SAFETY: the window was made above, on this thread.
-    let window = SettingsWindow::new(hwnd, panel)
+    let window = SettingsWindow::new(hwnd, panel, behind)
         .inspect_err(|_| unsafe { DestroyWindow(hwnd) }.unwrap_or_default())?;
     with_app(|app| app.settings = Some(window));
     bring_forward(hwnd);
@@ -139,7 +142,8 @@ fn register_class(instance: HINSTANCE) -> Result<()> {
 
 /// The window, framed and resizable, in the middle of the monitor the
 /// launcher would show on, dark over Mica; not shown yet.
-fn create(placement: Placement) -> Result<HWND> {
+/// The settings window, made at `placement`, and what it is drawn over.
+fn create(placement: Placement, dwm: Dwm) -> Result<(HWND, Behind)> {
     let rect = layout::settings_rect(placement.work_area, layout::scale(placement.dpi));
     // SAFETY: plain calls; the class is registered first.
     let hwnd = unsafe {
@@ -160,17 +164,25 @@ fn create(placement: Placement) -> Result<HWND> {
             None,
         )?
     };
-    // Where DWM refuses the backdrop (a window station of its own), the
-    // window still opens, on a plain background.
-    if let Err(error) = style(hwnd) {
-        eprintln!("hyalo: the settings window goes without its backdrop: {error}");
-    }
-    Ok(hwnd)
+    Ok((hwnd, style(hwnd, dwm)))
 }
 
-fn style(hwnd: HWND) -> Result<()> {
-    set_attribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, &BOOL::from(true))?;
-    set_attribute(hwnd, DWMWA_SYSTEMBACKDROP_TYPE, &DWMSBT_MAINWINDOW)?;
+/// Asks DWM for the window's look: a dark title bar, Mica under the whole
+/// window; says what it is drawn over. Where DWM refuses Mica (Windows 10,
+/// Windows 11 before 22H2, a window station of its own) the window opens
+/// on a solid background.
+fn style(hwnd: HWND, dwm: Dwm) -> Behind {
+    let _ = dwm(
+        hwnd,
+        DWMWA_USE_IMMERSIVE_DARK_MODE,
+        BOOL::from(true).0 as u32,
+    );
+    let mica = dwm(hwnd, DWMWA_SYSTEMBACKDROP_TYPE, DWMSBT_MAINWINDOW.0 as u32);
+    Behind::of(mica.and_then(|()| extend_frame(hwnd)))
+}
+
+/// Puts the frame, and the backdrop with it, under the whole client area.
+fn extend_frame(hwnd: HWND) -> Result<()> {
     // The backdrop under the whole client area, which the swap chain
     // leaves clear wherever it draws nothing.
     let sheet = MARGINS {
@@ -204,14 +216,14 @@ fn mods() -> Mods {
 
 impl SettingsWindow {
     /// The window's state, with its first frame drawn.
-    fn new(hwnd: HWND, panel: Panel) -> Result<Self> {
+    fn new(hwnd: HWND, panel: Panel, behind: Behind) -> Result<Self> {
         // SAFETY: a plain call on a live window.
         let dpi = unsafe { GetDpiForWindow(hwnd) };
         let (width, height) = client_size(hwnd);
         let mut window = Self {
             hwnd,
             panel,
-            painter: Painter::new(hwnd, width, height, dpi)?,
+            painter: Painter::new(hwnd, width, height, dpi, behind)?,
             dpi,
             laid: Laid::default(),
             tracking: false,
@@ -803,7 +815,7 @@ mod tests {
 
     use super::super::tests::{
         Chooser, Keyboard, Launcher, Ran, Taskbar, config_file, hold, listing, named,
-        pump_until_closed, release_json, releasing, services,
+        pump_until_closed, release_json, releasing, services, windows_10,
     };
     use super::super::{HOTKEY_TOGGLE, MOUSE_SHIFT, tray};
     use super::*;
@@ -1038,6 +1050,20 @@ mod tests {
             let settings = setup.settings();
             assert_eq!(settings.dwm(DWMWA_USE_IMMERSIVE_DARK_MODE), 1);
             assert_eq!(settings.dwm(DWMWA_SYSTEMBACKDROP_TYPE), DWMSBT_MAINWINDOW.0);
+            let [.., alpha] = settings.frame().pixel(2, 2);
+            assert_eq!(alpha, 0, "Mica shows through");
+        });
+    }
+
+    #[test]
+    fn where_dwm_gives_no_mica_it_opens_on_a_solid_background() {
+        on_hidden_desktop(|| {
+            let setup = set_up("settings-window-no-mica", DEFAULT, None);
+            with_app(|app| app.services.dwm = windows_10);
+            let settings = setup.settings();
+            assert_eq!(settings.dwm(DWMWA_USE_IMMERSIVE_DARK_MODE), 1);
+            let [.., alpha] = settings.frame().pixel(2, 2);
+            assert_eq!(alpha, 255, "the desktop does not show through");
         });
     }
 

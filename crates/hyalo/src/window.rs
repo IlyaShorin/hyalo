@@ -76,6 +76,7 @@ use crate::render::{Renderer, Row, Scene};
 use crate::results::{self, Listed, MAX_ROWS, Results};
 use crate::row_menu::{self, RowMenu};
 use crate::settings::{self, Loaded};
+use crate::surface::Behind;
 use crate::switcher;
 use crate::tray::{self, Tray};
 use crate::update::Updates;
@@ -195,7 +196,14 @@ pub struct Services {
     pub updates: Option<Updates>,
     /// Whether Windows has hibernation turned on, so Hibernate is listed.
     pub hibernates: bool,
+    /// Asks DWM for a window's look.
+    pub dwm: Dwm,
 }
+
+/// Sets one of a window's DWM attributes, each a 32-bit value, and says
+/// whether DWM took it: `set_attribute`, or in tests a stand-in that
+/// answers as an older Windows does.
+pub type Dwm = fn(HWND, DWMWINDOWATTRIBUTE, u32) -> Result<()>;
 
 /// The icons of Windows' settings. They never change, but the shell may
 /// give none at start, so the ones still missing are asked for again as
@@ -254,6 +262,7 @@ impl Services {
             windows_language: Language::of_windows(unsafe { GetUserDefaultUILanguage() }),
             updates: Updates::real(),
             hibernates: system::hibernates(),
+            dwm: set_attribute,
         }
     }
 }
@@ -323,6 +332,8 @@ struct App {
     checked: Checked,
     /// The newer release GitHub named, and how far installing it came.
     update: Option<Update>,
+    /// What the launcher is drawn over: the glass DWM gave it, or not.
+    behind: Behind,
 }
 
 /// A row's menu, made ready to open: what opens it, its lines, where it
@@ -585,7 +596,10 @@ impl App {
         let dpi = self.placement.dpi;
         match &mut self.renderer {
             Some(renderer) => renderer.resize(width, height, dpi)?,
-            None => self.renderer = Some(Renderer::new(self.hwnd, width, height, dpi)?),
+            None => {
+                let renderer = Renderer::new(self.hwnd, width, height, dpi, self.behind)?;
+                self.renderer = Some(renderer);
+            }
         }
         self.redraw()?;
         // The picture first, then the window: growing, it never shows
@@ -1306,6 +1320,7 @@ fn open(services: Services, shown: bool) -> Result<HWND> {
         .as_deref()
         .and_then(|path| settings::at_start(path, language));
     let position = services.position.as_deref().and_then(read_position);
+    let behind = style_window(hwnd, services.dwm);
     APP.with_borrow_mut(|app| {
         let mut opened = App {
             hwnd,
@@ -1332,6 +1347,7 @@ fn open(services: Services, shown: bool) -> Result<HWND> {
             position,
             checked: Checked::Never,
             update: None,
+            behind,
         };
         opened.find_picked();
         let loaded = seen.clone().map_or(Ok(Config::default()), settings::read);
@@ -1344,7 +1360,6 @@ fn open(services: Services, shown: bool) -> Result<HWND> {
         opened.watch_config(seen);
         *app = Some(opened);
     });
-    style_window(hwnd)?;
     if shown {
         show(hwnd)?;
     }
@@ -1397,23 +1412,36 @@ fn create_window() -> Result<HWND> {
     }
 }
 
-fn style_window(hwnd: HWND) -> Result<()> {
-    set_attribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, &BOOL::from(true))?;
-    set_attribute(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, &DWMWCP_ROUND)?;
-    set_attribute(hwnd, DWMWA_BORDER_COLOR, &DWMWA_COLOR_NONE)?;
+/// Asks DWM for the launcher's look: dark, round corners, no border,
+/// glass behind it; says what it is drawn over. An older Windows refuses
+/// what it does not know (Windows 10 all but the dark, Windows 11 before
+/// 22H2 the glass), and the launcher does without.
+fn style_window(hwnd: HWND, dwm: Dwm) -> Behind {
+    let _ = dwm(
+        hwnd,
+        DWMWA_USE_IMMERSIVE_DARK_MODE,
+        BOOL::from(true).0 as u32,
+    );
+    let _ = dwm(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND.0 as u32);
+    let _ = dwm(hwnd, DWMWA_BORDER_COLOR, DWMWA_COLOR_NONE);
     // No DwmExtendFrameIntoClientArea: the window has no redirection
     // bitmap, so nothing covers the backdrop in the client area anyway.
-    set_attribute(hwnd, DWMWA_SYSTEMBACKDROP_TYPE, &DWMSBT_TRANSIENTWINDOW)
+    Behind::of(dwm(
+        hwnd,
+        DWMWA_SYSTEMBACKDROP_TYPE,
+        DWMSBT_TRANSIENTWINDOW.0 as u32,
+    ))
 }
 
-fn set_attribute<T>(hwnd: HWND, attribute: DWMWINDOWATTRIBUTE, value: &T) -> Result<()> {
-    // SAFETY: `value` points to a live `T`, and the size passed is its size.
+/// DWM's own `Dwm`.
+fn set_attribute(hwnd: HWND, attribute: DWMWINDOWATTRIBUTE, value: u32) -> Result<()> {
+    // SAFETY: `value` is a live u32, and the size passed is its size.
     unsafe {
         DwmSetWindowAttribute(
             hwnd,
             attribute,
-            (value as *const T).cast(),
-            size_of::<T>() as u32,
+            (&raw const value).cast(),
+            size_of::<u32>() as u32,
         )
     }
 }
@@ -2237,6 +2265,7 @@ mod tests {
             windows_language: Language::English,
             updates: None,
             hibernates: true,
+            dwm: set_attribute,
         };
         (services, ran)
     }
@@ -2531,6 +2560,13 @@ mod tests {
                 .expect("read the frame back")
         }
 
+        /// A pixel of the glass right of the query, where nothing but the
+        /// launcher's tint is drawn: blue, green, red and alpha.
+        pub(super) fn glass_pixel(&self) -> [u8; 4] {
+            let frame = self.frame();
+            frame.pixel(frame.width * 19 / 20, frame.height / 2)
+        }
+
         /// The first column of the caret, in pixels, on the bar's middle
         /// row.
         pub(super) fn caret_x(&self) -> usize {
@@ -2619,6 +2655,32 @@ mod tests {
                 DWMSBT_TRANSIENTWINDOW.0
             );
             assert_eq!(launcher.dwm(DWMWA_WINDOW_CORNER_PREFERENCE), DWMWCP_ROUND.0);
+            let [.., alpha] = launcher.glass_pixel();
+            assert!(alpha < 255, "the glass shows through: {alpha}");
+        });
+    }
+
+    /// DWM as Windows 10 answers: it refuses the attributes Windows 11
+    /// brought, round corners, the border's colour and the system
+    /// backdrop, as it refuses any attribute it does not know.
+    pub(super) fn windows_10(hwnd: HWND, attribute: DWMWINDOWATTRIBUTE, value: u32) -> Result<()> {
+        match attribute {
+            DWMWA_WINDOW_CORNER_PREFERENCE | DWMWA_BORDER_COLOR | DWMWA_SYSTEMBACKDROP_TYPE => {
+                Err(windows::Win32::Foundation::E_INVALIDARG.into())
+            }
+            _ => set_attribute(hwnd, attribute, value),
+        }
+    }
+
+    #[test]
+    fn where_dwm_gives_no_glass_it_opens_on_a_solid_background() {
+        on_hidden_desktop(|| {
+            let (mut services, _) = services(listing(&[]).0, None);
+            services.dwm = windows_10;
+            let launcher = Launcher::serving(services);
+            assert_eq!(launcher.dwm(DWMWA_USE_IMMERSIVE_DARK_MODE), 1);
+            let [.., alpha] = launcher.glass_pixel();
+            assert_eq!(alpha, 255, "the desktop does not show through");
         });
     }
 
