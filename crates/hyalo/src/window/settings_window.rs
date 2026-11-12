@@ -663,7 +663,7 @@ fn carry_out(hwnd: HWND, effect: Effect) {
             with_app(App::install);
         }
         Effect::Copy(text) => {
-            with_app(|app| (app.services.run)(&Action::CopyText(text), false));
+            with_app(|app| app.run_action(&Action::CopyText(text)));
         }
         Effect::Paste => {
             let text = clipboard::text().unwrap_or_default();
