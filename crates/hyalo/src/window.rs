@@ -48,9 +48,9 @@ use windows::Win32::UI::Shell::{NIN_SELECT, NINF_KEY};
 use windows::Win32::UI::WindowsAndMessaging::{
     AllowSetForegroundWindow, CS_DBLCLKS, CW_USEDEFAULT, CreateWindowExW, DefWindowProcW,
     DestroyWindow, DispatchMessageW, FindWindowW, GetCursorPos, GetMessagePos, GetMessageW,
-    GetSystemMetrics, GetWindowRect, GetWindowThreadProcessId, HTCLIENT, HWND_TOPMOST, IDC_ARROW,
-    IDC_IBEAM, IsWindow, IsWindowVisible, LoadCursorW, MSG, PostMessageW, PostQuitMessage,
-    RegisterClassExW, SM_CXDOUBLECLK, SM_CYDOUBLECLK, SW_HIDE, SW_SHOW, SWP_NOACTIVATE, SetCursor,
+    GetSystemMetrics, GetWindowRect, GetWindowThreadProcessId, HTCLIENT, IDC_ARROW, IDC_IBEAM,
+    IsWindow, IsWindowVisible, LoadCursorW, MSG, PostMessageW, PostQuitMessage, RegisterClassExW,
+    SM_CXDOUBLECLK, SM_CYDOUBLECLK, SW_HIDE, SW_SHOW, SWP_NOACTIVATE, SWP_NOZORDER, SetCursor,
     SetForegroundWindow, SetWindowPos, ShowWindow, TranslateMessage, WA_INACTIVE, WM_ACTIVATE,
     WM_APP, WM_CHAR, WM_CLOSE, WM_CONTEXTMENU, WM_DESTROY, WM_HOTKEY, WM_KEYDOWN, WM_LBUTTONDBLCLK,
     WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCCALCSIZE, WM_NCHITTEST, WM_SETCURSOR,
@@ -569,18 +569,20 @@ impl App {
         self.put_window()
     }
 
-    /// Puts the window where it goes, at the size of what it lists.
+    /// Puts the window where it goes, at the size of what it lists,
+    /// leaving it where it is among the windows: lifted on every refresh,
+    /// it would cover a row's menu (see `show`).
     fn put_window(&self) -> Result<()> {
         let rect = self.rect();
         unsafe {
             SetWindowPos(
                 self.hwnd,
-                Some(HWND_TOPMOST),
+                None,
                 rect.x,
                 rect.y,
                 rect.width,
                 rect.height,
-                SWP_NOACTIVATE,
+                SWP_NOACTIVATE | SWP_NOZORDER,
             )
         }
     }
@@ -855,8 +857,13 @@ impl App {
         }
     }
 
-    /// Whether the selected row is still `item`'s.
-    fn still_picked(&self, item: &ItemId) -> bool {
+    /// The menu of `item`'s row closed, leaving the pointer at `pointer`
+    /// on the screen, if known. It went there over the menu, unseen, and
+    /// Windows tells of it next as a move: no move of the user's (see
+    /// `hover`), so it must not take the selection, nor call the asking
+    /// off. Whether the selected row is still `item`'s.
+    fn menu_closed(&mut self, item: &ItemId, pointer: Option<POINT>) -> bool {
+        self.pointer = pointer.map(|at| to_client(self.hwnd, at));
         self.results
             .picked()
             .is_some_and(|row| row.item.id == *item)
@@ -1497,9 +1504,9 @@ fn on_context_menu(hwnd: HWND, at: POINT) -> Result<()> {
     let Some(opening) = opening.flatten() else {
         return Ok(());
     };
-    let picked = opening.menu.open(hwnd, &opening.lines, opening.at);
-    let still = with_app(|app| app.still_picked(&opening.item)) == Some(true);
-    match picked.filter(|_| still) {
+    let closed = opening.menu.open(hwnd, &opening.lines, opening.at);
+    let still = with_app(|app| app.menu_closed(&opening.item, closed.pointer)) == Some(true);
+    match closed.picked.filter(|_| still) {
         Some(command) => on_picked(hwnd, command),
         None => Ok(()),
     }
@@ -1723,6 +1730,7 @@ fn show(hwnd: HWND) -> Result<()> {
         Ok(())
     })
     .unwrap_or(Ok(()))?;
+    // Shown and in front, it is on top of the windows that stay on top.
     unsafe {
         let _ = ShowWindow(hwnd, SW_SHOW);
         let _ = SetForegroundWindow(hwnd);
@@ -1968,9 +1976,10 @@ mod tests {
         VK_HOME, VK_LEFT, VK_RETURN, VK_RIGHT, VK_UP, VK_V, VK_X,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
-        EndMenu, FindWindowExW, GetClientRect, GetCursor, GetWindowRect, IsWindow, KillTimer,
-        PM_QS_POSTMESSAGE, PM_REMOVE, PeekMessageW, SendMessageW, SetTimer, WA_ACTIVE, WM_CLOSE,
-        WM_NULL, WM_QUIT, WM_RBUTTONDOWN, WM_RBUTTONUP,
+        EndMenu, FindWindowExW, GW_HWNDPREV, GetClientRect, GetCursor, GetWindow, GetWindowRect,
+        IsWindow, KillTimer, PM_QS_POSTMESSAGE, PM_REMOVE, PeekMessageW, SW_SHOWNOACTIVATE,
+        SendMessageW, SetTimer, WA_ACTIVE, WM_CLOSE, WM_NULL, WM_QUIT, WM_RBUTTONDOWN,
+        WM_RBUTTONUP,
     };
 
     use super::*;
@@ -2107,22 +2116,26 @@ mod tests {
     }
 
     /// Rows' menus as a test keeps them: the lines of each menu opened
-    /// and where, what happens while the next one is open, and what the
-    /// user picks from it.
+    /// and where, what happens while the next one is open, what the user
+    /// picks from it, and where on the screen they leave the pointer.
     #[derive(Default)]
     pub(super) struct Choices {
         pub(super) opened: RefCell<Vec<(Vec<row_menu::Line>, POINT)>>,
         pub(super) meanwhile: RefCell<Option<Box<dyn FnOnce()>>>,
         pub(super) pick: RefCell<Option<Command>>,
+        pub(super) left_at: RefCell<Option<POINT>>,
     }
 
     impl RowMenu for Choices {
-        fn open(&self, _: HWND, lines: &[row_menu::Line], at: POINT) -> Option<Command> {
+        fn open(&self, _: HWND, lines: &[row_menu::Line], at: POINT) -> row_menu::Closed {
             self.opened.borrow_mut().push((lines.to_vec(), at));
             if let Some(meanwhile) = self.meanwhile.borrow_mut().take() {
                 meanwhile();
             }
-            self.pick.borrow_mut().take()
+            row_menu::Closed {
+                picked: self.pick.borrow_mut().take(),
+                pointer: *self.left_at.borrow(),
+            }
         }
     }
 
@@ -2572,6 +2585,37 @@ mod tests {
             assert!(!launcher.visible());
             launcher.hotkey();
             assert!(launcher.visible());
+        });
+    }
+
+    #[test]
+    fn it_shows_on_top_of_the_windows_that_stay_on_top() {
+        on_hidden_desktop(|| {
+            let launcher = Launcher::open();
+            launcher.hotkey();
+            let (ex, style) = (WS_EX_TOPMOST | WS_EX_TOOLWINDOW, WS_POPUP);
+            let other = unsafe {
+                CreateWindowExW(
+                    ex,
+                    w!("STATIC"),
+                    w!(""),
+                    style,
+                    0,
+                    0,
+                    50,
+                    50,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+            }
+            .expect("a window that stays on top");
+            let _ = unsafe { ShowWindow(other, SW_SHOWNOACTIVATE) };
+            assert!(above(other, launcher.0), "on top of the hidden launcher");
+            launcher.hotkey();
+            assert!(above(launcher.0, other), "the launcher shows over it");
+            unsafe { DestroyWindow(other) }.expect("destroy it");
         });
     }
 
@@ -4466,6 +4510,120 @@ mod tests {
 
     fn titles_listed() -> Vec<String> {
         with_app(|app| titles(app)).expect("app state")
+    }
+
+    /// Reported on 0.2.5: Uninstall… picked from the menu uninstalled
+    /// nothing. The pointer goes over the menu to pick the entry, below
+    /// where the row was clicked; once the menu is gone, Windows tells
+    /// the launcher the pointer is there, over another row, and that
+    /// must not take the selection, nor call the asking off.
+    #[test]
+    fn the_pointer_left_where_uninstall_was_picked_calls_nothing_off() {
+        on_hidden_desktop(|| {
+            let titles = ["Everything", "Evernote", "Everest"];
+            let (launcher, ran, choices) = with_menus(&titles, &["Everything"]);
+            launcher.search_for("ever", 3);
+            let row = row_of("Everything");
+            let below = (row + 1) % 3;
+            launcher.mouse(WM_MOUSEMOVE, 200.0, middle_of(row));
+            *choices.left_at.borrow_mut() = Some(launcher.on_screen(200.0, middle_of(below)));
+            *choices.pick.borrow_mut() = Some(Command::Uninstall);
+            launcher.right_click(200.0, middle_of(row));
+            launcher.mouse(WM_MOUSEMOVE, 200.0, middle_of(below));
+            assert_eq!(with_app(|app| app.results.selected()), Some(row));
+            assert!(with_app(|app| app.results.asking()).expect("app state"));
+            launcher.press(VK_RETURN);
+            assert_eq!(*ran.borrow(), [uninstalled("Everything")]);
+            launcher.hotkey();
+            launcher.search_for("ever", 3);
+            launcher.mouse(WM_MOUSEMOVE, 200.0, middle_of(row));
+            *choices.left_at.borrow_mut() = None;
+            launcher.right_click(200.0, middle_of(row));
+            launcher.mouse(WM_MOUSEMOVE, 200.0, middle_of(below));
+            let selected = with_app(|app| app.results.selected());
+            assert_eq!(
+                selected,
+                Some(below),
+                "where the pointer is not known, a move is the user's"
+            );
+        });
+    }
+
+    thread_local! {
+        /// The gate a provider waits at while the real menu is open, and
+        /// what the menu saw: whether it was above the launcher when it
+        /// opened, and once the list had grown, whether it was still up
+        /// and above it.
+        static GATE: RefCell<Option<Sender<()>>> = const { RefCell::new(None) };
+        static OVER: RefCell<Option<bool>> = const { RefCell::new(None) };
+        static AFTER: RefCell<Option<(bool, bool)>> = const { RefCell::new(None) };
+    }
+
+    /// Whether `upper` is above `lower` among the desktop's windows.
+    fn above(upper: HWND, lower: HWND) -> bool {
+        let mut at = unsafe { GetWindow(lower, GW_HWNDPREV) }.ok();
+        while let Some(window) = at {
+            if window == upper {
+                return true;
+            }
+            at = unsafe { GetWindow(window, GW_HWNDPREV) }.ok();
+        }
+        false
+    }
+
+    /// Ticks inside the real menu's own loop: once it is up, notes
+    /// whether it is above the launcher and lets the provider hand over
+    /// more; once the list grew from that, notes whether the menu is still
+    /// up and above, and closes it. Gives up after a few seconds.
+    extern "system" fn refresh_under_the_menu(hwnd: HWND, _: u32, id: usize, _: u32) {
+        let ticks = TICKS.with(|ticks| {
+            *ticks.borrow_mut() += 1;
+            *ticks.borrow()
+        });
+        let menu = menu_up();
+        let grown = with_app(|app| app.results.rows().len() == 2) == Some(true);
+        if let (Some(menu), None) = (menu, OVER.with(|over| *over.borrow())) {
+            OVER.with(|over| *over.borrow_mut() = Some(above(menu, hwnd)));
+            let gate = GATE.with(|gate| gate.borrow_mut().take()).expect("a gate");
+            gate.send(()).expect("let the provider go");
+        } else if grown || ticks > 500 {
+            let still = menu.map(|menu| (true, above(menu, hwnd)));
+            AFTER.with(|after| *after.borrow_mut() = Some(still.unwrap_or((false, false))));
+            let _ = unsafe { KillTimer(Some(hwnd), id) };
+            let _ = unsafe { EndMenu() };
+        }
+    }
+
+    /// Reported on 0.2.5: every row's menu went away within about a
+    /// second. A refresh arrives while the menu is open and draws the
+    /// launcher again (here a provider's next piece; on a live machine
+    /// the files provider's, up to twice a second while the index
+    /// changes, or a folder's icon): that must leave the menu up and
+    /// above it.
+    #[test]
+    fn a_refresh_while_the_real_menu_is_open_leaves_the_menu_up_above_the_launcher() {
+        on_hidden_desktop(|| {
+            let (provider, gate) = gated(&["Everything"], &["Everything", "Evernote"]);
+            let (mut services, _) = services(provider, None);
+            services.row_menu = Rc::new(row_menu::Popup);
+            let launcher = Launcher::serving(services);
+            launcher.search_for("ever", 1);
+            GATE.with(|held| *held.borrow_mut() = Some(gate));
+            unsafe { SetTimer(Some(launcher.0), 1, 10, Some(refresh_under_the_menu)) };
+            launcher.menu_key();
+            assert_eq!(
+                OVER.with(|over| *over.borrow()),
+                Some(true),
+                "above at first"
+            );
+            let after = AFTER.with(|after| after.borrow_mut().take());
+            assert_eq!(titles_listed().len(), 2, "the list grew under the menu");
+            assert_eq!(
+                after,
+                Some((true, true)),
+                "still up, and above the launcher"
+            );
+        });
     }
 
     thread_local! {

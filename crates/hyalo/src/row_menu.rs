@@ -7,6 +7,7 @@
 use hyalo_core::item::{Action, Item, Kind};
 use hyalo_core::text::{Language, Text};
 use windows::Win32::Foundation::{HWND, POINT};
+use windows::Win32::UI::WindowsAndMessaging::GetCursorPos;
 
 use crate::keys::{self, Command};
 use crate::popup::{self, Side};
@@ -51,21 +52,37 @@ fn enter(action: &Action) -> Text {
     }
 }
 
+/// What a row's menu leaves when it closes: the entry picked, if any,
+/// and where the pointer is, in screen pixels, if Windows says. The user
+/// moved it over the menu, where the launcher did not see it go.
+#[derive(Debug, Clone, Copy)]
+pub struct Closed {
+    pub picked: Option<Command>,
+    pub pointer: Option<POINT>,
+}
+
 /// What the window asks of a row's menu: the real one in `Popup`, a
 /// stand-in in tests.
 pub trait RowMenu {
     /// Opens a menu of `lines` for `window` at `at`, in screen pixels,
-    /// until the user picks an entry or clicks away: what was picked, if
-    /// anything.
-    fn open(&self, window: HWND, lines: &[Line], at: POINT) -> Option<Command>;
+    /// until the user picks an entry or clicks away.
+    fn open(&self, window: HWND, lines: &[Line], at: POINT) -> Closed;
 }
 
 /// The menu Windows shows.
 pub struct Popup;
 
 impl RowMenu for Popup {
-    fn open(&self, window: HWND, lines: &[Line], at: POINT) -> Option<Command> {
-        popup::track(window, lines, at, Side::Below)
+    fn open(&self, window: HWND, lines: &[Line], at: POINT) -> Closed {
+        let picked = popup::track(window, lines, at, Side::Below);
+        let mut pointer = POINT::default();
+        // SAFETY: a plain call into a live POINT; it fails off the
+        // desktop that takes input.
+        let read = unsafe { GetCursorPos(&mut pointer) }.is_ok();
+        Closed {
+            picked,
+            pointer: read.then_some(pointer),
+        }
     }
 }
 
