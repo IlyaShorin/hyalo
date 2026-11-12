@@ -9,9 +9,11 @@ use std::path::{Path, PathBuf};
 use windows::Win32::Foundation::{ERROR_FILE_NOT_FOUND, WIN32_ERROR};
 use windows::Win32::System::Registry::{
     HKEY_CURRENT_USER, REG_ROUTINE_FLAGS, REG_SZ, RRF_RT_REG_BINARY, RRF_RT_REG_SZ,
-    RegDeleteKeyValueW, RegGetValueW, RegSetKeyValueW,
+    RegDeleteKeyValueW, RegSetKeyValueW,
 };
 use windows::core::{HSTRING, Result};
+
+use crate::registry::{self, text};
 
 /// Where Windows looks for what to start at logon, under the current
 /// user's key.
@@ -96,45 +98,7 @@ fn starts(run: Option<&str>, approved: Option<&[u8]>, exe: &Path) -> bool {
 /// The value `NAME` under the current user's `key`, as `kind` reads it,
 /// in bytes; `None` when there is none.
 fn read(key: &str, kind: REG_ROUTINE_FLAGS) -> Option<Vec<u8>> {
-    let (key, name) = (HSTRING::from(key), HSTRING::from(NAME));
-    let mut size = 0_u32;
-    // SAFETY: the first call only measures; the second writes at most
-    // `size` bytes into a buffer of that size.
-    unsafe {
-        let measured = RegGetValueW(
-            HKEY_CURRENT_USER,
-            &key,
-            &name,
-            kind,
-            None,
-            None,
-            Some(&mut size),
-        );
-        measured.ok().ok()?;
-        let mut bytes = vec![0_u8; size as usize];
-        let data = Some(bytes.as_mut_ptr().cast());
-        let read = RegGetValueW(
-            HKEY_CURRENT_USER,
-            &key,
-            &name,
-            kind,
-            None,
-            data,
-            Some(&mut size),
-        );
-        read.ok().ok()?;
-        bytes.truncate(size as usize);
-        Some(bytes)
-    }
-}
-
-/// A registry string's bytes as text, without the NUL at its end.
-fn text(bytes: &[u8]) -> String {
-    let pairs = bytes.as_chunks::<2>().0.iter();
-    let units: Vec<u16> = pairs.map(|&pair| u16::from_le_bytes(pair)).collect();
-    String::from_utf16_lossy(&units)
-        .trim_end_matches('\0')
-        .to_string()
+    registry::value(HKEY_CURRENT_USER, key, NAME, kind)
 }
 
 /// Writes `value` as the string `NAME` under the current user's `key`,
@@ -176,23 +140,27 @@ fn gone(status: WIN32_ERROR) -> Result<()> {
 #[cfg(test)]
 pub mod tests {
     use super::*;
-    use windows::Win32::System::Registry::{REG_BINARY, RegDeleteTreeW};
+    use crate::registry::tests::TestKey;
+    use windows::Win32::System::Registry::REG_BINARY;
 
     /// Keys of their own for one test, under `Software\hyalo-test-<pid>-<test>`
     /// in the current user's key, deleted afterwards. Never Windows' own.
     pub struct Keys {
-        root: String,
+        key: TestKey,
         pub run: String,
         pub approved: String,
     }
 
+    /// Where the test's StartupApproved key is, under its own.
+    const APPROVED_UNDER: &str = r"StartupApproved\Run";
+
     impl Keys {
         pub fn new(test: &str) -> Keys {
-            let root = format!(r"Software\hyalo-test-{}-{test}", std::process::id());
+            let key = TestKey::new(test);
             Keys {
-                run: format!(r"{root}\Run"),
-                approved: format!(r"{root}\StartupApproved\Run"),
-                root,
+                run: key.under("Run"),
+                approved: key.under(APPROVED_UNDER),
+                key,
             }
         }
 
@@ -207,33 +175,11 @@ pub mod tests {
 
         /// Sets the mark Windows' switch keeps.
         fn mark(&self, bytes: &[u8]) {
-            let written = unsafe {
-                RegSetKeyValueW(
-                    HKEY_CURRENT_USER,
-                    &HSTRING::from(&self.approved),
-                    &HSTRING::from(NAME),
-                    REG_BINARY.0,
-                    Some(bytes.as_ptr().cast()),
-                    bytes.len() as u32,
-                )
-            };
-            written.ok().expect("mark");
+            self.key.write(APPROVED_UNDER, NAME, REG_BINARY, bytes);
         }
 
         fn marked(&self) -> bool {
             read(&self.approved, RRF_RT_REG_BINARY).is_some()
-        }
-    }
-
-    impl Drop for Keys {
-        fn drop(&mut self) {
-            let _ = unsafe { RegDeleteTreeW(HKEY_CURRENT_USER, &HSTRING::from(&self.root)) };
-            let _ = unsafe {
-                windows::Win32::System::Registry::RegDeleteKeyW(
-                    HKEY_CURRENT_USER,
-                    &HSTRING::from(&self.root),
-                )
-            };
         }
     }
 

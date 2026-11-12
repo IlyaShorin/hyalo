@@ -1,5 +1,6 @@
 //! The rows the window lists for a query, and which one Enter picks.
 
+use std::borrow::Cow;
 use std::collections::HashSet;
 
 use hyalo_core::frecency::{Frecency, Timestamp};
@@ -83,9 +84,10 @@ pub struct Results {
     rows: Vec<Listed>,
     /// Within `rows` whenever there are any.
     selected: usize,
-    /// Whether the selected row asked to press Enter again: only one
-    /// that asks first, after the first Enter.
-    asking: bool,
+    /// What the selected row asks to press Enter for, if it asks: its own
+    /// action that asks first (a system command such as Restart), after
+    /// the first Enter, or uninstalling its app, after Shift+Delete.
+    asking: Option<Action>,
 }
 
 impl Results {
@@ -151,7 +153,7 @@ impl Results {
         Self {
             rows,
             selected: 0,
-            asking: false,
+            asking: None,
         }
     }
 
@@ -187,40 +189,53 @@ impl Results {
             rows.position(|row| row.item.id == picked.item.id)
         });
         fresh.selected = kept.unwrap_or(fresh.selected);
-        fresh.asking = self.asking && kept.is_some();
+        fresh.asking = self.asking.clone().filter(|_| kept.is_some());
         fresh
     }
 
-    /// Whether Enter may run the selected row now: at once, unless the
-    /// row asks first (a system command such as Restart) and is not
-    /// asking yet; then it starts asking, and the next Enter runs it.
-    pub fn confirm(&mut self) -> bool {
-        let asks = self
-            .picked()
-            .is_some_and(|row| row.item.action.asking().is_some());
-        let confirmed = self.asking || !asks;
-        self.asking = !confirmed;
-        confirmed
+    /// What Enter carries out now, `wanted` being what it does with the
+    /// selected row: what the row asked about, if it asks; else `wanted`
+    /// at once, unless that asks first (a system command such as
+    /// Restart): then the row asks about it, and the next Enter runs it.
+    pub fn confirm(&mut self, wanted: Action) -> Option<Action> {
+        if let Some(asked) = self.asking.take() {
+            return Some(asked);
+        }
+        match wanted.asks() {
+            true => {
+                self.ask(wanted);
+                None
+            }
+            false => Some(wanted),
+        }
     }
 
-    /// Whether the selected row asks to press Enter again.
+    /// The selected row asks to press Enter for `action`, if there is a
+    /// row and `action` asks first, such as uninstalling the row's app;
+    /// whether it asks.
+    pub fn ask(&mut self, action: Action) -> bool {
+        let asks = action.asks() && self.picked().is_some();
+        self.asking = asks.then_some(action);
+        asks
+    }
+
+    /// Whether the selected row asks to press Enter.
     pub fn asking(&self) -> bool {
-        self.asking
+        self.asking.is_some()
     }
 
     /// Stops asking, as anything but Enter does; whether it was.
     pub fn calm(&mut self) -> bool {
-        std::mem::take(&mut self.asking)
+        self.asking.take().is_some()
     }
 
     /// The second line of row `row` in `language`: what the asking row
     /// asks, else what its item says.
-    pub fn subtitle(&self, row: usize, language: Language) -> &str {
-        let item = &self.rows[row].item;
-        let asked = (self.asking && row == self.selected).then(|| item.action.asking());
-        match asked.flatten() {
-            Some(text) => language.say(text),
-            None => subtitle(item, language),
+    pub fn subtitle(&self, row: usize, language: Language) -> Cow<'_, str> {
+        let asking = self.asking.as_ref().filter(|_| row == self.selected);
+        match asking.and_then(|action| action.asking(language)) {
+            Some(asked) => Cow::Owned(asked),
+            None => Cow::Borrowed(subtitle(&self.rows[row].item, language)),
         }
     }
 
@@ -242,7 +257,7 @@ impl Results {
         let moved = row < self.rows.len() && row != self.selected;
         if moved {
             self.selected = row;
-            self.asking = false;
+            self.asking = None;
         }
         moved
     }
@@ -252,14 +267,14 @@ impl Results {
     pub fn down(&mut self) {
         let next = (self.selected + 1).checked_rem(self.rows.len());
         self.selected = next.unwrap_or(self.selected);
-        self.asking = false;
+        self.asking = None;
     }
 
     /// One row up; from the first row round to the last.
     pub fn up(&mut self) {
         let last = self.rows.len().saturating_sub(1);
         self.selected = self.selected.checked_sub(1).unwrap_or(last);
-        self.asking = false;
+        self.asking = None;
     }
 }
 
@@ -268,6 +283,7 @@ mod tests {
     use super::*;
     use hyalo_core::item::{ItemId, Kind};
     use hyalo_core::system_commands;
+    use hyalo_core::uninstall::Uninstall;
 
     const NOW: Timestamp = Timestamp(1_700_000_000);
 
@@ -581,10 +597,20 @@ mod tests {
         search(query, &items)
     }
 
-    fn said(results: &Results) -> Vec<&str> {
+    fn said(results: &Results) -> Vec<String> {
         let rows = 0..results.rows().len();
-        rows.map(|row| results.subtitle(row, Language::English))
-            .collect()
+        let said = rows.map(|row| results.subtitle(row, Language::English));
+        said.map(|line| line.into_owned()).collect()
+    }
+
+    /// Enter on the selected row: what it carries out now, if anything.
+    fn enter(results: &mut Results) -> Option<Action> {
+        let wanted = results.picked()?.item.action.clone();
+        results.confirm(wanted)
+    }
+
+    fn restart() -> Option<Action> {
+        Some(Action::System(Command::Restart))
     }
 
     #[test]
@@ -592,10 +618,10 @@ mod tests {
         let mut results = commands("restart");
         assert_eq!(picked(&results), Some("Restart"));
         assert!(!results.asking());
-        assert!(!results.confirm(), "asks");
+        assert_eq!(enter(&mut results), None, "asks");
         assert!(results.asking());
         assert_eq!(said(&results)[0], "Press Enter again to restart");
-        assert!(results.confirm(), "runs");
+        assert_eq!(enter(&mut results), restart(), "runs");
         assert!(!results.asking());
     }
 
@@ -603,17 +629,56 @@ mod tests {
     fn a_row_that_does_not_ask_runs_at_the_first_enter() {
         let mut results = commands("lock");
         assert_eq!(picked(&results), Some("Lock"));
-        assert!(results.confirm());
+        let lock = Some(Action::System(Command::Lock));
+        assert_eq!(enter(&mut results), lock);
         assert!(!results.asking());
         let mut results = search("note", &apps(&["Notepad"]));
-        assert!(results.confirm());
-        assert!(Results::default().confirm(), "nothing to ask about");
+        let open = Some(Action::Open("Notepad".to_string()));
+        assert_eq!(enter(&mut results), open);
+    }
+
+    /// Uninstalling the app `title`.
+    fn uninstalling(title: &str) -> Action {
+        Action::Uninstall(Uninstall::Package {
+            name: title.to_string(),
+            full_name: format!("{title}_1.0.0.0_x64__0000000000000"),
+        })
+    }
+
+    #[test]
+    fn a_row_asked_to_uninstall_its_app_says_so_and_enter_uninstalls_it() {
+        let mut results = search("note", &apps(&["Notepad", "Notes"]));
+        assert!(results.ask(uninstalling("Notepad")));
+        assert!(results.asking());
+        assert_eq!(
+            said(&results),
+            ["Press Enter to uninstall Notepad", "App"],
+            "the selected row asks, the others are apps"
+        );
+        assert_eq!(enter(&mut results), Some(uninstalling("Notepad")));
+        assert!(!results.asking());
+        assert_eq!(said(&results)[0], "App");
+        let open = Some(Action::Open("Notepad".to_string()));
+        assert_eq!(enter(&mut results), open, "the next Enter opens it");
+    }
+
+    #[test]
+    fn only_a_row_asks_and_only_about_what_asks_first() {
+        let mut nothing = Results::default();
+        assert!(!nothing.ask(uninstalling("Notepad")), "no row");
+        assert!(!nothing.asking());
+        let mut results = search("note", &apps(&["Notepad"]));
+        assert!(!results.ask(Action::Open("Notepad".to_string())));
+        assert!(!results.asking());
+        results.ask(uninstalling("Notepad"));
+        assert!(!results.ask(Action::Open("Notepad".to_string())));
+        assert!(!results.asking(), "asked about something else since");
     }
 
     #[test]
     fn only_the_asking_row_says_so_and_the_others_say_what_they_are() {
         let mut results = commands("s");
-        assert!(!results.confirm());
+        assert_eq!(enter(&mut results), None);
         let lines = said(&results);
         assert_eq!(lines[0], "Press Enter again to sleep");
         assert!(
@@ -631,20 +696,20 @@ mod tests {
         }];
         for step in moves {
             let mut results = commands("s");
-            results.confirm();
+            enter(&mut results);
             step(&mut results);
             assert!(!results.asking());
-            assert!(!results.confirm(), "a new row asks again");
+            assert_eq!(enter(&mut results), None, "a new row asks again");
         }
     }
 
     #[test]
     fn down_and_up_stop_the_asking_even_on_the_only_row() {
         let mut results = commands("restart");
-        results.confirm();
+        enter(&mut results);
         results.down();
         assert!(!results.asking());
-        results.confirm();
+        enter(&mut results);
         results.up();
         assert!(!results.asking());
     }
@@ -652,7 +717,7 @@ mod tests {
     #[test]
     fn pointing_at_the_asking_row_again_keeps_it_asking() {
         let mut results = commands("s");
-        results.confirm();
+        enter(&mut results);
         assert!(!results.select(0));
         assert!(results.asking());
     }
@@ -661,7 +726,7 @@ mod tests {
     fn calming_says_whether_it_was_asking() {
         let mut results = commands("restart");
         assert!(!results.calm());
-        results.confirm();
+        enter(&mut results);
         assert!(results.calm());
         assert!(!results.asking());
     }
@@ -670,11 +735,17 @@ mod tests {
     fn a_refresh_keeps_the_asking_row_asking_and_one_without_it_does_not() {
         let items = system_commands::items(Language::English, true);
         let mut results = commands("restart");
-        results.confirm();
+        enter(&mut results);
         let fresh = results.kept(search("restart", &items));
         assert!(fresh.asking());
+        let mut fresh = fresh;
+        assert_eq!(enter(&mut fresh), restart(), "about the same");
         let gone = results.kept(search("restart", &apps(&["Restart"])));
         assert!(!gone.asking(), "another item, though named the same");
+        let mut listed = search("note", &apps(&["Notepad"]));
+        listed.ask(uninstalling("Notepad"));
+        let mut kept = listed.kept(search("note", &apps(&["Notes", "Notepad"])));
+        assert_eq!(enter(&mut kept), Some(uninstalling("Notepad")), "moved");
     }
 
     #[test]

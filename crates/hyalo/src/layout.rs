@@ -141,6 +141,13 @@ pub fn row_top(index: usize) -> f32 {
     BAR_HEIGHT + LIST_PADDING + index as f32 * ROW_HEIGHT
 }
 
+/// Where the menu of row `index` opened from the keys goes, in DIPs from
+/// the launcher's top left: under the row, where its title starts. A
+/// click opens it where it clicked.
+pub fn menu_spot(index: usize) -> (f32, f32) {
+    (TEXT_LEFT, row_top(index) + ROW_HEIGHT)
+}
+
 /// The row at `y` DIPs from the top of the launcher, when it lists
 /// `rows` rows; `None` over the bar, the padding or past the last row.
 pub fn row_at(y: f32, rows: usize) -> Option<usize> {
@@ -301,6 +308,12 @@ mod tests {
     fn rows_start_below_the_bar_and_its_padding() {
         assert_eq!(row_top(0), 72.0);
         assert_eq!(row_top(2), 168.0);
+    }
+
+    #[test]
+    fn a_rows_menu_opened_from_the_keys_goes_under_it_where_its_title_starts() {
+        assert_eq!(menu_spot(0), (56.0, 120.0));
+        assert_eq!(menu_spot(2), (TEXT_LEFT, row_top(3)));
     }
 
     #[test]

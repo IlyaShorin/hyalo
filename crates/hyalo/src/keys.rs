@@ -4,7 +4,7 @@
 
 use hyalo_core::item::{Action, Item};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    VIRTUAL_KEY, VK_DOWN, VK_ESCAPE, VK_F4, VK_RETURN, VK_UP,
+    VIRTUAL_KEY, VK_DELETE, VK_DOWN, VK_ESCAPE, VK_F4, VK_RETURN, VK_UP,
 };
 
 /// A key that does something besides typing.
@@ -22,6 +22,10 @@ pub enum Command {
     /// Copy the selected file's or folder's full path: Ctrl+C with no
     /// text selected in the bar (the field says which keys copy).
     Copy,
+    /// Ask to uninstall the selected app: Shift+Delete, Windows' key for
+    /// deleting for good. With text selected in the bar it cuts the text,
+    /// as in any field: the window decides, and knows the uninstallers.
+    Uninstall,
 }
 
 /// Which modifier keys are held.
@@ -39,6 +43,7 @@ pub fn command(key: VIRTUAL_KEY, held: Held) -> Option<Command> {
         VK_UP => Some(Command::Up),
         VK_DOWN => Some(Command::Down),
         VK_RETURN => Some(enter(held)),
+        VK_DELETE if held.shift && !held.ctrl => Some(Command::Uninstall),
         _ => None,
     }
 }
@@ -48,6 +53,21 @@ pub fn command(key: VIRTUAL_KEY, held: Held) -> Option<Command> {
 /// would close it and so end hyalo. The other keys are Windows' own.
 pub fn alt_command(key: VIRTUAL_KEY) -> Option<Command> {
     (key == VK_F4).then_some(Command::Hide)
+}
+
+/// The keys that give `command`, as menus write them beside an entry:
+/// the ones `command` reads, or for copying the path the field's Ctrl+C.
+pub fn shortcut(command: Command) -> &'static str {
+    match command {
+        Command::Hide => "Esc",
+        Command::Up => "Up",
+        Command::Down => "Down",
+        Command::Open { as_admin: false } => "Enter",
+        Command::Open { as_admin: true } => "Ctrl+Shift+Enter",
+        Command::Reveal => "Ctrl+Enter",
+        Command::Copy => "Ctrl+C",
+        Command::Uninstall => "Shift+Delete",
+    }
 }
 
 /// Enter opens, Ctrl+Enter shows in the folder, Ctrl+Shift+Enter opens as
@@ -62,14 +82,14 @@ fn enter(held: Held) -> Command {
 
 /// What `command` does with `item`, and whether as administrator; `None`
 /// when it does nothing with it: only files and folders are shown in
-/// their folder or have a path to copy, and moving or hiding acts on no
-/// row.
+/// their folder or have a path to copy, moving or hiding acts on no row,
+/// and what uninstalls an app the item does not say.
 pub fn action(command: Command, item: &Item) -> Option<(Action, bool)> {
     match command {
         Command::Open { as_admin } => Some((item.action.clone(), as_admin)),
         Command::Reveal => Some((Action::Reveal(item.path()?.to_string()), false)),
         Command::Copy => Some((Action::CopyText(item.path()?.to_string()), false)),
-        Command::Hide | Command::Up | Command::Down => None,
+        Command::Hide | Command::Up | Command::Down | Command::Uninstall => None,
     }
 }
 
@@ -137,6 +157,23 @@ mod tests {
     }
 
     #[test]
+    fn shift_delete_asks_to_uninstall_and_delete_with_ctrl_or_alone_is_the_fields() {
+        let shift = Held {
+            ctrl: false,
+            shift: true,
+        };
+        let both = Held {
+            ctrl: true,
+            shift: true,
+        };
+        assert_eq!(command(VK_DELETE, shift), Some(Command::Uninstall));
+        assert_eq!(command(VK_DELETE, NONE), None);
+        assert_eq!(command(VK_DELETE, CTRL), None);
+        assert_eq!(command(VK_DELETE, both), None);
+        assert_eq!(action(Command::Uninstall, &app()), None, "the window's");
+    }
+
+    #[test]
     fn ctrl_c_is_the_fields_to_decide() {
         use windows::Win32::UI::Input::KeyboardAndMouse::VK_C;
         assert_eq!(command(VK_C, CTRL), None);
@@ -188,5 +225,55 @@ mod tests {
         for command in [Command::Hide, Command::Up, Command::Down] {
             assert_eq!(action(command, &app()), None, "{command:?}");
         }
+    }
+
+    /// The key and the modifiers a shortcut as menus write it stands for.
+    fn pressed(shortcut: &str) -> (VIRTUAL_KEY, Held) {
+        use windows::Win32::UI::Input::KeyboardAndMouse::VK_C;
+        let (mut key, mut held) = (None, NONE);
+        for part in shortcut.split('+') {
+            match part {
+                "Ctrl" => held.ctrl = true,
+                "Shift" => held.shift = true,
+                "Esc" => key = Some(VK_ESCAPE),
+                "Up" => key = Some(VK_UP),
+                "Down" => key = Some(VK_DOWN),
+                "Enter" => key = Some(VK_RETURN),
+                "Delete" => key = Some(VK_DELETE),
+                "C" => key = Some(VK_C),
+                other => panic!("{other} in {shortcut}"),
+            }
+        }
+        (key.expect("a key"), held)
+    }
+
+    #[test]
+    fn each_command_names_the_keys_that_give_it() {
+        let commands = [
+            Command::Hide,
+            Command::Up,
+            Command::Down,
+            Command::Open { as_admin: false },
+            Command::Open { as_admin: true },
+            Command::Reveal,
+            Command::Uninstall,
+        ];
+        for wanted in commands {
+            let (key, held) = pressed(shortcut(wanted));
+            assert_eq!(command(key, held), Some(wanted), "{}", shortcut(wanted));
+        }
+        assert_eq!(
+            shortcut(Command::Open { as_admin: true }),
+            "Ctrl+Shift+Enter"
+        );
+        assert_eq!(shortcut(Command::Uninstall), "Shift+Delete");
+    }
+
+    #[test]
+    fn copying_the_path_names_the_key_the_field_copies_with() {
+        use crate::field;
+        let (key, held) = pressed(shortcut(Command::Copy));
+        assert_eq!(field::key(key, held), Some(field::Key::Copy));
+        assert_eq!(command(key, held), None, "the field's to decide");
     }
 }

@@ -3,7 +3,8 @@
 //! folders under the bar, the arrows move the selection, Enter opens the
 //! selected item (Ctrl+Shift+Enter as administrator), Ctrl+Enter shows a
 //! file in its folder, Ctrl+C copies its path, and Esc, Enter or losing
-//! focus hides it.
+//! focus hides it. A right click, the Menu key or Shift+F10 opens a row's
+//! menu of the same.
 //!
 //! The `windows` crate marks Win32 calls `unsafe`. The invariant they rely
 //! on: `hwnd` is the live launcher window, owned by the UI thread.
@@ -34,8 +35,8 @@ use windows::Win32::Graphics::Dwm::{
     DWMWINDOWATTRIBUTE, DwmSetWindowAttribute,
 };
 use windows::Win32::Graphics::Gdi::{
-    GetMonitorInfoW, HMONITOR, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromPoint,
-    ScreenToClient,
+    ClientToScreen, GetMonitorInfoW, HMONITOR, MONITOR_DEFAULTTONEAREST, MONITORINFO,
+    MonitorFromPoint, ScreenToClient,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Time::{GetTimeZoneInformation, TIME_ZONE_INFORMATION};
@@ -73,11 +74,12 @@ use crate::notice::Notice;
 use crate::picker::{self, Picker};
 use crate::render::{Renderer, Row, Scene};
 use crate::results::{self, Listed, MAX_ROWS, Results};
+use crate::row_menu::{self, RowMenu};
 use crate::settings::{self, Loaded};
 use crate::switcher;
 use crate::tray::{self, Tray};
 use crate::update::Updates;
-use crate::{http, launch, rates, store, system, update};
+use crate::{http, launch, rates, store, system, uninstall, update};
 
 mod settings_window;
 
@@ -142,6 +144,8 @@ pub struct Services {
     pub hotkeys: Box<dyn Hotkeys>,
     /// The notification area.
     pub tray: Rc<dyn Tray>,
+    /// Opens a row's menu.
+    pub row_menu: Rc<dyn RowMenu>,
     /// Where the config lives; `None` runs on the defaults.
     pub config: Option<PathBuf>,
     /// Starts the launcher with Windows; `None` where it may not.
@@ -185,7 +189,7 @@ impl Services {
         Self {
             sources: vec![
                 Source {
-                    provider: Arc::new(catalog::find_apps),
+                    provider: catalog::apps(Arc::new(uninstall::entries)),
                     trusted: catalog::REFRESH_AFTER,
                     excluded: None,
                 },
@@ -218,6 +222,7 @@ impl Services {
             picks: store::default_path(),
             hotkeys: Box::new(hotkeys::System),
             tray: Rc::new(tray::Shell),
+            row_menu: Rc::new(row_menu::Popup),
             config: settings::default_path(),
             autostart: Autostart::real(),
             picker: Rc::new(picker::System),
@@ -294,6 +299,15 @@ struct App {
     checked: Checked,
     /// The newer release GitHub named, and how far installing it came.
     update: Option<Update>,
+}
+
+/// A row's menu, made ready to open: what opens it, its lines, where it
+/// opens, in screen pixels, and the item of the row it is for.
+struct Opening {
+    menu: Rc<dyn RowMenu>,
+    lines: Vec<row_menu::Line>,
+    at: POINT,
+    item: ItemId,
 }
 
 /// What the left button went down on.
@@ -763,15 +777,89 @@ impl App {
         Ok(!asked)
     }
 
-    /// Enter on the selected row: opens it, unless it asks first and has
-    /// not asked yet; then it asks, in place. Whether it asked: the
+    /// Enter on the selected row: carries out what the row asked about,
+    /// if it asks; else what `command` does with it (opens it), unless
+    /// that asks first: then the row asks, in place. Whether it asked: the
     /// launcher stays, waiting for the next Enter.
     fn enter(&mut self, command: Command) -> Result<bool> {
-        if self.results.confirm() {
-            self.act(command);
+        let Some((item, (wanted, as_admin))) = self.wanted(command) else {
             return Ok(false);
+        };
+        match self.results.confirm(wanted) {
+            Some(action) => {
+                self.perform(item, action, as_admin);
+                Ok(false)
+            }
+            None => self.redraw().map(|()| true),
         }
-        self.redraw().map(|()| true)
+    }
+
+    /// Shift+Delete: cuts the text selected in the bar, as in any field;
+    /// with none, the selected app asks to be uninstalled.
+    fn uninstall(&mut self) -> Result<()> {
+        if !self.query.selected().is_empty() {
+            return self.edit(field::Key::Cut).map(drop);
+        }
+        self.ask_to_uninstall()
+    }
+
+    /// The selected app asks, in place, to be uninstalled, if hyalo knows
+    /// what uninstalls it. Only the next Enter uninstalls.
+    fn ask_to_uninstall(&mut self) -> Result<()> {
+        let picked = self.results.picked().map(|row| &row.item.id);
+        let found = picked
+            .and_then(|id| self.catalog.uninstallers.get(id))
+            .cloned();
+        match found.is_some_and(|found| self.results.ask(Action::Uninstall(found))) {
+            true => self.redraw(),
+            false => Ok(()),
+        }
+    }
+
+    /// Makes ready the menu of the row at `clicked`, a point of the
+    /// screen, or with `None`, from the keys, of the selected row: selects
+    /// the row and calls off its asking, as any key or click but Enter
+    /// does. `None` off the rows, or with none.
+    fn row_menu(&mut self, clicked: Option<POINT>) -> Result<Option<Opening>> {
+        let Some((row, at)) = self.menu_row(clicked) else {
+            return Ok(None);
+        };
+        self.results.select(row);
+        self.results.calm();
+        self.redraw()?;
+        let item = &self.results.rows()[row].item;
+        let uninstalls = self.catalog.uninstallers.contains_key(&item.id);
+        Ok(Some(Opening {
+            menu: Rc::clone(&self.services.row_menu),
+            lines: row_menu::lines(item, uninstalls, self.language()),
+            at,
+            item: item.id.clone(),
+        }))
+    }
+
+    /// The row a menu opens for, and where, in screen pixels: the row at
+    /// `clicked`, there; with `None`, the selected row, under it.
+    fn menu_row(&self, clicked: Option<POINT>) -> Option<(usize, POINT)> {
+        match clicked {
+            Some(at) => Some((self.row_under(to_client(self.hwnd, at))?, at)),
+            None => {
+                let row = self.results.picked().map(|_| self.results.selected())?;
+                let scale = layout::scale(self.placement.dpi);
+                let (x, y) = layout::menu_spot(row);
+                let spot = POINT {
+                    x: (x * scale) as i32,
+                    y: (y * scale) as i32,
+                };
+                Some((row, to_screen(self.hwnd, spot)))
+            }
+        }
+    }
+
+    /// Whether the selected row is still `item`'s.
+    fn still_picked(&self, item: &ItemId) -> bool {
+        self.results
+            .picked()
+            .is_some_and(|row| row.item.id == *item)
     }
 
     /// Stops the selected row asking, as anything but Enter does, and
@@ -786,12 +874,25 @@ impl App {
     /// Carries out what `command` does with the selected row and notes
     /// the pick; whether it did anything.
     fn act(&mut self, command: Command) -> bool {
-        let Some(item) = self.results.picked().map(|row| row.item.clone()) else {
+        let Some((item, (action, as_admin))) = self.wanted(command) else {
             return false;
         };
-        let Some((action, as_admin)) = keys::action(command, &item) else {
-            return false;
-        };
+        self.perform(item, action, as_admin);
+        true
+    }
+
+    /// The selected row's item, what `command` does with it and whether
+    /// as administrator; `None` with no row, or when `command` does
+    /// nothing with it.
+    fn wanted(&self, command: Command) -> Option<(Item, (Action, bool))> {
+        let item = self.results.picked()?.item.clone();
+        let wanted = keys::action(command, &item)?;
+        Some((item, wanted))
+    }
+
+    /// Carries out `action` for `item`, as administrator or not, and notes
+    /// the pick.
+    fn perform(&mut self, item: Item, action: Action, as_admin: bool) {
         match action {
             // Later, from the message loop: opening a window here, with
             // the app state borrowed, would lose its first messages.
@@ -799,7 +900,6 @@ impl App {
             action => (self.services.run)(&action, as_admin),
         }
         self.note(item);
-        true
     }
 
     /// Carries out a key that edits the query or copies from it, and
@@ -1302,6 +1402,9 @@ fn on_message(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> Optio
         WM_MOUSEMOVE | WM_LBUTTONDOWN | WM_LBUTTONDBLCLK | WM_LBUTTONUP => {
             Some(on_mouse(hwnd, message, wparam, client_point(lparam)))
         }
+        // Windows makes it of a right click (WM_RBUTTONUP), Shift+F10 and
+        // the Menu key.
+        WM_CONTEXTMENU => Some(on_context_menu(hwnd, client_point(lparam))),
         // Always over the client area: WM_NCHITTEST above says so.
         WM_SETCURSOR => Some(on_set_cursor(hwnd)),
         _ => on_app_message(hwnd, message, wparam, lparam),
@@ -1376,6 +1479,51 @@ fn on_tray_menu(hwnd: HWND, at: POINT) -> Result<()> {
     match tray.menu(hwnd, &lines, at) {
         Some(command) => on_command(hwnd, command),
         None => Ok(()),
+    }
+}
+
+/// Where `WM_CONTEXTMENU` says it came from the keys, not a click.
+const FROM_KEYS: POINT = POINT { x: -1, y: -1 };
+
+/// A right click at `at`, a point of the screen, or the Menu key or
+/// Shift+F10 (`FROM_KEYS`): opens the menu of the row clicked, or of the
+/// selected row, and carries out what is picked. The menu runs a message
+/// loop of its own, so the app state is not held while it is open; the
+/// list may change meanwhile, so what is picked is done only to the row
+/// the menu was for, if it is still selected.
+fn on_context_menu(hwnd: HWND, at: POINT) -> Result<()> {
+    let clicked = Some(at).filter(|&at| at != FROM_KEYS);
+    let opening = with_app(|app| app.row_menu(clicked)).transpose()?;
+    let Some(opening) = opening.flatten() else {
+        return Ok(());
+    };
+    let picked = opening.menu.open(hwnd, &opening.lines, opening.at);
+    let still = with_app(|app| app.still_picked(&opening.item)) == Some(true);
+    match picked.filter(|_| still) {
+        Some(command) => on_picked(hwnd, command),
+        None => Ok(()),
+    }
+}
+
+/// Carries out what was picked from a row's menu: what its keys do, but
+/// Uninstall… only asks, even with text selected in the bar, which
+/// Shift+Delete would cut.
+fn on_picked(hwnd: HWND, command: Command) -> Result<()> {
+    match command {
+        Command::Open { .. } => on_enter(hwnd, command),
+        Command::Uninstall => with_app(App::ask_to_uninstall).unwrap_or(Ok(())),
+        command => {
+            act_on_row(hwnd, command);
+            Ok(())
+        }
+    }
+}
+
+/// Carries out what `command` does with the selected row, hiding the
+/// launcher if it did anything.
+fn act_on_row(hwnd: HWND, command: Command) {
+    if with_app(|app| app.act(command)) == Some(true) {
+        hide(hwnd);
     }
 }
 
@@ -1492,10 +1640,7 @@ fn on_set_cursor(hwnd: HWND) -> Result<()> {
 /// Shows the pointer over the point `at` of the screen as an I-beam over
 /// the query, an arrow elsewhere.
 fn set_cursor_over(hwnd: HWND, at: POINT) -> Result<()> {
-    let mut point = at;
-    // SAFETY: a plain call into a live POINT.
-    let _ = unsafe { ScreenToClient(hwnd, &mut point) };
-    let shape = match with_app(|app| app.part_at(point)) {
+    let shape = match with_app(|app| app.part_at(to_client(hwnd, at))) {
         Some(Part::Text) => IDC_IBEAM,
         _ => IDC_ARROW,
     };
@@ -1624,10 +1769,9 @@ fn on_other_key(
             hide(hwnd);
             None
         }
+        Some(Command::Uninstall) => with_app(App::uninstall),
         Some(command) => {
-            if with_app(|app| app.act(command)) == Some(true) {
-                hide(hwnd);
-            }
+            act_on_row(hwnd, command);
             None
         }
         None => return on_field_key(hwnd, field::key(key, held)),
@@ -1726,6 +1870,22 @@ fn placement_under_cursor() -> Result<Placement> {
     placement_on(unsafe { MonitorFromPoint(cursor, MONITOR_DEFAULTTONEAREST) })
 }
 
+/// `at`, a point of the screen, in `hwnd`'s client pixels.
+fn to_client(hwnd: HWND, at: POINT) -> POINT {
+    let mut point = at;
+    // SAFETY: a plain call into a live POINT.
+    let _ = unsafe { ScreenToClient(hwnd, &mut point) };
+    point
+}
+
+/// `at`, in `hwnd`'s client pixels, on the screen.
+fn to_screen(hwnd: HWND, at: POINT) -> POINT {
+    let mut point = at;
+    // SAFETY: a plain call into a live POINT.
+    let _ = unsafe { ClientToScreen(hwnd, &mut point) };
+    point
+}
+
 /// Where the mouse pointer is, in `hwnd`'s client pixels; `None` where it
 /// cannot be read (see `placement_under_cursor`).
 fn pointer_over(hwnd: HWND) -> Option<POINT> {
@@ -1798,16 +1958,19 @@ mod tests {
 
     use hyalo_core::config::DEFAULT;
     use hyalo_core::item::{Action, Item, Kind};
+    use hyalo_core::uninstall::Uninstall;
     use windows::Win32::Foundation::RECT;
     use windows::Win32::Graphics::Dwm::DwmGetWindowAttribute;
     use windows::Win32::Graphics::Gdi::MonitorFromWindow;
+    use windows::Win32::System::Threading::GetCurrentThreadId;
     use windows::Win32::UI::Input::KeyboardAndMouse::{
-        SetKeyboardState, VK_A, VK_BACK, VK_C, VK_DELETE, VK_DOWN, VK_END, VK_ESCAPE, VK_HOME,
-        VK_LEFT, VK_RETURN, VK_RIGHT, VK_UP, VK_V, VK_X,
+        SetKeyboardState, VK_A, VK_BACK, VK_C, VK_DELETE, VK_DOWN, VK_END, VK_ESCAPE, VK_F10,
+        VK_HOME, VK_LEFT, VK_RETURN, VK_RIGHT, VK_UP, VK_V, VK_X,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
-        GetClientRect, GetCursor, GetWindowRect, IsWindow, PM_QS_POSTMESSAGE, PM_REMOVE,
-        PeekMessageW, SendMessageW, WA_ACTIVE, WM_CLOSE, WM_NULL, WM_QUIT,
+        EndMenu, FindWindowExW, GetClientRect, GetCursor, GetWindowRect, IsWindow, KillTimer,
+        PM_QS_POSTMESSAGE, PM_REMOVE, PeekMessageW, SendMessageW, SetTimer, WA_ACTIVE, WM_CLOSE,
+        WM_NULL, WM_QUIT, WM_RBUTTONDOWN, WM_RBUTTONUP,
     };
 
     use super::*;
@@ -1943,6 +2106,26 @@ mod tests {
         }
     }
 
+    /// Rows' menus as a test keeps them: the lines of each menu opened
+    /// and where, what happens while the next one is open, and what the
+    /// user picks from it.
+    #[derive(Default)]
+    pub(super) struct Choices {
+        pub(super) opened: RefCell<Vec<(Vec<row_menu::Line>, POINT)>>,
+        pub(super) meanwhile: RefCell<Option<Box<dyn FnOnce()>>>,
+        pub(super) pick: RefCell<Option<Command>>,
+    }
+
+    impl RowMenu for Choices {
+        fn open(&self, _: HWND, lines: &[row_menu::Line], at: POINT) -> Option<Command> {
+            self.opened.borrow_mut().push((lines.to_vec(), at));
+            if let Some(meanwhile) = self.meanwhile.borrow_mut().take() {
+                meanwhile();
+            }
+            self.pick.borrow_mut().take()
+        }
+    }
+
     impl Keyboard {
         /// The hotkeys the launcher holds now.
         pub(super) fn held(&self) -> Vec<String> {
@@ -1977,6 +2160,7 @@ mod tests {
             picks,
             hotkeys: Box::new(Rc::new(Keyboard::default())),
             tray: Rc::new(Taskbar::default()),
+            row_menu: Rc::new(Choices::default()),
             config: None,
             autostart: None,
             picker: Rc::new(Chooser::default()),
@@ -2176,6 +2360,38 @@ mod tests {
         pub(super) fn click(&self, x: f32, y: f32) {
             self.mouse(WM_LBUTTONDOWN, x, y);
             self.mouse(WM_LBUTTONUP, x, y);
+        }
+
+        /// The right button down and up at (x, y) in DIPs, which Windows
+        /// turns into `WM_CONTEXTMENU` at that point of the screen.
+        pub(super) fn right_click(&self, x: f32, y: f32) {
+            self.mouse(WM_RBUTTONDOWN, x, y);
+            self.mouse(WM_RBUTTONUP, x, y);
+        }
+
+        /// The Menu key: what Windows sends for it, `WM_CONTEXTMENU` at
+        /// (-1, -1). Windows makes that of the key pressed for real only,
+        /// not of a `WM_KEYUP` sent or posted.
+        pub(super) fn menu_key(&self) {
+            let hwnd = Some(WPARAM(self.0.0 as usize));
+            unsafe { SendMessageW(self.0, WM_CONTEXTMENU, hwnd, Some(LPARAM(-1))) };
+        }
+
+        /// Shift+F10, which Windows turns into the same `WM_CONTEXTMENU`.
+        pub(super) fn shift_f10(&self) {
+            hold(&[VK_SHIFT]);
+            self.send(WM_SYSKEYDOWN, usize::from(VK_F10.0));
+            hold(&[]);
+        }
+
+        /// The point (x, y) in DIPs of the launcher, in screen pixels.
+        pub(super) fn on_screen(&self, x: f32, y: f32) -> POINT {
+            let scale = layout::scale(self.placement().dpi);
+            let rect = self.rect();
+            POINT {
+                x: rect.x + (x * scale) as i32,
+                y: rect.y + (y * scale) as i32,
+            }
         }
 
         /// The same in pixels of the frame, at the bar's middle.
@@ -3892,6 +4108,434 @@ mod tests {
             launcher.press(VK_RETURN);
             launcher.click(60.0, layout::BAR_HEIGHT / 2.0);
             assert_eq!(first_shown().1, "System command");
+        });
+    }
+
+    /// What uninstalls the app `title` in these tests: an MSI, named as
+    /// Everything's is.
+    fn uninstaller(title: &str) -> Uninstall {
+        Uninstall::Program {
+            name: format!("{title} 1.4.1.1032 (x64)"),
+            program: "msiexec.exe".to_string(),
+            arguments: format!("/x {{{title}}}"),
+        }
+    }
+
+    fn uninstalled(title: &str) -> (Action, bool) {
+        (Action::Uninstall(uninstaller(title)), false)
+    }
+
+    /// A launcher that lists apps titled `titles`, icons too, and knows
+    /// what uninstalls those `uninstallable` names, one at least; and
+    /// what it was asked to run.
+    fn uninstalling(titles: &[&str], uninstallable: &[&str]) -> (Launcher, Ran) {
+        let (services, ran) = uninstallers(titles, uninstallable);
+        (knowing(services, uninstallable.len()), ran)
+    }
+
+    /// Services that list apps titled `titles`, icons too, and know what
+    /// uninstalls those `uninstallable` names; and what the launcher was
+    /// asked to run.
+    fn uninstallers(titles: &[&str], uninstallable: &[&str]) -> (Services, Ran) {
+        let listed = listing(titles).0;
+        let found: HashMap<ItemId, Uninstall> = uninstallable
+            .iter()
+            .map(|title| (app(title).id, uninstaller(title)))
+            .collect();
+        let provider: Provider = Arc::new(move |request: &Request, report: &dyn Fn(Found)| {
+            listed(request, report);
+            report(Found::Uninstallers(found.clone()));
+        });
+        services(provider, None)
+    }
+
+    /// A launcher on `services`, once it knows what uninstalls `all` apps.
+    fn knowing(services: Services, all: usize) -> Launcher {
+        let launcher = Launcher::serving(services);
+        launcher.pump_until(|app| app.catalog.uninstallers.len() == all);
+        launcher
+    }
+
+    /// Shift+Delete, then no key held.
+    fn shift_delete(launcher: &Launcher) {
+        hold(&[VK_SHIFT]);
+        launcher.press(VK_DELETE);
+        hold(&[]);
+    }
+
+    #[test]
+    fn shift_delete_asks_to_uninstall_the_app_and_enter_uninstalls_it() {
+        on_hidden_desktop(|| {
+            let (launcher, ran) = uninstalling(&["Everything", "Notepad"], &["Everything"]);
+            launcher.type_text("every");
+            assert_eq!(first_shown().1, "App");
+            assert!(!asks_in_amber(&launcher));
+            shift_delete(&launcher);
+            let asks = "Press Enter to uninstall Everything 1.4.1.1032 (x64)";
+            assert_eq!(first_shown().1, asks, "names what it uninstalls");
+            assert!(asks_in_amber(&launcher), "the question, in amber");
+            assert!(ran.borrow().is_empty(), "not yet");
+            assert!(launcher.visible());
+            launcher.press(VK_RETURN);
+            assert_eq!(*ran.borrow(), [uninstalled("Everything")]);
+            assert!(!launcher.visible());
+        });
+    }
+
+    #[test]
+    fn a_click_on_the_row_asking_to_uninstall_uninstalls() {
+        on_hidden_desktop(|| {
+            let (launcher, ran) = uninstalling(&["Everything"], &["Everything"]);
+            launcher.type_text("every");
+            shift_delete(&launcher);
+            launcher.click(200.0, middle_of(0));
+            assert_eq!(*ran.borrow(), [uninstalled("Everything")]);
+            assert!(!launcher.visible());
+        });
+    }
+
+    #[test]
+    fn any_other_key_typing_or_a_click_elsewhere_calls_the_uninstall_off() {
+        on_hidden_desktop(|| {
+            let (launcher, ran) = uninstalling(&["Everything"], &["Everything"]);
+            launcher.type_text("every");
+            for key in [VK_DOWN, VK_UP, VK_END] {
+                shift_delete(&launcher);
+                launcher.press(key);
+                assert_eq!(first_shown().1, "App", "{key:?}");
+            }
+            shift_delete(&launcher);
+            launcher.type_text("t");
+            assert_eq!(first_shown().1, "App", "typing");
+            shift_delete(&launcher);
+            launcher.click(60.0, layout::BAR_HEIGHT / 2.0);
+            assert_eq!(first_shown().1, "App", "a click in the query");
+            launcher.press(VK_RETURN);
+            assert_eq!(
+                *ran.borrow(),
+                [opened("Everything", false)],
+                "Enter opens it"
+            );
+        });
+    }
+
+    #[test]
+    fn shift_delete_with_text_selected_cuts_it_as_in_any_field() {
+        on_hidden_desktop(|| {
+            let (launcher, ran) = uninstalling(&["Everything"], &["Everything"]);
+            launcher.search_for("every", 1);
+            hold(&[VK_CONTROL]);
+            launcher.press(VK_A);
+            shift_delete(&launcher);
+            let cut = (Action::CopyText("every".to_string()), false);
+            assert_eq!(*ran.borrow(), [cut]);
+            assert_eq!(launcher.query(), "");
+            assert!(!with_app(|app| app.results.asking()).expect("app state"));
+        });
+    }
+
+    #[test]
+    fn shift_delete_where_hyalo_knows_no_uninstaller_does_nothing() {
+        on_hidden_desktop(|| {
+            let (launcher, ran) = uninstalling(&["Everything", "Notepad"], &["Everything"]);
+            launcher.type_text("notepad");
+            shift_delete(&launcher);
+            assert_eq!(first_shown().1, "App");
+            launcher.type_text(" xyz");
+            shift_delete(&launcher);
+            assert!(ran.borrow().is_empty());
+            assert!(launcher.visible());
+            assert_eq!(launcher.query(), "notepad xyz");
+        });
+    }
+
+    #[test]
+    fn shift_delete_on_a_row_asking_to_restart_asks_nothing_more() {
+        on_hidden_desktop(|| {
+            let (launcher, ran) = uninstalling(&["Everything"], &["Everything"]);
+            launcher.type_text("restart");
+            launcher.press(VK_RETURN);
+            shift_delete(&launcher);
+            assert_eq!(first_shown().1, "System command", "called off");
+            launcher.press(VK_RETURN);
+            assert!(ran.borrow().is_empty(), "asks anew");
+        });
+    }
+
+    /// A launcher that lists apps titled `titles`, knows what uninstalls
+    /// those `uninstallable` names, one at least, and opens rows' menus
+    /// through `Choices`; what it was asked to run, and the menus.
+    fn with_menus(titles: &[&str], uninstallable: &[&str]) -> (Launcher, Ran, Rc<Choices>) {
+        let (mut services, ran) = uninstallers(titles, uninstallable);
+        let choices = Rc::new(Choices::default());
+        services.row_menu = choices.clone();
+        (knowing(services, uninstallable.len()), ran, choices)
+    }
+
+    /// The row titled `title`.
+    fn row_of(title: &str) -> usize {
+        let rows = with_app(|app| titles(app)).expect("app state");
+        rows.iter().position(|row| row == title).expect("listed")
+    }
+
+    /// The menu of the app `title`'s row, `uninstalls` or not.
+    fn menu_of(title: &str, uninstalls: bool) -> Vec<row_menu::Line> {
+        row_menu::lines(&app(title), uninstalls, Language::English)
+    }
+
+    #[test]
+    fn a_right_click_on_a_row_selects_it_and_opens_its_menu_where_it_was_clicked() {
+        on_hidden_desktop(|| {
+            let (launcher, ran, choices) = with_menus(&["Everything", "Evernote"], &["Everything"]);
+            launcher.search_for("ever", 2);
+            let (first, second) = (row_of("Everything"), row_of("Evernote"));
+            launcher.right_click(200.0, middle_of(second));
+            assert_eq!(with_app(|app| app.results.selected()), Some(second));
+            let at = launcher.on_screen(200.0, middle_of(second));
+            assert_eq!(*choices.opened.borrow(), [(menu_of("Evernote", false), at)]);
+            launcher.right_click(300.0, middle_of(first));
+            let at = launcher.on_screen(300.0, middle_of(first));
+            let opened = choices.opened.borrow()[1].clone();
+            assert_eq!(opened, (menu_of("Everything", true), at), "it uninstalls");
+            assert_eq!(launcher.lit_row(2), first);
+            assert!(ran.borrow().is_empty(), "nothing picked");
+            assert!(launcher.visible());
+        });
+    }
+
+    #[test]
+    fn the_menu_key_and_shift_f10_open_the_selected_rows_menu_under_it() {
+        on_hidden_desktop(|| {
+            let (launcher, ran, choices) = with_menus(&["Everything", "Evernote"], &["Everything"]);
+            launcher.search_for("ever", 2);
+            launcher.press(VK_DOWN);
+            let (x, y) = layout::menu_spot(1);
+            let under = launcher.on_screen(x, y);
+            let title = with_app(|app| titles(app)[1].clone()).expect("app state");
+            let menu = menu_of(&title, title == "Everything");
+            launcher.menu_key();
+            launcher.shift_f10();
+            let opened = [(menu.clone(), under), (menu, under)];
+            assert_eq!(*choices.opened.borrow(), opened);
+            assert!(ran.borrow().is_empty());
+        });
+    }
+
+    #[test]
+    fn a_right_click_off_the_rows_or_the_keys_with_no_row_open_no_menu() {
+        on_hidden_desktop(|| {
+            let (launcher, _, choices) = with_menus(&["Everything"], &["Everything"]);
+            launcher.menu_key();
+            launcher.shift_f10();
+            launcher.search_for("every", 1);
+            launcher.right_click(100.0, layout::BAR_HEIGHT / 2.0);
+            launcher.right_click(8.0, 8.0);
+            launcher.right_click(200.0, middle_of(1));
+            assert!(choices.opened.borrow().is_empty());
+            assert!(launcher.visible());
+        });
+    }
+
+    #[test]
+    fn open_and_run_as_administrator_from_the_menu_do_what_enter_does() {
+        on_hidden_desktop(|| {
+            for as_admin in [false, true] {
+                let (launcher, ran, choices) = with_menus(&["Everything"], &["Everything"]);
+                launcher.search_for("every", 1);
+                *choices.pick.borrow_mut() = Some(Command::Open { as_admin });
+                launcher.right_click(200.0, middle_of(0));
+                assert_eq!(*ran.borrow(), [opened("Everything", as_admin)]);
+                assert!(!launcher.visible(), "hidden, as after Enter");
+            }
+        });
+    }
+
+    #[test]
+    fn show_in_folder_and_copy_path_from_the_menu_do_what_their_keys_do() {
+        on_hidden_desktop(|| {
+            let path = r"C:\Users\Me\notes.txt";
+            let notes = Item::file(path.to_string(), false);
+            let picks = [
+                (Command::Reveal, Action::Reveal(path.to_string())),
+                (Command::Copy, Action::CopyText(path.to_string())),
+            ];
+            for (pick, done) in picks {
+                let listed = vec![notes.clone()];
+                let provider: Provider = Arc::new(move |_: &Request, report: &dyn Fn(Found)| {
+                    report(Found::Items(listed.clone()));
+                });
+                let (mut services, ran) = services(provider, None);
+                let choices = Rc::new(Choices::default());
+                services.row_menu = choices.clone();
+                let launcher = Launcher::serving(services);
+                launcher.search_for("notes", 1);
+                *choices.pick.borrow_mut() = Some(pick);
+                launcher.menu_key();
+                let menu = row_menu::lines(&notes, false, Language::English);
+                assert_eq!(choices.opened.borrow()[0].0, menu);
+                assert_eq!(*ran.borrow(), [(done, false)]);
+                assert!(!launcher.visible());
+            }
+        });
+    }
+
+    #[test]
+    fn uninstall_from_the_menu_asks_in_place_and_only_enter_uninstalls() {
+        on_hidden_desktop(|| {
+            let (launcher, ran, choices) = with_menus(&["Everything"], &["Everything"]);
+            launcher.search_for("every", 1);
+            *choices.pick.borrow_mut() = Some(Command::Uninstall);
+            launcher.right_click(200.0, middle_of(0));
+            let asks = "Press Enter to uninstall Everything 1.4.1.1032 (x64)";
+            assert_eq!(first_shown().1, asks);
+            assert!(asks_in_amber(&launcher), "the question, in amber");
+            assert!(ran.borrow().is_empty(), "never straight from the menu");
+            assert!(launcher.visible());
+            launcher.press(VK_RETURN);
+            assert_eq!(*ran.borrow(), [uninstalled("Everything")]);
+            assert!(!launcher.visible());
+        });
+    }
+
+    #[test]
+    fn uninstall_from_the_menu_asks_even_with_text_selected_in_the_bar() {
+        on_hidden_desktop(|| {
+            let (launcher, ran, choices) = with_menus(&["Everything"], &["Everything"]);
+            launcher.search_for("every", 1);
+            hold(&[VK_CONTROL]);
+            launcher.press(VK_A);
+            hold(&[]);
+            *choices.pick.borrow_mut() = Some(Command::Uninstall);
+            launcher.menu_key();
+            assert!(with_app(|app| app.results.asking()).expect("app state"));
+            assert_eq!(launcher.query(), "every", "nothing cut");
+            assert_eq!(launcher.selected(), "every");
+            assert!(ran.borrow().is_empty());
+        });
+    }
+
+    #[test]
+    fn opening_the_menu_of_a_row_that_asks_calls_it_off_so_open_opens() {
+        on_hidden_desktop(|| {
+            let (launcher, ran, choices) = with_menus(&["Everything"], &["Everything"]);
+            launcher.search_for("every", 1);
+            shift_delete(&launcher);
+            launcher.menu_key();
+            assert_eq!(first_shown().1, "App", "called off, nothing picked");
+            shift_delete(&launcher);
+            *choices.pick.borrow_mut() = Some(Command::Open { as_admin: false });
+            launcher.right_click(200.0, middle_of(0));
+            assert_eq!(
+                *ran.borrow(),
+                [opened("Everything", false)],
+                "not uninstalled"
+            );
+        });
+    }
+
+    #[test]
+    fn what_is_picked_is_done_only_to_the_row_the_menu_was_for() {
+        on_hidden_desktop(|| {
+            let (launcher, ran, choices) = with_menus(&["Everything", "Evernote"], &["Everything"]);
+            launcher.search_for("ever", 2);
+            let hwnd = launcher.0;
+            // The list changes under the open menu: typing leaves only
+            // Everything listed, and selected.
+            *choices.meanwhile.borrow_mut() = Some(Box::new(move || {
+                unsafe { SendMessageW(hwnd, WM_CHAR, Some(WPARAM(usize::from(b'y'))), None) };
+            }));
+            *choices.pick.borrow_mut() = Some(Command::Open { as_admin: false });
+            launcher.right_click(200.0, middle_of(row_of("Evernote")));
+            assert_eq!(titles_listed(), ["Everything"]);
+            assert!(
+                ran.borrow().is_empty(),
+                "Everything was not the row clicked"
+            );
+            // The launcher hides under the open menu: the hotkey.
+            *choices.meanwhile.borrow_mut() = Some(Box::new(move || {
+                unsafe {
+                    SendMessageW(hwnd, WM_HOTKEY, Some(WPARAM(HOTKEY_TOGGLE as usize)), None)
+                };
+            }));
+            *choices.pick.borrow_mut() = Some(Command::Open { as_admin: false });
+            launcher.menu_key();
+            assert!(!launcher.visible());
+            assert!(ran.borrow().is_empty(), "the row went with the launcher");
+        });
+    }
+
+    fn titles_listed() -> Vec<String> {
+        with_app(|app| titles(app)).expect("app state")
+    }
+
+    thread_local! {
+        /// What the real menu saw once it was up: whether the launcher
+        /// was still shown, and where the menu was.
+        static IN_MENU: RefCell<Option<(bool, RECT)>> = const { RefCell::new(None) };
+        static TICKS: RefCell<u32> = const { RefCell::new(0) };
+    }
+
+    /// The popup menu this thread has up, if any.
+    fn menu_up() -> Option<HWND> {
+        let mut after = None;
+        loop {
+            let menu = unsafe { FindWindowExW(None, after, w!("#32768"), PCWSTR::null()) }.ok()?;
+            let thread = unsafe { GetWindowThreadProcessId(menu, None) };
+            if thread == unsafe { GetCurrentThreadId() } {
+                return Some(menu);
+            }
+            after = Some(menu);
+        }
+    }
+
+    /// Ticks inside the real menu's own message loop: once the menu is
+    /// up, notes what it sees and picks the second entry, as Down, Down
+    /// and Enter would; gives up after a second.
+    extern "system" fn pick_second(hwnd: HWND, _: u32, id: usize, _: u32) {
+        let ticks = TICKS.with(|ticks| {
+            *ticks.borrow_mut() += 1;
+            *ticks.borrow()
+        });
+        let Some(menu) = menu_up() else {
+            if ticks > 100 {
+                let _ = unsafe { KillTimer(Some(hwnd), id) };
+                let _ = unsafe { EndMenu() };
+            }
+            return;
+        };
+        let _ = unsafe { KillTimer(Some(hwnd), id) };
+        let mut rect = RECT::default();
+        unsafe { GetWindowRect(menu, &mut rect) }.expect("the menu's place");
+        let shown = unsafe { IsWindowVisible(hwnd) }.as_bool();
+        IN_MENU.with(|seen| *seen.borrow_mut() = Some((shown, rect)));
+        for key in [VK_DOWN, VK_DOWN, VK_RETURN] {
+            let key = WPARAM(usize::from(key.0));
+            unsafe { PostMessageW(Some(menu), WM_KEYDOWN, key, LPARAM(0)) }.expect("a key");
+        }
+    }
+
+    #[test]
+    fn the_real_menu_opens_under_the_row_keeps_the_launcher_up_and_does_what_is_picked() {
+        on_hidden_desktop(|| {
+            let (mut services, ran) = uninstallers(&["Everything"], &[]);
+            services.row_menu = Rc::new(row_menu::Popup);
+            let launcher = Launcher::serving(services);
+            launcher.search_for("every", 1);
+            unsafe { SetTimer(Some(launcher.0), 1, 10, Some(pick_second)) };
+            launcher.menu_key();
+            let (shown, rect) = IN_MENU
+                .with(|seen| seen.borrow_mut().take())
+                .expect("a menu");
+            assert!(shown, "losing no focus to its menu, the launcher stays");
+            let (x, y) = layout::menu_spot(0);
+            let under = launcher.on_screen(x, y);
+            assert_eq!((rect.left, rect.top), (under.x, under.y), "under the row");
+            assert_eq!(
+                *ran.borrow(),
+                [opened("Everything", true)],
+                "as administrator"
+            );
+            assert!(!launcher.visible());
         });
     }
 

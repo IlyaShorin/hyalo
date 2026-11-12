@@ -146,6 +146,8 @@ table! {
         "Нажмите Enter ещё раз, чтобы выйти из системы";
     AskEmptyRecycleBin => "Press Enter again to empty the Recycle Bin",
         "Нажмите Enter ещё раз, чтобы очистить корзину";
+    /// An app's second line after Shift+Delete: what is uninstalled.
+    AskUninstall => "Press Enter to uninstall {0}", "Нажмите Enter, чтобы удалить {0}";
     /// An amount, its currency, the target, the rates' date.
     Currency => "{0} {1} → {2} · Bank of Russia, {3} · Enter to copy",
         "{0} {1} → {2} · Банк России, {3} · Enter — скопировать";
@@ -153,6 +155,17 @@ table! {
     SearchWeb => "Search {0} for “{1}”", "Искать в {0}: «{1}»";
     WebSearch => "Web search · Enter to open in the browser",
         "Поиск в интернете · Enter — открыть в браузере";
+
+    // A row's menu: what Enter does with the row, then what other keys do.
+    Open => "Open", "Открыть";
+    Copy => "Copy", "Копировать";
+    Run => "Run", "Выполнить";
+    SwitchTo => "Switch to", "Перейти";
+    RunAsAdministrator => "Run as administrator", "Запуск от имени администратора";
+    ShowInFolder => "Show in folder", "Показать в папке";
+    CopyPath => "Copy path", "Копировать путь";
+    /// It asks first, as Shift+Delete does.
+    Uninstall => "Uninstall…", "Удалить…";
 
     // The tray.
     Show => "Show hyalo", "Показать hyalo";

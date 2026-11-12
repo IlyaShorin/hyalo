@@ -8,7 +8,7 @@ use std::sync::OnceLock;
 use hyalo_core::hotkey::Hotkey;
 use hyalo_core::text::{Language, Text};
 use hyalo_core::update::{Progress, Update};
-use windows::Win32::Foundation::{HWND, LPARAM, POINT, WPARAM};
+use windows::Win32::Foundation::{HWND, POINT};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::{GetDpiForSystem, GetSystemMetricsForDpi};
 use windows::Win32::UI::Shell::{
@@ -16,61 +16,28 @@ use windows::Win32::UI::Shell::{
     NOTIFYICON_VERSION_4, NOTIFYICONDATAW, Shell_NotifyIconW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, CreatePopupMenu, DestroyIcon, DestroyMenu, HICON, HMENU, IMAGE_ICON,
-    LR_DEFAULTCOLOR, LoadImageW, MENU_ITEM_FLAGS, MF_CHECKED, MF_GRAYED, MF_SEPARATOR, MF_STRING,
-    PostMessageW, RegisterWindowMessageW, SM_CXSMICON, SetForegroundWindow, TPM_BOTTOMALIGN,
-    TPM_LEFTALIGN, TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenuEx, WM_APP, WM_NULL,
+    DestroyIcon, HICON, IMAGE_ICON, LR_DEFAULTCOLOR, LoadImageW, RegisterWindowMessageW,
+    SM_CXSMICON, WM_APP,
 };
-use windows::core::{HSTRING, PCWSTR, Result, w};
+use windows::core::{PCWSTR, Result, w};
 
-/// What a menu entry does. Its number is the id Win32 gives back for it.
+use crate::popup::{self, Side};
+
+/// What a menu entry does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Command {
-    Show = 1,
-    Settings = 2,
-    StartWithWindows = 3,
-    Exit = 4,
-    Install = 5,
-}
-
-impl Command {
-    /// The command a menu sent as `id`, if it is one of these.
-    pub fn from_id(id: usize) -> Option<Command> {
-        let all = [
-            Command::Show,
-            Command::Settings,
-            Command::StartWithWindows,
-            Command::Exit,
-            Command::Install,
-        ];
-        all.into_iter().find(|&command| command as usize == id)
-    }
-
-    fn entry(self, label: String) -> Line {
-        Line::Entry(Entry {
-            command: self,
-            label,
-            checked: false,
-            enabled: true,
-        })
-    }
+    Show,
+    Settings,
+    StartWithWindows,
+    Exit,
+    Install,
 }
 
 /// One entry of the menu.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Entry {
-    pub command: Command,
-    pub label: String,
-    pub checked: bool,
-    pub enabled: bool,
-}
+pub type Entry = popup::Entry<Command>;
 
 /// A line of the menu.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Line {
-    Entry(Entry),
-    Separator,
-}
+pub type Line = popup::Line<Command>;
 
 /// The menu: Show (with the hotkey that does it, if one is registered),
 /// the install of a newer release, if there is one (grayed while it
@@ -96,16 +63,16 @@ pub fn menu(
         enabled: starts.is_some(),
     });
     let install = update.map(|update| install(update, language));
-    let show = Command::Show.entry(show);
+    let show = Line::entry(Command::Show, show);
     let lines = [Some(show), install, Some(Line::Separator)]
         .into_iter()
         .flatten();
     lines
         .chain([
-            Command::Settings.entry(language.say(Text::Settings).to_string()),
+            Line::entry(Command::Settings, language.say(Text::Settings).to_string()),
             start,
             Line::Separator,
-            Command::Exit.entry(language.say(Text::Exit).to_string()),
+            Line::entry(Command::Exit, language.say(Text::Exit).to_string()),
         ])
         .collect()
 }
@@ -199,25 +166,8 @@ impl Tray for Shell {
     }
 
     fn menu(&self, window: HWND, lines: &[Line], at: POINT) -> Option<Command> {
-        let Ok(menu) = build(lines) else {
-            eprintln!("hyalo: cannot build the tray menu");
-            return None;
-        };
-        // SAFETY: `menu` is ours and destroyed once. The window must be in
-        // the foreground for the menu to close when the user clicks
-        // elsewhere; WM_NULL afterwards lets it close on the first click.
-        unsafe {
-            let _ = SetForegroundWindow(window);
-            // Above and to the right of the point, which Windows moves to
-            // fit the screen; the command comes back here rather than as
-            // WM_COMMAND.
-            let flags =
-                TPM_RIGHTBUTTON | TPM_BOTTOMALIGN | TPM_LEFTALIGN | TPM_RETURNCMD | TPM_NONOTIFY;
-            let picked = TrackPopupMenuEx(menu, flags.0, at.x, at.y, window, None);
-            let _ = PostMessageW(Some(window), WM_NULL, WPARAM(0), LPARAM(0));
-            let _ = DestroyMenu(menu);
-            Command::from_id(picked.0 as usize)
-        }
+        // Above the point: the taskbar is at the bottom.
+        popup::track(window, lines, at, Side::Above)
     }
 }
 
@@ -269,35 +219,6 @@ pub fn icon(side: i32) -> Result<HICON> {
     }
 }
 
-/// A popup menu holding `lines`. The caller destroys it.
-fn build(lines: &[Line]) -> Result<HMENU> {
-    // SAFETY: the menu is new; each label outlives the call that copies it.
-    unsafe {
-        let menu = CreatePopupMenu()?;
-        for line in lines {
-            match line {
-                Line::Separator => AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null())?,
-                Line::Entry(entry) => {
-                    let label = HSTRING::from(entry.label.as_str());
-                    AppendMenuW(menu, flags(entry), entry.command as usize, &label)?
-                }
-            }
-        }
-        Ok(menu)
-    }
-}
-
-fn flags(entry: &Entry) -> MENU_ITEM_FLAGS {
-    let mut flags = MF_STRING;
-    if entry.checked {
-        flags |= MF_CHECKED;
-    }
-    if !entry.enabled {
-        flags |= MF_GRAYED;
-    }
-    flags
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -336,10 +257,6 @@ mod tests {
             Line::Separator => None,
         });
         assert!(!commands.collect::<Vec<_>>().contains(&Command::Install));
-        assert_eq!(
-            Command::from_id(Command::Install as usize),
-            Some(Command::Install)
-        );
     }
     use crate::test_desktop::on_hidden_desktop;
     use windows::Win32::Graphics::Gdi::{
@@ -347,8 +264,7 @@ mod tests {
         ReleaseDC,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
-        CreateWindowExW, DestroyWindow, GetIconInfo, GetMenuItemCount, GetMenuItemID, GetMenuState,
-        GetMenuStringW, ICONINFO, MF_BYPOSITION, WINDOW_EX_STYLE, WINDOW_STYLE,
+        CreateWindowExW, DestroyWindow, GetIconInfo, ICONINFO, WINDOW_EX_STYLE, WINDOW_STYLE,
     };
 
     fn alt_space() -> Option<Hotkey> {
@@ -452,22 +368,6 @@ mod tests {
     }
 
     #[test]
-    fn a_command_comes_back_from_its_number() {
-        let all = [
-            Command::Show,
-            Command::Settings,
-            Command::StartWithWindows,
-            Command::Exit,
-            Command::Install,
-        ];
-        for command in all {
-            assert_eq!(Command::from_id(command as usize), Some(command));
-        }
-        assert_eq!(Command::from_id(0), None);
-        assert_eq!(Command::from_id(6), None);
-    }
-
-    #[test]
     fn the_tip_names_the_hotkey_or_what_is_wrong() {
         assert_eq!(tip(alt_space(), None), "hyalo · Alt+Space");
         assert_eq!(tip(None, None), "hyalo");
@@ -493,25 +393,6 @@ mod tests {
         );
         let over = "x".repeat(room + 1);
         assert!(tip(None, Some(&over)).ends_with('…'), "one more does not");
-    }
-
-    /// The menu Win32 holds: each item's label, or `None` for a
-    /// separator, with whether it is checked and grayed.
-    fn read_back(menu: HMENU) -> Vec<(Option<String>, usize, bool, bool)> {
-        let count = unsafe { GetMenuItemCount(Some(menu)) };
-        (0..count as u32)
-            .map(|at| {
-                let mut label = [0_u16; 64];
-                let length = unsafe { GetMenuStringW(menu, at, Some(&mut label), MF_BYPOSITION) };
-                let state = unsafe { GetMenuState(menu, at, MF_BYPOSITION) };
-                let id = unsafe { GetMenuItemID(menu, at as i32) } as usize;
-                let text =
-                    (length > 0).then(|| String::from_utf16_lossy(&label[..length as usize]));
-                let checked = state & MF_CHECKED.0 != 0;
-                let grayed = state & MF_GRAYED.0 != 0;
-                (text, id, checked, grayed)
-            })
-            .collect()
     }
 
     /// A plain window that is never shown.
@@ -572,28 +453,6 @@ mod tests {
         let data = data(HWND::default(), None, &long);
         assert_eq!(data.szTip[data.szTip.len() - 1], 0);
         assert_eq!(data.szTip[data.szTip.len() - 2], u16::from(b'x'));
-    }
-
-    #[test]
-    fn builds_the_win32_menu_the_lines_describe() {
-        let built = |lines: &[Line]| {
-            let built = build(lines).expect("a menu");
-            let items = read_back(built);
-            unsafe { DestroyMenu(built) }.expect("destroy the menu");
-            items
-        };
-        let items = built(&menu(alt_space(), Some(true), None, Language::English));
-        let show = (Some("Show hyalo	Alt+Space".to_string()), 1, false, false);
-        assert_eq!(items[0], show);
-        assert_eq!(items[1].0, None, "a separator");
-        assert_eq!(items[1].1, 0, "which sends no command");
-        let start = (Some("Start with Windows".to_string()), 3, true, false);
-        assert_eq!(items[3], start);
-        assert_eq!(items[5], (Some("Exit".to_string()), 4, false, false));
-        assert!(
-            built(&menu(alt_space(), None, None, Language::English))[3].3,
-            "grayed"
-        );
     }
 
     /// The pixel at (x, y) of `icon`, as BGRA.

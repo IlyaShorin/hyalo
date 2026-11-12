@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 use hyalo_core::item::{Item, ItemId};
 use hyalo_core::rates::Rates;
 use hyalo_core::system_settings;
+use hyalo_core::uninstall::{self, Uninstall};
 use hyalo_core::update::{Failure, Release};
 use windows::core::Result;
 
@@ -20,6 +21,9 @@ pub enum Found {
     Items(Vec<Item>),
     /// The icon of one item.
     Icon(ItemId, Icon),
+    /// Each app's uninstaller, where hyalo can tell it, in place of those
+    /// found before.
+    Uninstallers(HashMap<ItemId, Uninstall>),
     /// The file index changed: search it again.
     Files,
     /// Picked files and folders that are still there.
@@ -64,6 +68,8 @@ pub struct Catalog {
     /// force.
     pub system: Vec<Item>,
     pub icons: HashMap<ItemId, Icon>,
+    /// What uninstalls each app that can be uninstalled.
+    pub uninstallers: HashMap<ItemId, Uninstall>,
     /// Files and folders picked before, ranked with the items so that
     /// frecency lifts them however many files match as well.
     pub picked: Vec<Item>,
@@ -81,6 +87,7 @@ impl Catalog {
             Found::Icon(id, icon) => {
                 self.icons.insert(id, icon);
             }
+            Found::Uninstallers(uninstallers) => self.uninstallers = uninstallers,
             Found::Files => {}
             Found::Picked(items) => items.into_iter().for_each(|item| self.pick(item)),
             Found::Rates(rates) => self.rates = Some(rates),
@@ -114,21 +121,29 @@ impl Catalog {
     }
 }
 
+/// What the Uninstall keys list: the registry's (`uninstall::entries`),
+/// or a test's stand-in.
+pub type Listing = Arc<dyn Fn() -> Vec<uninstall::Entry> + Send + Sync>;
+
 /// The apps provider: lists the Applications folder, reports the items,
-/// then the icons the window lacks, one at a time, so search works while
-/// icons still come in (listing takes about 0.5 s, icons as long again).
-pub fn find_apps(request: &Request, report: &dyn Fn(Found)) {
-    if let Err(error) = report_apps(request, report) {
-        eprintln!("hyalo: cannot list the apps: {error}");
-    }
+/// then each app's uninstaller, of those `listing` gives, then the icons
+/// the window lacks, one at a time, so search works while icons still
+/// come in (listing takes about 0.5 s, icons as long again).
+pub fn apps(listing: Listing) -> Provider {
+    Arc::new(move |request: &Request, report: &dyn Fn(Found)| {
+        if let Err(error) = report_apps(request, &listing, report) {
+            eprintln!("hyalo: cannot list the apps: {error}");
+        }
+    })
 }
 
-fn report_apps(request: &Request, report: &dyn Fn(Found)) -> Result<()> {
+fn report_apps(request: &Request, listing: &Listing, report: &dyn Fn(Found)) -> Result<()> {
     let _com = Com::init()?;
     let entries = apps::find()?;
     report(Found::Items(
         entries.iter().map(|entry| entry.item.clone()).collect(),
     ));
+    report(Found::Uninstallers(uninstallers(&entries, &listing())));
     let missing = entries
         .iter()
         .filter(|entry| !request.known.contains(&entry.item.id));
@@ -139,6 +154,20 @@ fn report_apps(request: &Request, report: &dyn Fn(Found)) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// What uninstalls each of the apps `entries` lists, where it can be told
+/// from what the Uninstall keys list in `listed`.
+fn uninstallers(
+    entries: &[apps::Entry],
+    listed: &[uninstall::Entry],
+) -> HashMap<ItemId, Uninstall> {
+    let folders = crate::uninstall::folders();
+    let found = entries.iter().filter_map(|entry| {
+        let uninstaller = uninstall::find(&entry.app, listed, &folders)?;
+        Some((entry.item.id.clone(), uninstaller))
+    });
+    found.collect()
 }
 
 /// The icons of Windows' settings the window lacks, from the shell: the
@@ -321,15 +350,22 @@ mod tests {
         })
     }
 
-    /// Everything `find_apps` reports when the window has the icons of
-    /// `known`.
+    /// Everything the apps provider reports when the window has the icons
+    /// of `known` and the Uninstall keys list `listed`.
     #[track_caller]
-    fn found(known: HashSet<ItemId>) -> Vec<Found> {
+    fn found_with(known: HashSet<ItemId>, listed: Vec<uninstall::Entry>) -> Vec<Found> {
         let request = Request {
             icon_size: 32,
             known,
         };
-        reported(move |report| find_apps(&request, report))
+        let listing: Listing = Arc::new(move || listed.clone());
+        reported(move |report| apps(listing)(&request, report))
+    }
+
+    /// The same, the Uninstall keys listing nothing.
+    #[track_caller]
+    fn found(known: HashSet<ItemId>) -> Vec<Found> {
+        found_with(known, Vec::new())
     }
 
     fn icon_of<'a>(found: &'a [Found], id: &str) -> Option<&'a Icon> {
@@ -378,6 +414,58 @@ mod tests {
         let icon = icon_of(&first, EXPLORER).expect("Explorer's icon");
         assert_eq!((icon.width, icon.height), (32, 32));
         let known = items.iter().map(|item| item.id.clone()).collect();
-        assert_eq!(found(known).len(), 1, "the items again, no icons");
+        let again = found(known).len();
+        assert_eq!(again, 2, "the items and the uninstallers again, no icons");
+    }
+
+    #[test]
+    fn after_the_apps_comes_each_ones_uninstaller_of_those_the_keys_list() {
+        let setup = r"C:\Program Files (x86)\Microsoft\Edge\Application\setup.exe";
+        let edge = uninstall::Entry {
+            key: "Microsoft Edge".to_string(),
+            name: "Microsoft Edge".to_string(),
+            command: format!("\"{setup}\" --uninstall"),
+            ..uninstall::Entry::default()
+        };
+        let found = found_with(HashSet::new(), vec![edge]);
+        let Some(Found::Uninstallers(uninstallers)) = found.get(1) else {
+            panic!("the uninstallers come after the items");
+        };
+        let of = |id: &str| uninstallers.get(&ItemId(id.to_string()));
+        let edge = of("MSEdge").expect("Edge's, by its name");
+        let removes = Uninstall::Program {
+            name: "Microsoft Edge".to_string(),
+            program: setup.to_string(),
+            arguments: "--uninstall".to_string(),
+        };
+        assert_eq!(edge, &removes);
+        let store = of("Microsoft.WindowsStore_8wekyb3d8bbwe!App");
+        let Some(Uninstall::Package { full_name, .. }) = store else {
+            panic!("the Store's package: {store:?}");
+        };
+        assert!(
+            full_name.starts_with("Microsoft.WindowsStore_"),
+            "{full_name}"
+        );
+        assert_eq!(of(EXPLORER), None, "Windows' own");
+        let settings =
+            "windows.immersivecontrolpanel_cw5n1h2txyewy!microsoft.windows.immersivecontrolpanel";
+        assert_eq!(of(settings), None, "a package of Windows' own");
+    }
+
+    #[test]
+    fn uninstallers_found_replace_those_before() {
+        let mut catalog = Catalog::default();
+        let paint = ItemId("Paint".to_string());
+        let package = |full_name: &str| Uninstall::Package {
+            name: "Paint".to_string(),
+            full_name: full_name.to_string(),
+        };
+        let found = |full_name| HashMap::from([(paint.clone(), package(full_name))]);
+        catalog.take(Found::Uninstallers(found("old")));
+        catalog.take(Found::Uninstallers(found("new")));
+        assert_eq!(catalog.uninstallers, found("new"));
+        catalog.take(Found::Uninstallers(HashMap::new()));
+        assert!(catalog.uninstallers.is_empty(), "uninstalled since");
     }
 }
