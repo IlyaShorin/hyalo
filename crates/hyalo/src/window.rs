@@ -855,8 +855,13 @@ impl App {
         }
     }
 
-    /// Whether the selected row is still `item`'s.
-    fn still_picked(&self, item: &ItemId) -> bool {
+    /// The menu of `item`'s row closed, leaving the pointer at `pointer`
+    /// on the screen, if known. It went there over the menu, unseen, and
+    /// Windows tells of it next as a move: no move of the user's (see
+    /// `hover`), so it must not take the selection, nor call the asking
+    /// off. Whether the selected row is still `item`'s.
+    fn menu_closed(&mut self, item: &ItemId, pointer: Option<POINT>) -> bool {
+        self.pointer = pointer.map(|at| to_client(self.hwnd, at));
         self.results
             .picked()
             .is_some_and(|row| row.item.id == *item)
@@ -1497,9 +1502,9 @@ fn on_context_menu(hwnd: HWND, at: POINT) -> Result<()> {
     let Some(opening) = opening.flatten() else {
         return Ok(());
     };
-    let picked = opening.menu.open(hwnd, &opening.lines, opening.at);
-    let still = with_app(|app| app.still_picked(&opening.item)) == Some(true);
-    match picked.filter(|_| still) {
+    let closed = opening.menu.open(hwnd, &opening.lines, opening.at);
+    let still = with_app(|app| app.menu_closed(&opening.item, closed.pointer)) == Some(true);
+    match closed.picked.filter(|_| still) {
         Some(command) => on_picked(hwnd, command),
         None => Ok(()),
     }
@@ -2107,22 +2112,26 @@ mod tests {
     }
 
     /// Rows' menus as a test keeps them: the lines of each menu opened
-    /// and where, what happens while the next one is open, and what the
-    /// user picks from it.
+    /// and where, what happens while the next one is open, what the user
+    /// picks from it, and where on the screen they leave the pointer.
     #[derive(Default)]
     pub(super) struct Choices {
         pub(super) opened: RefCell<Vec<(Vec<row_menu::Line>, POINT)>>,
         pub(super) meanwhile: RefCell<Option<Box<dyn FnOnce()>>>,
         pub(super) pick: RefCell<Option<Command>>,
+        pub(super) left_at: RefCell<Option<POINT>>,
     }
 
     impl RowMenu for Choices {
-        fn open(&self, _: HWND, lines: &[row_menu::Line], at: POINT) -> Option<Command> {
+        fn open(&self, _: HWND, lines: &[row_menu::Line], at: POINT) -> row_menu::Closed {
             self.opened.borrow_mut().push((lines.to_vec(), at));
             if let Some(meanwhile) = self.meanwhile.borrow_mut().take() {
                 meanwhile();
             }
-            self.pick.borrow_mut().take()
+            row_menu::Closed {
+                picked: self.pick.borrow_mut().take(),
+                pointer: *self.left_at.borrow(),
+            }
         }
     }
 
@@ -4466,6 +4475,43 @@ mod tests {
 
     fn titles_listed() -> Vec<String> {
         with_app(|app| titles(app)).expect("app state")
+    }
+
+    /// Reported on 0.2.5: Uninstall… picked from the menu uninstalled
+    /// nothing. The pointer goes over the menu to pick the entry, below
+    /// where the row was clicked; once the menu is gone, Windows tells
+    /// the launcher the pointer is there, over another row, and that
+    /// must not take the selection, nor call the asking off.
+    #[test]
+    fn the_pointer_left_where_uninstall_was_picked_calls_nothing_off() {
+        on_hidden_desktop(|| {
+            let titles = ["Everything", "Evernote", "Everest"];
+            let (launcher, ran, choices) = with_menus(&titles, &["Everything"]);
+            launcher.search_for("ever", 3);
+            let row = row_of("Everything");
+            let below = (row + 1) % 3;
+            launcher.mouse(WM_MOUSEMOVE, 200.0, middle_of(row));
+            *choices.left_at.borrow_mut() = Some(launcher.on_screen(200.0, middle_of(below)));
+            *choices.pick.borrow_mut() = Some(Command::Uninstall);
+            launcher.right_click(200.0, middle_of(row));
+            launcher.mouse(WM_MOUSEMOVE, 200.0, middle_of(below));
+            assert_eq!(with_app(|app| app.results.selected()), Some(row));
+            assert!(with_app(|app| app.results.asking()).expect("app state"));
+            launcher.press(VK_RETURN);
+            assert_eq!(*ran.borrow(), [uninstalled("Everything")]);
+            launcher.hotkey();
+            launcher.search_for("ever", 3);
+            launcher.mouse(WM_MOUSEMOVE, 200.0, middle_of(row));
+            *choices.left_at.borrow_mut() = None;
+            launcher.right_click(200.0, middle_of(row));
+            launcher.mouse(WM_MOUSEMOVE, 200.0, middle_of(below));
+            let selected = with_app(|app| app.results.selected());
+            assert_eq!(
+                selected,
+                Some(below),
+                "where the pointer is not known, a move is the user's"
+            );
+        });
     }
 
     thread_local! {
