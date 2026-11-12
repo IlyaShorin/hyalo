@@ -69,7 +69,9 @@ pub fn track<C: Clone>(window: HWND, lines: &[Line<C>], at: POINT, side: Side) -
     let id = unsafe {
         let _ = SetForegroundWindow(window);
         let id = TrackPopupMenuEx(menu, flags.0, at.x, at.y, window, None);
-        let _ = PostMessageW(Some(window), WM_NULL, WPARAM(0), LPARAM(0));
+        // WM_NULL carries nothing in its parameters.
+        let none = (WPARAM::default(), LPARAM::default());
+        let _ = PostMessageW(Some(window), WM_NULL, none.0, none.1);
         let _ = DestroyMenu(menu);
         id
     };
