@@ -4,7 +4,7 @@ A fast, glassy Spotlight-style launcher for Windows 11. Press a hotkey, type a f
 
 *hyalo* comes from Greek ὕαλος, "glass".
 
-> **Status:** 0.2.4, with all of v0.1 and v0.2 below: finds and opens apps, files and folders (kept current as they change, narrowed by filters), Windows' own settings pages and Control Panel items, answers arithmetic, converts currencies, searches the web, switches windows, uninstalls apps, locks, restarts or shuts down the PC (asking first); lives in the tray, with a TOML config applied as you save it and a settings window that edits it; speaks English or Russian; updates itself from GitHub Releases. Download `hyalo.exe` from the latest release and run it: it installs itself.
+> **Status:** 0.2.5, with all of v0.1 and v0.2 below: finds and opens apps, files and folders (kept current as they change, narrowed by filters), Windows' own settings pages and Control Panel items, answers arithmetic, converts currencies, searches the web, switches windows, uninstalls apps, locks, restarts or shuts down the PC (asking first); lives in the tray, with a TOML config applied as you save it and a settings window that edits it; speaks English or Russian; updates itself from GitHub Releases. Download `hyalo.exe` from the latest release and run it: it installs itself.
 
 ## Goals
 
@@ -47,7 +47,7 @@ The launcher never runs elevated. Only the indexer service does, because MFT acc
 - System commands (lock, sleep, restart) with confirmation
 - Filters: `ext:`, `in:`, `size:`, `mod:`
 
-**Next release**
+**Since** (done, in 0.2.5)
 - Uninstall an app from its row: Shift+Delete, then Enter
 - A menu on every row (right click, the Menu key or Shift+F10): what the row can do, each with the keys that do it
 
