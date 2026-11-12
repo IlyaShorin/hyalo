@@ -71,10 +71,46 @@ pub const fn rgba(r: f32, g: f32, b: f32, a: f32) -> D2D1_COLOR_F {
     D2D1_COLOR_F { r, g, b, a }
 }
 
+/// A font family to draw in, and the one to draw in instead where
+/// Windows does not have it.
+#[derive(Clone, Copy, Debug)]
+pub struct Family {
+    pub wanted: PCWSTR,
+    pub instead: PCWSTR,
+}
+
+impl Family {
+    /// The family to draw in: the one wanted, if Windows has it. A family
+    /// DirectWrite does not find is drawn in whatever it finds for each
+    /// letter, and a symbol font's symbols as nothing at all.
+    fn installed(self, dwrite: &IDWriteFactory) -> Result<PCWSTR> {
+        let mut collection = None;
+        // SAFETY: `collection` is a live Option the call fills.
+        unsafe { dwrite.GetSystemFontCollection(&mut collection, false)? };
+        let collection = collection.ok_or_else(windows::core::Error::empty)?;
+        let (mut index, mut exists) = (0, BOOL::default());
+        // SAFETY: `wanted` is a nul-terminated literal; `index` and
+        // `exists` are live and filled by the call.
+        unsafe { collection.FindFamilyName(self.wanted, &mut index, &mut exists)? };
+        Ok(if exists.as_bool() {
+            self.wanted
+        } else {
+            self.instead
+        })
+    }
+}
+
 /// The families text is drawn in: the display cut for large text, the
-/// text cut for the rest.
-pub const DISPLAY_FONT: PCWSTR = w!("Segoe UI Variable Display");
-pub const TEXT_FONT: PCWSTR = w!("Segoe UI Variable Text");
+/// text cut for the rest. Segoe UI Variable came with Windows 11; Windows
+/// 10 has Segoe UI.
+pub const DISPLAY_FONT: Family = Family {
+    wanted: w!("Segoe UI Variable Display"),
+    instead: w!("Segoe UI"),
+};
+pub const TEXT_FONT: Family = Family {
+    wanted: w!("Segoe UI Variable Text"),
+    instead: w!("Segoe UI"),
+};
 
 /// What a window's picture is drawn over.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -326,10 +362,11 @@ pub fn hit(layout: &IDWriteTextLayout, x: f32) -> Result<u32> {
 /// height of its layout.
 pub fn text_format(
     dwrite: &IDWriteFactory,
-    family: PCWSTR,
+    family: Family,
     size: f32,
     weight: DWRITE_FONT_WEIGHT,
 ) -> Result<IDWriteTextFormat> {
+    let family = family.installed(dwrite)?;
     unsafe {
         let format = dwrite.CreateTextFormat(
             family,
@@ -560,6 +597,8 @@ mod readback {
 mod tests {
     use windows::Win32::Foundation::DCOMPOSITION_ERROR_WINDOW_ALREADY_COMPOSED;
 
+    use windows::Win32::Graphics::DirectWrite::DWRITE_FONT_WEIGHT_NORMAL;
+
     use super::*;
     use crate::test_desktop::on_hidden_desktop;
 
@@ -628,6 +667,33 @@ mod tests {
             windows::Win32::Foundation::E_INVALIDARG,
         ));
         assert_eq!(Behind::of(refused), Behind::Desktop);
+    }
+
+    /// The family `format` draws in.
+    fn family_of(format: &IDWriteTextFormat) -> String {
+        let mut name = vec![0; unsafe { format.GetFontFamilyNameLength() } as usize + 1];
+        unsafe { format.GetFontFamilyName(&mut name) }.expect("the family's name");
+        String::from_utf16_lossy(&name[..name.len() - 1])
+    }
+
+    #[test]
+    fn text_is_drawn_in_the_family_wanted_where_windows_has_it_else_in_the_one_instead() {
+        let dwrite: IDWriteFactory =
+            unsafe { DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED) }.expect("DirectWrite");
+        let normal = DWRITE_FONT_WEIGHT_NORMAL;
+        let format = |family| text_format(&dwrite, family, 14.0, normal).expect("a format");
+        // Windows 11, which the tests run on, has the families wanted.
+        assert_eq!(family_of(&format(TEXT_FONT)), "Segoe UI Variable Text");
+        assert_eq!(
+            family_of(&format(DISPLAY_FONT)),
+            "Segoe UI Variable Display"
+        );
+        // Windows 10 has not.
+        let missing = Family {
+            wanted: w!("Segoe UI Variable Text, as Windows 10 has it not"),
+            instead: w!("Segoe UI"),
+        };
+        assert_eq!(family_of(&format(missing)), "Segoe UI");
     }
 
     #[test]

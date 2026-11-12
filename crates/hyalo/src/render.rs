@@ -28,15 +28,15 @@ use windows::Win32::Graphics::DirectWrite::{
     DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_TEXT_ALIGNMENT_CENTER,
     DWRITE_TEXT_RANGE, IDWriteFactory, IDWriteTextFormat, IDWriteTextLayout,
 };
-use windows::core::{PCWSTR, Result, w};
+use windows::core::{Result, w};
 use windows_numerics::Vector2;
 
 use crate::apps::Icon;
 use crate::field;
 use crate::layout::{BAR_HEIGHT, ICON_SIZE, ROW_HEIGHT, TEXT_LEFT, TEXT_RIGHT_PAD, row_top};
 use crate::surface::{
-    Behind, DISPLAY_FONT, PREMULTIPLIED_BGRA, SELECTED_TEXT, Surface, TEXT_FONT, caret_x, hit,
-    line_width, rgba, text_format, trimmed,
+    Behind, DISPLAY_FONT, Family, PREMULTIPLIED_BGRA, SELECTED_TEXT, Surface, TEXT_FONT, caret_x,
+    hit, line_width, rgba, text_format, trimmed,
 };
 
 /// What to draw.
@@ -74,9 +74,13 @@ pub struct Row<'a> {
 const QUERY_SIZE: f32 = 24.0;
 const TITLE_SIZE: f32 = 15.0;
 const SUBTITLE_SIZE: f32 = 12.0;
-/// A row's symbol: Windows 11's own icon font, about as tall as an app's
-/// icon draws its picture.
-const GLYPH_FONT: PCWSTR = w!("Segoe Fluent Icons");
+/// A row's symbol: Windows 11's own icon font, or Windows 10's, whose
+/// symbols have the same codes; about as tall as an app's icon draws its
+/// picture.
+const GLYPH_FONT: Family = Family {
+    wanted: w!("Segoe Fluent Icons"),
+    instead: w!("Segoe MDL2 Assets"),
+};
 const GLYPH_SIZE: f32 = 20.0;
 /// Matches the radius DWM uses for `DWMWCP_ROUND`.
 const CORNER_RADIUS: f32 = 8.0;
