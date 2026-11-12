@@ -21,7 +21,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 use windows::core::{PCWSTR, Result, w};
 
-use crate::popup;
+use crate::popup::{self, Side};
 
 /// What a menu entry does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -167,7 +167,7 @@ impl Tray for Shell {
 
     fn menu(&self, window: HWND, lines: &[Line], at: POINT) -> Option<Command> {
         // Above the point: the taskbar is at the bottom.
-        popup::track(window, lines, at)
+        popup::track(window, lines, at, Side::Above)
     }
 }
 

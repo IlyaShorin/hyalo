@@ -9,7 +9,7 @@ use hyalo_core::text::{Language, Text};
 use windows::Win32::Foundation::{HWND, POINT};
 
 use crate::keys::{self, Command};
-use crate::popup;
+use crate::popup::{self, Side};
 
 /// A line of a row's menu.
 pub type Line = popup::Line<Command>;
@@ -65,7 +65,7 @@ pub struct Popup;
 
 impl RowMenu for Popup {
     fn open(&self, window: HWND, lines: &[Line], at: POINT) -> Option<Command> {
-        popup::track(window, lines, at)
+        popup::track(window, lines, at, Side::Below)
     }
 }
 

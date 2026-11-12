@@ -49,6 +49,7 @@ The launcher never runs elevated. Only the indexer service does, because MFT acc
 
 **Next release**
 - Uninstall an app from its row: Shift+Delete, then Enter
+- A menu on every row (right click, the Menu key or Shift+F10): what the row can do, each with the keys that do it
 
 **Later**
 - Preview pane
@@ -114,6 +115,7 @@ What the prototype does:
 
   A filter given twice narrows further (`size:>1kb size:<1mb`), but more extensions or folders add choices (`in:code in:projects`). Extensions and sizes are files' alone, so they leave folders out. A filter that does not read (`size:big`, `mod:2026-13`) is a word like any other.
 - Up and Down move the selection, or point at a row; Enter or a click opens it, Ctrl+Shift+Enter opens it as administrator, Ctrl+Enter shows a file or folder in its folder, Ctrl+C with no text selected in the bar copies its full path, Shift+Delete with none asks to uninstall an app, Esc hides the launcher.
+- A right click on a row, or the Menu key or Shift+F10 on the selected one, opens Windows' own menu of what the row can do, in hyalo's language, each entry with the keys that do the same: what Enter does (Open; Copy for the calculator's or a conversion's answer, Switch to for a window, Run for a system command), Run as administrator for an app (Ctrl+Shift+Enter), Show in folder (Ctrl+Enter) and Copy path (Ctrl+C) for a file or folder, and, after a line, Uninstall… (Shift+Delete) for an app hyalo knows the uninstaller of. An entry picked does what its keys do; Uninstall… makes the row ask in amber, as Shift+Delete does, and only Enter then uninstalls. Opening the menu calls off a row's asking, as any key or click but Enter does. The launcher stays up while the menu is open, and should the list change under it, what was picked is done only to the row it was opened for.
 - Picks are remembered per query (frecency) in `%APPDATA%\hyalo\frecency.json`, so what you open often rises, files included.
 
 ## Releases

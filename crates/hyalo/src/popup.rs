@@ -7,7 +7,7 @@ use windows::Win32::Foundation::{HWND, LPARAM, POINT, WPARAM};
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, DestroyMenu, HMENU, MENU_ITEM_FLAGS, MF_CHECKED, MF_GRAYED,
     MF_SEPARATOR, MF_STRING, PostMessageW, SetForegroundWindow, TPM_BOTTOMALIGN, TPM_LEFTALIGN,
-    TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenuEx, WM_NULL,
+    TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON, TPM_TOPALIGN, TrackPopupMenuEx, WM_NULL,
 };
 use windows::core::{HSTRING, PCWSTR, Result};
 
@@ -40,17 +40,29 @@ impl<C> Line<C> {
     }
 }
 
-/// Opens a menu of `lines` for `window` at `at`, in screen pixels, above
-/// it and to the right (Windows moves it to fit the screen), until the
-/// user picks an entry or clicks away: what the entry picked stands for,
-/// if any. Runs a message loop of its own meanwhile.
-pub fn track<C: Clone>(window: HWND, lines: &[Line<C>], at: POINT) -> Option<C> {
+/// Which way a menu goes from the point it opens at: up, as from the
+/// taskbar, or down, as from a row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Side {
+    Above,
+    Below,
+}
+
+/// Opens a menu of `lines` for `window` at `at`, in screen pixels, on
+/// `side` of it and to the right (Windows moves it to fit the screen),
+/// until the user picks an entry or clicks away: what the entry picked
+/// stands for, if any. Runs a message loop of its own meanwhile.
+pub fn track<C: Clone>(window: HWND, lines: &[Line<C>], at: POINT, side: Side) -> Option<C> {
     let Ok(menu) = build(lines) else {
         eprintln!("hyalo: cannot build a menu");
         return None;
     };
+    let side = match side {
+        Side::Above => TPM_BOTTOMALIGN,
+        Side::Below => TPM_TOPALIGN,
+    };
     // The command comes back here rather than as WM_COMMAND.
-    let flags = TPM_BOTTOMALIGN | TPM_LEFTALIGN | TPM_RIGHTBUTTON | TPM_RETURNCMD | TPM_NONOTIFY;
+    let flags = side | TPM_LEFTALIGN | TPM_RIGHTBUTTON | TPM_RETURNCMD | TPM_NONOTIFY;
     // SAFETY: `menu` is ours and destroyed once. The window must be in
     // the foreground for the menu to close when the user clicks
     // elsewhere; WM_NULL afterwards lets it close on the first click.
