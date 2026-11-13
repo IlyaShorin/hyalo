@@ -10,7 +10,7 @@ use windows::Win32::Graphics::Imaging::{
     WICBitmapEncoderNoCache, WICBitmapPaletteTypeCustom, WICDecodeMetadataCacheOnDemand,
 };
 use windows::Win32::System::Com::{
-    CLSCTX_INPROC_SERVER, CoCreateInstance, IStream, STREAM_SEEK_END, STREAM_SEEK_SET,
+    CLSCTX_INPROC_SERVER, CoCreateInstance, IStream, STATFLAG_NONAME, STATSTG, STREAM_SEEK_SET,
 };
 use windows::Win32::UI::Shell::SHCreateMemStream;
 use windows::core::{Error, Result};
@@ -54,13 +54,13 @@ fn write_frame(encoder: &IWICBitmapEncoder, pixels: &Pixels) -> Result<()> {
 
 /// Everything `stream` holds, from its start.
 fn read_all(stream: &IStream) -> Result<Vec<u8>> {
-    let mut size = 0_u64;
+    let mut stat = STATSTG::default();
     // SAFETY: COM calls on a live stream; the buffer is as long as the
     // count the read is given.
     unsafe {
-        stream.Seek(0, STREAM_SEEK_END, Some(&mut size))?;
+        stream.Stat(&mut stat, STATFLAG_NONAME)?;
         stream.Seek(0, STREAM_SEEK_SET, None)?;
-        let mut bytes = vec![0_u8; size as usize];
+        let mut bytes = vec![0_u8; stat.cbSize as usize];
         let mut read = 0_u32;
         let length = bytes.len() as u32;
         stream
@@ -75,7 +75,7 @@ fn read_all(stream: &IStream) -> Result<Vec<u8>> {
 pub fn decode(png: &[u8]) -> Result<Pixels> {
     let factory = factory()?;
     let converter = converted(&factory, png)?;
-    let (mut width, mut height) = (0, 0);
+    let (mut width, mut height) = (u32::default(), u32::default());
     // SAFETY: COM calls on a live converter; the buffer holds `width` by
     // `height` pixels of 4 bytes, as the copy is told.
     unsafe {
