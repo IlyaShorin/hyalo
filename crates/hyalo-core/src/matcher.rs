@@ -150,10 +150,10 @@ impl Pattern {
     /// `folded` gives it); `None` when the query's letters are not all in
     /// it in order, in either layout, so `find` gives `None` too.
     pub fn rough<'a>(&'a self, folded: &'a str) -> Option<Rough<'a>> {
-        let kinds = self.layouts.each_ref().map(|(layout, query)| {
-            let query = query.text.as_str();
-            (*layout, query, roughly(query, folded))
-        });
+        let kinds = self
+            .layouts
+            .each_ref()
+            .map(|(layout, query)| (*layout, query, roughly(&query.text, folded)));
         let (_, points) = best(kinds.iter().map(|&(layout, _, kind)| (layout, kind)))?;
         Some(Rough {
             folded,
@@ -173,7 +173,7 @@ impl Pattern {
 /// the strongest kind of match the folded text allows.
 pub struct Rough<'a> {
     folded: &'a str,
-    kinds: [(Layout, &'a str, Option<Strength>); 2],
+    kinds: [(Layout, &'a Folded, Option<Strength>); 2],
     points: f64,
 }
 
@@ -185,16 +185,95 @@ impl Rough<'_> {
 
     /// A closer look, with the words of `name`, the name folded here.
     pub fn ceiling(&self, name: &str) -> Option<Ceiling> {
-        let closer = self.kinds.iter().map(|&(layout, query, kind)| {
-            let kind = kind.and_then(|kind| closer(query, self.folded, name, kind));
-            (layout, kind)
-        });
-        let (strength, points) = best(closer)?;
+        let (strength, points) = best(self.closer(name))?;
         Some(match strength {
             Strength::Acronym => Ceiling::AtMost(points),
             _ => Ceiling::Exactly(points),
         })
     }
+
+    /// The points `find` gives `name`, without finding where: the ceiling,
+    /// with a possible acronym checked word by word. A letter that starts
+    /// a word with the rest of the query after it is no acronym yet: in a
+    /// long name of many words (a Windows component's manifest) it rarely
+    /// is one.
+    pub fn exactly(&self, name: &str) -> Option<f64> {
+        let kinds = self.kinds.iter().zip(self.closer(name));
+        let checked = kinds.map(|(&(layout, query, rough), (_, closer))| {
+            let checked = match closer {
+                Some(Strength::Acronym) if !acronym_of(&query.letters, self.folded, name) => {
+                    (rough == Some(Strength::WordStart)).then_some(Strength::Substring)
+                }
+                closer => closer,
+            };
+            (layout, checked)
+        });
+        best(checked).map(|(_, points)| points)
+    }
+
+    /// Per layout, the strongest kind of match the words of `name` allow,
+    /// an acronym only roughly.
+    fn closer(&self, name: &str) -> impl Iterator<Item = (Layout, Option<Strength>)> {
+        self.kinds.iter().map(move |&(layout, query, kind)| {
+            let kind = kind.and_then(|kind| closer(&query.text, self.folded, name, kind));
+            (layout, kind)
+        })
+    }
+}
+
+/// Whether the folded `query` splits into pieces, each the start of a
+/// word of `name`, the words in order: what `acronym` finds, without
+/// finding where. `folded` is `name` folded.
+fn acronym_of(query: &[char], folded: &str, name: &str) -> bool {
+    // The places in the query its pieces so far reach, one bit each.
+    let Some(whole) = u32::try_from(query.len())
+        .ok()
+        .and_then(|length| 1_u128.checked_shl(length))
+    else {
+        return long_acronym_of(query, name);
+    };
+    let mut reached = 1_u128;
+    for word in folded_words(folded, name) {
+        let mut from = reached;
+        while from != 0 && reached & whole == 0 {
+            let at = from.trailing_zeros() as usize;
+            from &= from - 1;
+            let common = query[at..]
+                .iter()
+                .zip(word.chars())
+                .take_while(|(typed, named)| *typed == named)
+                .count();
+            // Every piece of 1..=common letters from `at` reaches further.
+            reached |= ((1_u128 << common) - 1) << at << 1;
+        }
+    }
+    reached & whole != 0
+}
+
+/// `acronym_of` for a query too long for its bits: `find`'s own search.
+fn long_acronym_of(query: &[char], name: &str) -> bool {
+    let letters: Vec<char> = name.chars().collect();
+    let folded: Vec<char> = letters.iter().copied().map(compared).collect();
+    acronym(query, &folded, &words(&letters)).is_some()
+}
+
+/// The words of `name` as `words` cuts them, each as its text in
+/// `folded`, `name` folded.
+fn folded_words<'a>(folded: &'a str, name: &str) -> impl Iterator<Item = &'a str> {
+    let mut before = None;
+    let starts = name
+        .chars()
+        .zip(folded.char_indices())
+        .filter_map(move |(letter, (at, _))| {
+            let start = starts_word(before, letter);
+            before = Some(letter);
+            start.then_some(at)
+        });
+    let mut starts = starts.chain([folded.len()]).peekable();
+    std::iter::from_fn(move || {
+        let start = starts.next()?;
+        Some(&folded[start..*starts.peek()?])
+    })
 }
 
 /// The kind of match, over the layouts, that gives the most points, and
@@ -732,6 +811,32 @@ mod tests {
         assert_eq!(ceiling("codes", "Code"), None);
     }
 
+    fn exact(query: &str, name: &str) -> Option<f64> {
+        let folded = folded(name);
+        Pattern::new(query).rough(&folded)?.exactly(name)
+    }
+
+    #[test]
+    fn exactly_checks_an_acronym_word_by_word() {
+        assert_eq!(exact("vsc", "Visual Studio Code"), Some(40.0));
+        assert_eq!(exact("vscode", "Visual Studio Code"), Some(40.0));
+        assert_eq!(exact("ae", "a table"), None, "e starts no word");
+        assert_eq!(exact("ab", "a cab"), Some(20.0), "a run, no acronym");
+        assert_eq!(exact("aab", "aa ab"), Some(40.0), "a shorter first piece");
+        // A Windows component's manifest: its r starts a word and the
+        // rest follow in order, but none of them at the start of a word.
+        let manifest = "amd64_microsoft-windows-resampledmo_31bf3856ad364e35_10.0.26100.9549_none_3b264855887cfba8";
+        assert_eq!(exact("readme", manifest), None);
+        assert_eq!(exact("мысщву", "Visual Studio Code"), Some(35.0));
+    }
+
+    #[test]
+    fn exactly_checks_an_acronym_of_any_length() {
+        let (a, b) = ("a".repeat(70), "b".repeat(70));
+        assert_eq!(exact(&format!("{a}{b}"), &format!("{a} {b}")), Some(40.0));
+        assert_eq!(exact(&format!("{a}{b}"), &format!("{a} x{b}")), None);
+    }
+
     #[test]
     fn the_ceiling_counts_the_wrong_layout_a_little_lower() {
         assert_eq!(ceiling("мысщву", "vscode"), Some(95.0));
@@ -770,7 +875,10 @@ mod tests {
                 let below = found.is_some_and(|points| ceiling.is_none_or(|top| top < points));
                 assert!(!below, "{query:?} in {name:?}: {found:?} over {ceiling:?}");
                 let folded = folded(name);
-                let rough = pattern.rough(&folded).map(|rough| rough.points());
+                let rough = pattern.rough(&folded);
+                let exact = rough.as_ref().and_then(|rough| rough.exactly(name));
+                assert_eq!(exact, found, "{query:?} in {name:?} exactly");
+                let rough = rough.map(|rough| rough.points());
                 let below = ceiling.is_some_and(|points| rough.is_none_or(|top| top < points));
                 assert!(!below, "{query:?} in {name:?}: {ceiling:?} over {rough:?}");
             }

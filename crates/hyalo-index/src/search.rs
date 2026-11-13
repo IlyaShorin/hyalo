@@ -1,6 +1,6 @@
 //! Finding the best files and folders for a query among millions.
 //!
-//! Each thread takes a slice of the entries. A name whose letters are not
+//! Each thread takes its share of the entries. A name whose letters are not
 //! in order is skipped at once (`Pattern::ceiling`); so is one whose best
 //! possible score cannot beat what the thread already holds. Only the
 //! rest are matched and scored by hyalo-core, as every item is.
@@ -19,7 +19,8 @@ use hyalo_core::rank::{self, Ranked};
 use crate::index::{Entry, offset, same};
 use crate::{EntryId, Index};
 
-/// The fewest entries worth a thread of their own.
+/// The fewest entries worth a thread of their own, and how many a thread
+/// is dealt at a time.
 const CHUNK: usize = 4096;
 
 /// What a search found, and how much work it took.
@@ -55,12 +56,16 @@ impl Index {
             };
         }
         let pattern = &Pattern::new(query);
-        let narrowing = &self.narrowing(filters, query.is_empty());
+        let (narrowing, unmatched) = (&self.narrowing(filters), query.is_empty());
+        let all = self.entries.len();
+        let threads = threads(all, cores());
         let (mut hits, scored) = thread::scope(|scope| {
-            let threads: Vec<_> = self
-                .slices()
-                .map(|slice| {
-                    scope.spawn(move || self.best_in(slice, pattern, narrowing, places, limit))
+            let threads: Vec<_> = (0..threads)
+                .map(|thread| {
+                    let dealt = dealt(all, threads, thread);
+                    let search =
+                        move || self.best_in(dealt, pattern, narrowing, places, limit, unmatched);
+                    scope.spawn(search)
                 })
                 .collect();
             let found = threads.into_iter().map(|thread| thread.join());
@@ -70,10 +75,12 @@ impl Index {
                 (hits, scored + also)
             })
         });
-        // Stable: equal scores stay in the order of the slices.
+        // Equal scores keep the order of the index, whichever thread
+        // found them.
         hits.sort_by(|one, other| {
             let newer = other.newer.cmp(&one.newer);
-            other.score.total_cmp(&one.score).then(newer)
+            let earlier = one.at.cmp(&other.at);
+            other.score.total_cmp(&one.score).then(newer).then(earlier)
         });
         hits.truncate(limit);
         let rows = hits.into_iter().map(|hit| self.ranked(hit, pattern));
@@ -83,31 +90,22 @@ impl Index {
         }
     }
 
-    /// The entries cut into one slice per core, none under `CHUNK`.
-    fn slices(&self) -> impl Iterator<Item = Range<usize>> {
-        let all = self.entries.len();
-        let cores = thread::available_parallelism()
-            .unwrap_or(NonZero::<usize>::MIN)
-            .get();
-        let size = all.div_ceil(cores).max(CHUNK);
-        (0..all)
-            .step_by(size)
-            .map(move |start| start..all.min(start + size))
-    }
-
-    /// The best `limit` entries in `slice`.
+    /// The best `limit` entries of those `dealt`; `unmatched`, by their
+    /// place alone.
     fn best_in(
         &self,
-        slice: Range<usize>,
+        dealt: impl Iterator<Item = Range<usize>>,
         pattern: &Pattern,
         narrowing: &Narrowing,
         places: &Places,
         limit: usize,
+        unmatched: bool,
     ) -> (Vec<Hit>, usize) {
         let mut scan = Scan {
             index: self,
             pattern,
             narrowing,
+            unmatched,
             places,
             best: Best {
                 limit,
@@ -117,7 +115,7 @@ impl Index {
             under: vec![None; SEEN],
             scored: 0,
         };
-        for at in slice {
+        for at in dealt.flatten() {
             scan.consider(at as u32);
         }
         (scan.best.hits, scan.scored)
@@ -154,16 +152,15 @@ impl Index {
     pub fn sieve<'a>(&'a self, filters: &'a Filters) -> Sieve<'a> {
         Sieve {
             index: self,
-            narrowing: self.narrowing(filters, false),
+            narrowing: self.narrowing(filters),
         }
     }
 
     /// `filters` made ready: the folders `in:` names found.
-    fn narrowing<'a>(&self, filters: &'a Filters, unmatched: bool) -> Narrowing<'a> {
+    fn narrowing<'a>(&self, filters: &'a Filters) -> Narrowing<'a> {
         let named = !filters.folders.is_empty();
         Narrowing {
             filters,
-            unmatched,
             within: named.then(|| self.folders_named(&filters.folders)),
         }
     }
@@ -184,10 +181,33 @@ impl Index {
         let found = hit.found.or_else(|| pattern.find(&item.title));
         Ranked {
             item,
-            found: found.expect("an exact ceiling is a match"),
+            found: found.expect("a hit with points is a match"),
             score: hit.score,
         }
     }
+}
+
+/// The cores this machine has.
+fn cores() -> usize {
+    thread::available_parallelism()
+        .unwrap_or(NonZero::<usize>::MIN)
+        .get()
+}
+
+/// How many threads look through `all` entries: one per `CHUNK` of them,
+/// at most one per core.
+fn threads(all: usize, cores: usize) -> usize {
+    all.div_ceil(CHUNK).min(cores)
+}
+
+/// The entries thread `thread` of `threads` looks through, of `all`:
+/// dealt `CHUNK` at a time in turn, as cards are. Names dear to judge sit
+/// together (a folder of a Windows component's manifests), and dealt so
+/// they are shared out among the threads rather than left to one.
+fn dealt(all: usize, threads: usize, thread: usize) -> impl Iterator<Item = Range<usize>> {
+    (thread * CHUNK..all)
+        .step_by(threads * CHUNK)
+        .map(move |start| start..all.min(start + CHUNK))
 }
 
 /// Folders whose place points one thread remembers: siblings come one
@@ -219,8 +239,6 @@ impl Sieve<'_> {
 /// Filters made ready for one search.
 struct Narrowing<'a> {
     filters: &'a Filters,
-    /// No words: what the filters let through is listed unmatched.
-    unmatched: bool,
     /// The folders `in:` names, when it names any: what is listed is
     /// under one of them.
     within: Option<HashSet<u32>>,
@@ -261,6 +279,8 @@ struct Scan<'a> {
     index: &'a Index,
     pattern: &'a Pattern,
     narrowing: &'a Narrowing<'a>,
+    /// No words: what the filters let through is listed unmatched.
+    unmatched: bool,
     places: &'a Places,
     best: Best,
     /// `(folder, points of its place)`, each folder in slot `folder % SEEN`.
@@ -274,14 +294,14 @@ struct Scan<'a> {
 impl Scan<'_> {
     /// Offers the entry at `at` to `best`, unless it cannot beat what is
     /// there: judged roughly from the folded name, then from the name's
-    /// words; only a possible acronym needs `find` to know its points.
+    /// words; a possible acronym is checked word by word only then.
     fn consider(&mut self, at: u32) {
         let entry = self.index.entries[at as usize];
         let listed = entry.is_live() && !entry.is_root();
         if !listed || !self.narrowing.admits(self.index, at, entry) || !self.inside(entry.parent) {
             return;
         }
-        match self.narrowing.unmatched {
+        match self.unmatched {
             true => self.list(at, entry),
             false => self.match_name(at, entry),
         }
@@ -306,23 +326,27 @@ impl Scan<'_> {
         let (folded, name, kind) = (index.folded_of(entry), index.name_of(entry), kind_of(entry));
         let floor = self.best.floor();
         let beats = |points: f64| rank::score(points, kind, places::BOOST, 0.0) > floor;
-        let rough = self
-            .pattern
-            .rough(folded)
-            .filter(|rough| beats(rough.points()));
-        let ceiling = rough.and_then(|rough| rough.ceiling(name));
+        let rough = self.pattern.rough(folded);
+        let Some(rough) = rough.filter(|rough| beats(rough.points())) else {
+            return;
+        };
+        let ceiling = rough.ceiling(name);
         let Some(ceiling) = ceiling.filter(|ceiling| beats(ceiling.points())) else {
             return;
         };
         self.scored += 1;
-        let Some((points, found)) = matched(self.pattern, name, ceiling) else {
+        let points = match ceiling {
+            Ceiling::Exactly(points) => Some(points),
+            Ceiling::AtMost(_) => rough.exactly(name),
+        };
+        let Some(points) = points else {
             return;
         };
         let score = rank::score(points, kind, self.place(entry.parent), 0.0);
         self.best.offer(Hit {
             at,
             score,
-            found,
+            found: None,
             newer: None,
         });
     }
@@ -355,18 +379,6 @@ impl Scan<'_> {
     }
 }
 
-/// The points a name's match is worth, with the match itself when finding
-/// it was the only way to know them.
-fn matched(pattern: &Pattern, name: &str, ceiling: Ceiling) -> Option<(f64, Option<Match>)> {
-    match ceiling {
-        Ceiling::Exactly(points) => Some((points, None)),
-        Ceiling::AtMost(_) => {
-            let found = pattern.find(name)?;
-            Some((found.points(), Some(found)))
-        }
-    }
-}
-
 fn kind_of(entry: Entry) -> Kind {
     match entry.is_folder() {
         true => Kind::Folder,
@@ -378,7 +390,8 @@ fn kind_of(entry: Entry) -> Kind {
 struct Hit {
     at: u32,
     score: f64,
-    /// Found while searching only when needed; the rows shown find it.
+    /// No letters, for a row listed by filters alone; a match's letters
+    /// are found for the rows shown alone.
     found: Option<Match>,
     /// When it was written, for ties among rows listed unmatched; none
     /// for a match, whose ties keep the order of the index.
@@ -474,6 +487,38 @@ mod tests {
     fn equal_scores_keep_the_order_of_the_index() {
         let index = holding(&["note b", "note a", "note c"]);
         assert_eq!(titles(&index, "note", 2), ["note b", "note a"]);
+    }
+
+    #[test]
+    fn a_thread_per_chunk_up_to_one_per_core() {
+        assert_eq!(threads(0, 8), 0);
+        assert_eq!(threads(1, 8), 1);
+        assert_eq!(threads(CHUNK, 8), 1);
+        assert_eq!(threads(CHUNK + 1, 8), 2);
+        assert_eq!(threads(100 * CHUNK, 8), 8);
+    }
+
+    #[test]
+    fn the_entries_are_dealt_a_chunk_at_a_time_in_turn() {
+        let all = 3 * CHUNK + 10;
+        let dealt = |thread| dealt(all, 2, thread).collect::<Vec<_>>();
+        assert_eq!(dealt(0), [0..CHUNK, 2 * CHUNK..3 * CHUNK]);
+        assert_eq!(dealt(1), [CHUNK..2 * CHUNK, 3 * CHUNK..all]);
+    }
+
+    #[test]
+    fn equal_scores_keep_the_order_of_the_index_whichever_thread_found_them() {
+        // One chunk more than there are threads: the first thread is dealt
+        // the last, so it finds `note a` after the second thread's `note b`.
+        let threads = cores();
+        let mut names: Vec<String> = (0..(threads + 1) * CHUNK)
+            .map(|n| format!("x{n}"))
+            .collect();
+        // C: and C:\in come first.
+        names[CHUNK - 2] = "note b".into();
+        names[threads * CHUNK - 2] = "note a".into();
+        let names: Vec<&str> = names.iter().map(String::as_str).collect();
+        assert_eq!(titles(&holding(&names), "note", 1), ["note b"]);
     }
 
     #[test]
