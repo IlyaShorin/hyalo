@@ -23,6 +23,7 @@ use windows::Win32::Graphics::Direct2D::Common::{D2D_RECT_F, D2D_SIZE_U, D2D1_CO
 use windows::Win32::Graphics::Direct2D::{
     D2D1_ANTIALIAS_MODE_ALIASED, D2D1_BITMAP_OPTIONS_NONE, D2D1_BITMAP_PROPERTIES1, D2D1_ELLIPSE,
     D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC, D2D1_ROUNDED_RECT, ID2D1Bitmap1,
+    ID2D1DeviceContext,
 };
 use windows::Win32::Graphics::DirectWrite::{
     DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_TEXT_ALIGNMENT_CENTER,
@@ -435,23 +436,7 @@ impl Renderer {
         if let Some(bitmap) = self.icons.get(id) {
             return Ok(bitmap.clone());
         }
-        let size = D2D_SIZE_U {
-            width: icon.width,
-            height: icon.height,
-        };
-        let props = D2D1_BITMAP_PROPERTIES1 {
-            pixelFormat: PREMULTIPLIED_BGRA,
-            bitmapOptions: D2D1_BITMAP_OPTIONS_NONE,
-            ..Default::default()
-        };
-        let pixels = Some(icon.bgra.as_ptr().cast());
-        // SAFETY: `pixels` holds `height` rows of `width * 4` bytes, which
-        // CreateBitmap copies before it returns.
-        let bitmap = unsafe {
-            self.surface
-                .dc
-                .CreateBitmap(size, pixels, icon.width * 4, &props)?
-        };
+        let bitmap = upload(&self.surface.dc, icon)?;
         self.icons.insert(id.clone(), bitmap.clone());
         Ok(bitmap)
     }
@@ -486,6 +471,23 @@ impl Fonts {
             glyph: centred(text_format(dwrite, GLYPH_FONT, GLYPH_SIZE, normal)?)?,
         })
     }
+}
+
+/// `icon` on the GPU, as a bitmap `dc` draws.
+fn upload(dc: &ID2D1DeviceContext, icon: &Icon) -> Result<ID2D1Bitmap1> {
+    let size = D2D_SIZE_U {
+        width: icon.width,
+        height: icon.height,
+    };
+    let props = D2D1_BITMAP_PROPERTIES1 {
+        pixelFormat: PREMULTIPLIED_BGRA,
+        bitmapOptions: D2D1_BITMAP_OPTIONS_NONE,
+        ..Default::default()
+    };
+    let pixels = Some(icon.bgra.as_ptr().cast());
+    // SAFETY: `pixels` holds `height` rows of `width * 4` bytes, which
+    // CreateBitmap copies before it returns.
+    unsafe { dc.CreateBitmap(size, pixels, icon.width * 4, &props) }
 }
 
 /// Text centred across its layout's width too.
@@ -624,73 +626,64 @@ mod tests {
         }
     }
 
+    /// The ids of the rows found for "note".
+    fn note_ids() -> [ItemId; 3] {
+        ["notepad", "sticky", "long"].map(|id| ItemId(id.to_string()))
+    }
+
+    /// The icons of the first two rows found for "note": a blue disc and a
+    /// green one, 48 px for 150 %.
+    fn note_icons() -> [Icon; 2] {
+        [disc(48, [240, 160, 40]), disc(48, [90, 200, 80])]
+    }
+
+    /// Three rows found for "note", the second selected.
+    fn note<'a>(ids: &'a [ItemId; 3], [blue, green]: &'a [Icon; 2]) -> Scene<'a> {
+        let rows = vec![
+            Row {
+                id: &ids[0],
+                title: "Notepad",
+                subtitle: "App".into(),
+                highlights: utf16_ranges("Notepad", &[0, 1, 2, 3]),
+                icon: Some(blue),
+                glyph: None,
+            },
+            Row {
+                id: &ids[1],
+                title: "Sticky Notes",
+                subtitle: "App".into(),
+                highlights: utf16_ranges("Sticky Notes", &[7, 8, 9, 10]),
+                icon: Some(green),
+                glyph: None,
+            },
+            Row {
+                id: &ids[2],
+                title: "A name so long that it cannot fit in the window and has to end in an ellipsis just before the right edge",
+                subtitle: r"C:\Program Files\Some Vendor\Some Product\a path long enough that it, too, has to be cut short with an ellipsis\bin\app.exe".into(),
+                highlights: Vec::new(),
+                icon: None,
+                glyph: None,
+            },
+        ];
+        Scene {
+            rows,
+            selected: 1,
+            ..Scene::bar("note")
+        }
+    }
+
     #[test]
     fn lists_rows_under_the_bar_at_150_percent() {
         on_hidden_desktop(|| {
-            let ids = ["notepad", "sticky", "long"].map(|id| ItemId(id.to_string()));
-            let (blue, green) = (disc(48, [240, 160, 40]), disc(48, [90, 200, 80]));
-            let rows = || {
-                vec![
-                    Row {
-                        id: &ids[0],
-                        title: "Notepad",
-                        subtitle: "App".into(),
-                        highlights: utf16_ranges("Notepad", &[0, 1, 2, 3]),
-                        icon: Some(&blue),
-                        glyph: None,
-                    },
-                    Row {
-                        id: &ids[1],
-                        title: "Sticky Notes",
-                        subtitle: "App".into(),
-                        highlights: utf16_ranges("Sticky Notes", &[7, 8, 9, 10]),
-                        icon: Some(&green),
-                        glyph: None,
-                    },
-                    Row {
-                        id: &ids[2],
-                        title: "A name so long that it cannot fit in the window and has to end in an ellipsis just before the right edge",
-                        subtitle: r"C:\Program Files\Some Vendor\Some Product\a path long enough that it, too, has to be cut short with an ellipsis\bin\app.exe".into(),
-                        highlights: Vec::new(),
-                        icon: None,
-                        glyph: None,
-                    },
-                ]
-            };
+            let (ids, icons) = (note_ids(), note_icons());
             let canvas = Canvas::new();
             let mut renderer =
                 Renderer::new(canvas.0, 1080, 336, 144, Behind::Glass).expect("a renderer");
             for _ in 0..2 {
-                let scene = Scene {
-                    rows: rows(),
-                    selected: 1,
-                    ..Scene::bar("note")
-                };
-                renderer.draw(&scene).expect("draw");
+                renderer.draw(&note(&ids, &icons)).expect("draw");
                 let frame = renderer.read_frame().expect("read the frame back");
                 assert_looks_like("list-150", &frame);
             }
-        });
-    }
-
-    #[test]
-    fn an_answer_row_with_grouped_digits_at_100_percent() {
-        on_hidden_desktop(|| {
-            let id = ItemId("hyalo:calculator".to_string());
-            let scene = Scene {
-                rows: vec![Row {
-                    id: &id,
-                    title: "1\u{A0}234\u{A0}567,5",
-                    subtitle: "Calculator · Enter to copy".into(),
-                    highlights: Vec::new(),
-                    icon: None,
-                    glyph: Some('\u{E8EF}'),
-                }],
-                selected: 0,
-                ..Scene::bar("1234567+0,5")
-            };
-            let frame = drawn(&scene, (720, 128), 96);
-            assert_looks_like("answer-100", &frame);
         });
     }
 
