@@ -1,6 +1,5 @@
 //! The USN journal: NTFS's record of what changed on a volume, read from a
-//! place on. Pure: it reads what the volume gave, and decides whether a
-//! place saved earlier can still be read from.
+//! place on. Pure: it reads what the volume gave.
 
 use std::collections::HashSet;
 
@@ -27,36 +26,6 @@ const RENAME_OLD_NAME: u32 = 0x1000;
 const RENAME_NEW_NAME: u32 = 0x2000;
 const BASIC_INFO_CHANGE: u32 = 0x8000;
 const HARD_LINK_CHANGE: u32 = 0x1_0000;
-
-/// A volume's journal, as NTFS says it is now.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Journal {
-    /// Which journal: one made again has another.
-    pub id: u64,
-    /// The first place still kept: older records were let go.
-    pub lowest: i64,
-    /// Where the next record will be written.
-    pub next: i64,
-}
-
-/// How far a volume's changes were taken in: the volume, by serial
-/// number, its journal, and the place in it to read on from.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Position {
-    pub volume: u64,
-    pub journal: u64,
-    pub next: i64,
-}
-
-impl Position {
-    /// Whether the volume `volume`, whose journal is `journal` now, can be
-    /// read on from here: the same volume and journal, and nothing between
-    /// here and now let go.
-    pub fn follows(self, volume: u64, journal: Journal) -> bool {
-        let kept = journal.lowest..=journal.next;
-        self.volume == volume && self.journal == journal.id && kept.contains(&self.next)
-    }
-}
 
 /// What a read of the journal gave: the place to read on from, and the
 /// records of the files that changed, each once, in the order they first

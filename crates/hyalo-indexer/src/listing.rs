@@ -5,7 +5,7 @@
 use std::collections::VecDeque;
 
 use crate::mft::Record;
-use crate::{Change, File, Name, ROOT};
+use hyalo_core::volume::{Change, File, Name, ROOT};
 
 /// The records read of a volume's table so far, kept small: a name,
 /// stretch of a shared text, per item.

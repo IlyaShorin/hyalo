@@ -75,59 +75,6 @@ fn a_record_beyond_the_index_s_numbers_is_passed_over() {
     assert_eq!(changed(&read), Some((9, vec![96])));
 }
 
-const VOLUME: u64 = 0x1234_5678_9ABC_DEF0;
-
-fn position(next: i64) -> Position {
-    Position {
-        volume: VOLUME,
-        journal: 7,
-        next,
-    }
-}
-
-fn journal(lowest: i64, next: i64) -> Journal {
-    Journal {
-        id: 7,
-        lowest,
-        next,
-    }
-}
-
-#[test]
-fn a_saved_place_is_read_on_from_while_the_journal_still_holds_it() {
-    assert!(position(5_000).follows(VOLUME, journal(1_000, 9_000)));
-    assert!(
-        position(1_000).follows(VOLUME, journal(1_000, 9_000)),
-        "the oldest kept"
-    );
-    assert!(
-        position(9_000).follows(VOLUME, journal(1_000, 9_000)),
-        "nothing since"
-    );
-}
-
-#[test]
-fn a_saved_place_let_go_or_ahead_of_the_journal_is_not() {
-    assert!(
-        !position(999).follows(VOLUME, journal(1_000, 9_000)),
-        "let go"
-    );
-    assert!(
-        !position(9_001).follows(VOLUME, journal(1_000, 9_000)),
-        "ahead"
-    );
-}
-
-#[test]
-fn another_journal_or_volume_is_read_from_nothing() {
-    let other = Journal {
-        id: 8,
-        ..journal(1_000, 9_000)
-    };
-    assert!(!position(5_000).follows(VOLUME, other));
-    assert!(!position(5_000).follows(VOLUME + 1, journal(1_000, 9_000)));
-}
-
 #[test]
 fn the_reasons_asked_for_are_those_that_change_what_the_index_holds() {
     assert_eq!(REASONS, 0x1_b307);

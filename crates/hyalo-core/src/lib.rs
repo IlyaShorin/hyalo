@@ -21,4 +21,5 @@ pub mod system_settings;
 pub mod text;
 pub mod uninstall;
 pub mod update;
+pub mod volume;
 pub mod web;

@@ -3,6 +3,8 @@
 //! gave, and checks them where they come in, since names are anyone's to
 //! choose and this runs with the rights of the system.
 
+use hyalo_core::volume::Name;
+
 use crate::bytes::{i64_at, number, u16_at, u32_at, u64_at};
 
 /// Bytes of a record each entry of its update sequence stands for: NTFS's
@@ -43,14 +45,6 @@ pub struct Record {
     pub size: Option<u64>,
     /// The other records its attribute list says hold its names or data.
     pub elsewhere: Vec<u32>,
-}
-
-/// One of a file's names: the folder it is in, by record number, and the
-/// name there.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Name {
-    pub parent: u32,
-    pub text: String,
 }
 
 impl Record {

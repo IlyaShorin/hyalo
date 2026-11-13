@@ -10,3 +10,4 @@ repository.workspace = true
 workspace = true
 
 [dependencies]
+hyalo-core = { path = "../hyalo-core" }
