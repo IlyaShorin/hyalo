@@ -2188,20 +2188,19 @@ mod tests {
     use windows::Win32::Foundation::RECT;
     use windows::Win32::Graphics::Dwm::DwmGetWindowAttribute;
     use windows::Win32::Graphics::Gdi::MonitorFromWindow;
-    use windows::Win32::System::Threading::GetCurrentThreadId;
     use windows::Win32::UI::Input::KeyboardAndMouse::{
         SetKeyboardState, VK_A, VK_BACK, VK_C, VK_DELETE, VK_DOWN, VK_END, VK_ESCAPE, VK_F10,
         VK_HOME, VK_LEFT, VK_RETURN, VK_RIGHT, VK_UP, VK_V, VK_X,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
-        EndMenu, FindWindowExW, GW_HWNDPREV, GetClientRect, GetCursor, GetWindow, GetWindowRect,
-        IsWindow, KillTimer, PM_QS_POSTMESSAGE, PM_REMOVE, PeekMessageW, SW_SHOWNOACTIVATE,
-        SendMessageW, SetTimer, WA_ACTIVE, WM_CLOSE, WM_NULL, WM_QUIT, WM_RBUTTONDOWN,
-        WM_RBUTTONUP,
+        EndMenu, GW_HWNDPREV, GetClientRect, GetCursor, GetWindow, GetWindowRect, IsWindow,
+        KillTimer, PM_QS_POSTMESSAGE, PM_REMOVE, PeekMessageW, SW_SHOWNOACTIVATE, SendMessageW,
+        SetTimer, WA_ACTIVE, WM_CLOSE, WM_NULL, WM_QUIT, WM_RBUTTONDOWN, WM_RBUTTONUP,
     };
 
     use super::*;
     use crate::autostart;
+    use crate::popup::tests::{FirstLook, menu_turn, menu_up};
     use crate::render::Frame;
     use crate::scratch::Scratch;
     use crate::test_desktop::{
@@ -5288,6 +5287,7 @@ mod tests {
     #[test]
     fn a_refresh_while_the_real_menu_is_open_leaves_the_menu_up_above_the_launcher() {
         on_hidden_desktop(|| {
+            let _turn = menu_turn();
             let (provider, gate) = gated(&["Everything"], &["Everything", "Evernote"]);
             let (mut services, _) = services(provider, None);
             services.row_menu = Rc::new(row_menu::Popup);
@@ -5318,19 +5318,6 @@ mod tests {
         static TICKS: RefCell<u32> = const { RefCell::new(0) };
     }
 
-    /// The popup menu this thread has up, if any.
-    fn menu_up() -> Option<HWND> {
-        let mut after = None;
-        loop {
-            let menu = unsafe { FindWindowExW(None, after, w!("#32768"), PCWSTR::null()) }.ok()?;
-            let thread = unsafe { GetWindowThreadProcessId(menu, None) };
-            if thread == unsafe { GetCurrentThreadId() } {
-                return Some(menu);
-            }
-            after = Some(menu);
-        }
-    }
-
     /// Ticks inside the real menu's own message loop: once the menu is
     /// up, notes what it sees and picks the second entry, as Down, Down
     /// and Enter would; gives up after a second.
@@ -5358,17 +5345,19 @@ mod tests {
     }
 
     #[test]
-    fn the_real_menu_opens_under_the_row_keeps_the_launcher_up_and_does_what_is_picked() {
+    fn the_real_menu_opens_whole_under_the_row_keeps_the_launcher_up_and_does_what_is_picked() {
         on_hidden_desktop(|| {
             let (mut services, ran) = uninstallers(&["Everything"], &[]);
             services.row_menu = Rc::new(row_menu::Popup);
             let launcher = Launcher::serving(services);
             launcher.search_for("every", 1);
+            let look = FirstLook::new();
             unsafe { SetTimer(Some(launcher.0), 1, 10, Some(pick_second)) };
             launcher.menu_key();
             let (shown, rect) = IN_MENU
                 .with(|seen| seen.borrow_mut().take())
                 .expect("a menu");
+            assert_eq!(look.fading(), Some(false), "up at once, as the tray's");
             assert!(shown, "losing no focus to its menu, the launcher stays");
             let (x, y) = layout::menu_spot(0);
             let under = launcher.on_screen(x, y);
