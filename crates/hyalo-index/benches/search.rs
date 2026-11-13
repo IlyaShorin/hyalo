@@ -45,10 +45,10 @@ const RUNS: usize = 21;
 const LIMIT: usize = 16;
 
 fn main() {
-    let (index, now) = match std::env::var_os("HYALO_BENCH_SNAPSHOT") {
-        Some(path) => (snapshot(&path), seconds_now()),
-        None => (made_up(), synthetic::NOW),
-    };
+    let (index, now) = std::env::var_os("HYALO_BENCH_SNAPSHOT").map_or_else(
+        || (made_up(), synthetic::NOW),
+        |path| (snapshot(&path), seconds_now()),
+    );
     let memory = index.memory() as f64 / 1_048_576.0;
     println!("searching {} entries in {memory:.0} MiB", index.len());
     let places = Places::new(&[r"C:\Desktop", r"C:\Documents"]);
