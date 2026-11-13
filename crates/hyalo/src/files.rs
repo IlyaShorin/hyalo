@@ -13,6 +13,7 @@ use std::fs::{self, DirEntry, File};
 use std::io::{self, BufReader, BufWriter, Write};
 use std::os::windows::fs::{FileTypeExt, MetadataExt};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard, TryLockError};
 use std::thread;
@@ -178,20 +179,21 @@ pub fn provider(
     roots: Roots,
     snapshot: Option<PathBuf>,
     excluded: Excluded,
-    indexer: Arc<dyn Indexer>,
+    (indexer, recheck): (Arc<dyn Indexer>, Recheck),
 ) -> Provider {
     let writer = Mutex::new(writer);
     Arc::new(move |_: &Request, report: &dyn Fn(Found)| {
         let writer = match writer.try_lock() {
             Ok(writer) => writer,
             Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
-            Err(TryLockError::WouldBlock) => return,
+            Err(TryLockError::WouldBlock) => return recheck.ask(),
         };
         let walk = Walk {
             roots: &*roots,
             snapshot: snapshot.as_deref(),
             excluded: &excluded,
             indexer: &*indexer,
+            recheck: &recheck,
         };
         walk.serve(&writer.0, report);
     })
@@ -203,6 +205,25 @@ struct Walk<'a> {
     snapshot: Option<&'a Path>,
     excluded: &'a Excluded,
     indexer: &'a dyn Indexer,
+    recheck: &'a Recheck,
+}
+
+/// Asks the files provider to look for the indexer service again, for
+/// the roots it walks: the window does once the service is installed, and
+/// so does a run of the provider that finds one at work, as showing the
+/// launcher now and then starts.
+#[derive(Clone, Default)]
+pub struct Recheck(Arc<AtomicBool>);
+
+impl Recheck {
+    pub fn ask(&self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+
+    /// Whether it was asked since it last said so.
+    fn taken(&self) -> bool {
+        self.0.swap(false, Ordering::SeqCst)
+    }
 }
 
 /// What the provider hears of a root: from its watch, or from the service.
@@ -262,6 +283,16 @@ impl Sources {
 
     fn is_served(&self, at: usize) -> bool {
         self.served[at].is_some()
+    }
+
+    /// Has `indexer` follow the roots that are walked, from where the
+    /// index is, in place of their watches, where it will.
+    fn serve_walked(&mut self, shared: &RwLock<Index>, roots: &[PathBuf], indexer: &dyn Indexer) {
+        for (at, root) in roots.iter().enumerate() {
+            if !self.is_served(at) && self.serve(at, root, position_of(shared, root), indexer) {
+                self.watches[at] = None;
+            }
+        }
     }
 }
 
@@ -359,6 +390,9 @@ impl Walk<'_> {
                 Err(_) => {}
             }
             self.keep_out(shared, roots, &mut kept.excluded, report, sources);
+            if self.recheck.taken() {
+                sources.serve_walked(shared, roots, self.indexer);
+            }
             let version = read(shared).version();
             if kept.told.due(version, Instant::now(), TELL_EVERY) {
                 report(Found::Files);
@@ -1149,7 +1183,13 @@ mod tests {
         let roots: Roots = Arc::new(move || vec![root.clone()]);
         let excluded = Excluded::default();
         (
-            provider(writer, roots, snapshot, excluded.clone(), walked()),
+            provider(
+                writer,
+                roots,
+                snapshot,
+                excluded.clone(),
+                (walked(), Recheck::default()),
+            ),
             files,
             excluded,
         )
@@ -1298,7 +1338,13 @@ mod tests {
         let (files, writer) = Files::new();
         let roots: Roots = Arc::new(move || vec![root.clone()]);
         let serving = Serving::new(
-            provider(writer, roots, None, Excluded::default(), walked()),
+            provider(
+                writer,
+                roots,
+                None,
+                Excluded::default(),
+                (walked(), Recheck::default()),
+            ),
             files,
         );
         serving.until(|serving| serving.reports() >= 1);
@@ -1500,6 +1546,7 @@ mod tests {
             snapshot: None,
             excluded: &excluded,
             indexer: &served::Walked,
+            recheck: &Recheck::default(),
         };
         let roots = [kept.0.clone(), lost.0.clone()];
         walk.walk(&writer.0, &roots, true, &|_| {});
@@ -1609,7 +1656,13 @@ mod tests {
         });
         let excluded = excluding(&[folder.path("gone")]);
         let serving = Serving::new(
-            provider(writer, roots, Some(snapshot), excluded, walked()),
+            provider(
+                writer,
+                roots,
+                Some(snapshot),
+                excluded,
+                (walked(), Recheck::default()),
+            ),
             files,
         );
         // Before the walk asks for its roots, the snapshot is in, what is
@@ -1685,7 +1738,13 @@ mod tests {
             vec![]
         });
         let serving = Serving::new(
-            provider(writer, roots, Some(path), Excluded::default(), walked()),
+            provider(
+                writer,
+                roots,
+                Some(path),
+                Excluded::default(),
+                (walked(), Recheck::default()),
+            ),
             files,
         );
         serving.until(|_| before_walking.lock().expect("seen").is_some());
@@ -1719,7 +1778,13 @@ mod tests {
             gate.1.wait();
             vec![root.clone()]
         });
-        let provider = provider(writer, roots, None, Excluded::default(), walked());
+        let provider = provider(
+            writer,
+            roots,
+            None,
+            Excluded::default(),
+            (walked(), Recheck::default()),
+        );
         let serving = Serving::new(Arc::clone(&provider), files);
         shared.0.wait();
         assert_eq!(run(&provider), 0, "busy");
@@ -1832,7 +1897,13 @@ mod tests {
         let root = folder.0.clone();
         let roots: Roots = Arc::new(move || vec![root.clone()]);
         Serving::new(
-            provider(writer, roots, snapshot, excluded.clone(), indexer),
+            provider(
+                writer,
+                roots,
+                snapshot,
+                excluded.clone(),
+                (indexer, Recheck::default()),
+            ),
             files,
         )
     }
@@ -1944,6 +2015,27 @@ mod tests {
         send.send(Ok(Answer::Listed)).expect("sent");
         serving.finds("kept", &[folder.path("kept.txt")]);
         assert_eq!(search(serving.files(), "inside"), Vec::<String>::new());
+    }
+
+    #[test]
+    fn a_service_that_comes_later_takes_over_a_walked_root() {
+        let folder = Scratch::new("served-later").with(&["walked.txt"]);
+        let (indexer, send) = Scripted::new();
+        let waiting = indexer.streams.lock().expect("streams").pop().expect("one");
+        let (files, writer) = Files::new();
+        let root = folder.0.clone();
+        let roots: Roots = Arc::new(move || vec![root.clone()]);
+        let sources = (indexer.clone() as Arc<dyn Indexer>, Recheck::default());
+        let provider = provider(writer, roots, None, Excluded::default(), sources);
+        let serving = Serving::new(Arc::clone(&provider), files);
+        serving.finds("walked", &[folder.path("walked.txt")]);
+        indexer.streams.lock().expect("streams").push(waiting);
+        // Showing the launcher runs the provider, which finds one at work.
+        assert_eq!(run(&provider), 0);
+        list(&send, at(100));
+        serving.finds("inside", &[folder.path(r"listed\inside.txt")]);
+        assert_eq!(search(serving.files(), "walked"), Vec::<String>::new());
+        assert_eq!(indexer.asked(), [None, None]);
     }
 
     #[test]
