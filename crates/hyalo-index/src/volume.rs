@@ -71,6 +71,36 @@ impl Index {
         Ok(came)
     }
 
+    /// Adds what a listing says of a file to the volume whose root is
+    /// `root`, which holds nothing of it yet, its folders listed before
+    /// what they hold: each name an entry, in a folder the index holds,
+    /// as a walk adds them. Unlike `settle`, it looks for no entry of the
+    /// file to move and no other by the same name to replace, which in a
+    /// folder of thousands costs a look through them all for each.
+    pub fn list(&mut self, root: EntryId, change: &Change) -> Result<(), Error> {
+        self.root(root)?;
+        let (record, Some(file)) = (change.record, &change.file) else {
+            return Ok(());
+        };
+        if record >= MOST_RECORDS {
+            return Ok(());
+        }
+        let mut now = Vec::new();
+        for name in &file.names {
+            let Some(folder) = self.folder_of(root.0, name.parent) else {
+                continue;
+            };
+            if let Ok(entry) = self.add(EntryId(folder), &name.text, file.folder) {
+                self.files[entry.0 as usize] = record;
+                // Added just now, so it is there.
+                let _ = self.set_stat(entry, file.size, file.written);
+                now.push(entry.0);
+            }
+        }
+        self.remember(root.0, record, &now);
+        Ok(())
+    }
+
     /// How far the journal of the volume whose root is `root` was taken in.
     pub fn position(&self, root: EntryId) -> Option<Position> {
         self.volume(root.0)?.position
@@ -600,6 +630,58 @@ mod tests {
             None,
             "a root made again starts afresh"
         );
+    }
+
+    /// `volume()`'s, listed: the same entries, known by their records.
+    fn listed() -> (Index, EntryId) {
+        let mut index = Index::default();
+        let c = index.add_root("C:").unwrap();
+        for change in [
+            folder(40, ROOT, "Users"),
+            folder(41, 40, "Me"),
+            folder(60, ROOT, "Windows"),
+            file(50, 41, "notes.txt"),
+            change(70, false, &[(40, "a.txt"), (60, "b.txt")], 7, 3_000),
+            file(80, 999, "nowhere.txt"),
+            gone(81),
+            change(82, false, &[(40, ""), (40, "good.txt")], 1, 1),
+        ] {
+            index.list(c, &change).unwrap();
+        }
+        (index, c)
+    }
+
+    #[test]
+    fn a_listing_adds_each_name_in_a_folder_the_index_holds() {
+        let (index, _) = listed();
+        let notes = index.find(r"C:\Users\Me\notes.txt").expect("listed");
+        assert_eq!(index.stat(notes), Some((5, 2_000)));
+        assert_eq!(
+            index.is_folder(index.find(r"C:\Users\Me").expect("listed")),
+            Some(true)
+        );
+        assert!(found(&index, r"C:\Users\a.txt") && found(&index, r"C:\Windows\b.txt"));
+        assert!(
+            found(&index, r"C:\Users\good.txt"),
+            "the name refused left out"
+        );
+        assert_eq!(
+            index.len(),
+            8,
+            "the root, three folders, notes, two links, good"
+        );
+    }
+
+    #[test]
+    fn what_was_listed_is_known_by_its_records_after() {
+        let (mut index, c) = listed();
+        index.settle(c, &folder(41, 60, "You")).unwrap();
+        assert!(found(&index, r"C:\Windows\You\notes.txt"));
+        index.settle(c, &gone(70)).unwrap();
+        assert!(!found(&index, r"C:\Users\a.txt") && !found(&index, r"C:\Windows\b.txt"));
+        assert_eq!(index.list(EntryId(999), &gone(1)), Err(Error::NoSuchEntry));
+        assert_eq!(index.list(c, &file(1 << 30, ROOT, "far")), Ok(()));
+        assert!(!found(&index, r"C:\far"), "no record a volume could have");
     }
 
     #[test]

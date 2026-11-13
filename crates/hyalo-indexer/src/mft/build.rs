@@ -101,11 +101,22 @@ impl Made {
     /// The file's data stream, `length` bytes, of which this record maps
     /// the clusters from `first` on, lying where `runs` says.
     pub fn data(self, first: u64, length: u64, runs: &[u8]) -> Made {
-        let mut attribute = vec![0; 0x40];
+        self.named_data(first, length, runs, "")
+    }
+
+    /// The same, for the stream named `name`: another than the file's own,
+    /// unless the name is empty.
+    pub fn named_data(self, first: u64, length: u64, runs: &[u8], name: &str) -> Made {
+        let name: Vec<u8> = name.encode_utf16().flat_map(u16::to_le_bytes).collect();
+        let runs_at = (0x40 + name.len()).next_multiple_of(8);
+        let mut attribute = vec![0; runs_at];
+        attribute[9] = (name.len() / 2) as u8;
+        attribute[0x0A..0x0C].copy_from_slice(&0x40_u16.to_le_bytes());
+        attribute[0x40..0x40 + name.len()].copy_from_slice(&name);
         attribute[0..4].copy_from_slice(&DATA.to_le_bytes());
         attribute[8] = 1;
         attribute[0x10..0x18].copy_from_slice(&first.to_le_bytes());
-        attribute[0x20..0x22].copy_from_slice(&0x40_u16.to_le_bytes());
+        attribute[0x20..0x22].copy_from_slice(&(runs_at as u16).to_le_bytes());
         for at in [0x28, 0x30, 0x38] {
             attribute[at..at + 8].copy_from_slice(&length.to_le_bytes());
         }

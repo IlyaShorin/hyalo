@@ -22,6 +22,13 @@ const END: u32 = 0xFFFF_FFFF;
 const IN_USE: u16 = 1;
 const DIRECTORY: u16 = 2;
 
+/// The shortest entry of an attribute list: what it says, rounded up to
+/// eight bytes, as every entry is.
+const LIST_ENTRY: u16 = 0x20;
+
+/// The shortest attribute: the header of one kept in the record.
+const ATTRIBUTE: usize = 0x18;
+
 /// The namespace of a short 8.3 name kept beside the long one.
 const DOS: u8 = 2;
 
@@ -81,7 +88,7 @@ pub fn fix(record: &mut [u8]) -> bool {
         return false;
     };
     let (offset, sectors) = (offset as usize, (count as usize).saturating_sub(1));
-    if sectors == 0 || sectors * STRIDE != record.len() {
+    if sectors * STRIDE != record.len() {
         return false;
     }
     let Some(sequence) = record.get(offset..offset + 2 * (sectors + 1)) else {
@@ -171,7 +178,7 @@ fn name(value: &[u8]) -> Option<Name> {
 fn listed(value: &[u8]) -> Vec<u32> {
     let mut records: Vec<u32> = Vec::new();
     let mut at = 0;
-    while let Some(length) = u16_at(value, at + 4).filter(|&length| length >= 0x1A) {
+    while let Some(length) = u16_at(value, at + 4).filter(|&length| length >= LIST_ENTRY) {
         let kind = u32_at(value, at);
         let record = u64_at(value, at + 0x10).and_then(number);
         if let (Some(FILE_NAME | DATA), Some(record)) = (kind, record)
@@ -224,15 +231,16 @@ impl Body<'_> {
 /// The record's attributes, up to the end marker or the first that does
 /// not fit in the record.
 fn attributes(record: &[u8]) -> impl Iterator<Item = Attribute<'_>> {
-    let used = u32_at(record, 0x18).map_or(0, |used| (used as usize).min(record.len()));
-    let record = &record[..used];
+    // A record that says it uses more than it holds holds nothing.
+    let used = u32_at(record, 0x18).and_then(|used| record.get(..used as usize));
+    let record = used.unwrap_or_default();
     let mut at = u16_at(record, 0x14).map(usize::from);
     std::iter::from_fn(move || {
         let start = at?;
         let kind = u32_at(record, start).filter(|&kind| kind != END)?;
         let length = u32_at(record, start + 4)? as usize;
         let attribute = record.get(start..start.checked_add(length)?)?;
-        at = (length >= 0x18).then_some(start + length);
+        at = (length >= ATTRIBUTE).then_some(start + length);
         Some(Attribute {
             kind,
             named: *attribute.get(9)? != 0,
@@ -305,7 +313,8 @@ pub fn runs(bytes: &[u8]) -> Option<Vec<Extent>> {
 fn run(bytes: &[u8], at: usize) -> Option<(u64, Option<i64>, usize)> {
     let header = *bytes.get(at)?;
     let (length_size, place_size) = (usize::from(header & 0xF), usize::from(header >> 4));
-    if !(1..=8).contains(&length_size) || place_size > 8 {
+    // A length of no bytes is no clusters, refused below.
+    if length_size > 8 || place_size > 8 {
         return None;
     }
     let place_at = at + 1 + length_size;
@@ -908,5 +917,74 @@ mod tests {
     fn an_extension_of_the_table_s_own_record_names_it_as_its_base() {
         let made = record().extending(0).data(8, 0, &[0x11, 0x08, 0x50, 0x00]);
         assert_eq!(parse(&made.bytes(SIZE)).expect("in use").base, Some(0));
+    }
+
+    #[test]
+    fn a_record_of_one_sector_gets_its_end_back() {
+        let made = record().name(5, "a", WIN32);
+        let mut small = made.on_disk(512);
+        assert!(fix(&mut small));
+        assert_eq!(small, made.bytes(512));
+    }
+
+    #[test]
+    fn an_attribute_list_entry_shorter_than_one_can_be_ends_the_list() {
+        let made = record().list(&[(0x30, 0, 300), (0x30, 0, 301)]);
+        let mut bytes = made.bytes(SIZE);
+        let first = u16::from_le_bytes([bytes[0x14], bytes[0x15]]) as usize;
+        let entry = first + 0x18;
+        bytes[entry + 4..entry + 6].copy_from_slice(&0x18_u16.to_le_bytes());
+        assert_eq!(parse(&bytes).expect("in use").elsewhere, Vec::<u32>::new());
+    }
+
+    #[test]
+    fn a_record_that_says_it_uses_more_than_it_holds_holds_no_attributes() {
+        let made = record().name(5, "a.txt", WIN32);
+        let mut bytes = made.bytes(SIZE);
+        bytes[0x18..0x1C].copy_from_slice(&2000_u32.to_le_bytes());
+        assert_eq!(parse(&bytes).expect("in use").names, []);
+    }
+
+    #[test]
+    fn the_shortest_attribute_is_read_and_the_next_one_after_it() {
+        let made = record().small_data(0, "").name(5, "after", WIN32);
+        let parsed = parse(&made.bytes(SIZE)).expect("in use");
+        assert_eq!(parsed.size, Some(0));
+        assert_eq!(parsed.names, [name(5, "after")]);
+    }
+
+    #[test]
+    fn a_run_of_one_cluster_or_of_eight_byte_numbers_reads() {
+        assert_eq!(runs(&[0x11, 0x01, 0x05, 0x00]), Some(vec![at(5, 1)]));
+        let eight = [0x18, 2, 0, 0, 0, 0, 0, 0, 0, 0x07, 0x00];
+        assert_eq!(runs(&eight), Some(vec![at(7, 2)]));
+        let nine = [0x09, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0x00];
+        assert_eq!(runs(&nine), None, "a length longer than 8 bytes");
+    }
+
+    #[test]
+    fn a_named_stream_kept_outside_the_record_is_not_the_table() {
+        let made = record().named_data(0, 4096, &[0x11, 0x01, 0x05, 0x00], "other");
+        assert_eq!(data_runs(&made.bytes(SIZE)), None);
+    }
+
+    #[test]
+    fn a_span_ends_where_the_table_s_bytes_asked_for_end() {
+        let table = table();
+        let span = |at, length| Span { at, length };
+        assert_eq!(
+            table.spans(0, 16 * 4096),
+            Some(vec![span(100 * 4096, 16 * 4096)]),
+            "no empty span from the stretch after"
+        );
+    }
+
+    #[test]
+    fn pieces_smaller_than_a_cluster_are_read_a_cluster_at_a_time() {
+        let piece = |start, length| Piece { start, length };
+        assert_eq!(
+            table().pieces(8192, 100),
+            [piece(0, 4096), piece(4096, 4096)]
+        );
     }
 }

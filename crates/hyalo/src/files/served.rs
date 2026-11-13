@@ -106,6 +106,7 @@ pub struct Listing {
     index: Index,
     root: EntryId,
     position: Position,
+    started: Instant,
 }
 
 impl Listing {
@@ -118,16 +119,26 @@ impl Listing {
             index,
             root,
             position,
+            started: Instant::now(),
         })
     }
 
+    /// Adds what the listing says of these files, the names a walk leaves
+    /// out at a volume's root left out.
     pub fn take(&mut self, changes: &[Change]) {
-        settle(&mut self.index, self.root, changes, self.position);
+        for change in changes {
+            // The root is the listing's own: it is there.
+            let _ = self.index.list(self.root, &kept(change));
+        }
     }
 
     /// The volume, whole, with no room kept for growth.
     pub fn done(mut self) -> Index {
+        // The root is the listing's own: it is there.
+        let _ = self.index.set_position(self.root, self.position);
         self.index.shrink_to_fit();
+        let (count, took) = (self.index.len(), self.started.elapsed());
+        eprintln!("hyalo: {count} files and folders from the indexer service in {took:.1?}");
         self.index
     }
 }
@@ -383,5 +394,117 @@ mod tests {
             ]
         );
         drop(following);
+    }
+
+    /// How long the installed service takes to list each fixed drive and
+    /// the launcher to take the listing in, as it does at a first start.
+    /// Talks to the real service, so it runs only when asked:
+    /// `cargo test --release -p hyalo -- --ignored --nocapture service_lists`.
+    #[test]
+    #[ignore]
+    fn service_lists_the_fixed_drives() {
+        for root in crate::files::fixed_drives() {
+            let started = Instant::now();
+            let mut stream = Service.follow(&root, None).expect("the service follows it");
+            let going = AtomicBool::new(false);
+            let Ok(Some(Answer::Listing(position))) = stream.next(&going) else {
+                println!("{}: refused", root.display());
+                continue;
+            };
+            let first = started.elapsed();
+            let name = root.to_string_lossy().trim_end_matches('\\').to_string();
+            let mut listing = Listing::new(&name, position).expect("a root");
+            let (mut sent, mut taking, mut first_files) = (0, Duration::ZERO, None);
+            loop {
+                match stream.next(&going).expect("an answer") {
+                    Some(Answer::Files(changes)) => {
+                        first_files.get_or_insert_with(|| started.elapsed());
+                        sent += changes.len();
+                        let taken = Instant::now();
+                        listing.take(&changes);
+                        taking += taken.elapsed();
+                    }
+                    Some(Answer::Listed) => break,
+                    other => panic!("{other:?} in a listing"),
+                }
+            }
+            println!(
+                "{}: first files after {first_files:.2?}, taking them in {taking:.2?}",
+                root.display()
+            );
+            let index = listing.done();
+            let (took, memory) = (started.elapsed(), index.memory() >> 20);
+            println!(
+                "{name}: {sent} sent, {} in the index, {memory} MiB; listing began after {first:.2?}, all in {took:.2?}",
+                index.len()
+            );
+        }
+    }
+
+    /// Whether the installed service tells of a file made, renamed and
+    /// removed on the system drive, through its journal; asked by hand,
+    /// as above.
+    #[test]
+    #[ignore]
+    fn service_tells_of_changes_on_the_system_drive() {
+        let drive = std::env::var("SystemDrive").expect("SystemDrive");
+        let mut stream = Service
+            .follow(Path::new(&format!(r"{drive}\")), None)
+            .expect("followed");
+        let going = AtomicBool::new(false);
+        while !matches!(
+            stream.next(&going).expect("an answer"),
+            Some(Answer::Listed)
+        ) {}
+        let folder = std::env::temp_dir().join(format!("hyalo-journal-{}", std::process::id()));
+        std::fs::create_dir_all(&folder).expect("made");
+        let made = folder.join("journal-made.txt");
+        std::fs::write(&made, b"12345").expect("written");
+        let named = |change: &Change, text: &str| {
+            change
+                .file
+                .iter()
+                .flat_map(|file| &file.names)
+                .any(|name| name.text == text)
+        };
+        let started = Instant::now();
+        let record = loop {
+            let Some(Answer::Changed(_, changes)) = stream.next(&going).expect("an answer") else {
+                continue;
+            };
+            if let Some(change) = changes
+                .iter()
+                .find(|change| named(change, "journal-made.txt"))
+            {
+                println!("made, told after {:.2?}: {change:?}", started.elapsed());
+                break change.record;
+            }
+        };
+        std::fs::rename(&made, folder.join("journal-renamed.txt")).expect("renamed");
+        loop {
+            let Some(Answer::Changed(_, changes)) = stream.next(&going).expect("an answer") else {
+                continue;
+            };
+            if changes
+                .iter()
+                .any(|change| change.record == record && named(change, "journal-renamed.txt"))
+            {
+                println!("renamed, told after {:.2?}", started.elapsed());
+                break;
+            }
+        }
+        std::fs::remove_dir_all(&folder).expect("removed");
+        loop {
+            let Some(Answer::Changed(_, changes)) = stream.next(&going).expect("an answer") else {
+                continue;
+            };
+            if changes
+                .iter()
+                .any(|change| change.record == record && change.file.is_none())
+            {
+                println!("gone, told after {:.2?}", started.elapsed());
+                break;
+            }
+        }
     }
 }
