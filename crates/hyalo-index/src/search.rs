@@ -184,7 +184,7 @@ impl Index {
         let found = hit.found.or_else(|| pattern.find(&item.title));
         Ranked {
             item,
-            found: found.expect("an exact ceiling is a match"),
+            found: found.expect("a hit with points is a match"),
             score: hit.score,
         }
     }
@@ -274,7 +274,7 @@ struct Scan<'a> {
 impl Scan<'_> {
     /// Offers the entry at `at` to `best`, unless it cannot beat what is
     /// there: judged roughly from the folded name, then from the name's
-    /// words; only a possible acronym needs `find` to know its points.
+    /// words; a possible acronym is checked word by word only then.
     fn consider(&mut self, at: u32) {
         let entry = self.index.entries[at as usize];
         let listed = entry.is_live() && !entry.is_root();
@@ -306,23 +306,27 @@ impl Scan<'_> {
         let (folded, name, kind) = (index.folded_of(entry), index.name_of(entry), kind_of(entry));
         let floor = self.best.floor();
         let beats = |points: f64| rank::score(points, kind, places::BOOST, 0.0) > floor;
-        let rough = self
-            .pattern
-            .rough(folded)
-            .filter(|rough| beats(rough.points()));
-        let ceiling = rough.and_then(|rough| rough.ceiling(name));
+        let rough = self.pattern.rough(folded);
+        let Some(rough) = rough.filter(|rough| beats(rough.points())) else {
+            return;
+        };
+        let ceiling = rough.ceiling(name);
         let Some(ceiling) = ceiling.filter(|ceiling| beats(ceiling.points())) else {
             return;
         };
         self.scored += 1;
-        let Some((points, found)) = matched(self.pattern, name, ceiling) else {
+        let points = match ceiling {
+            Ceiling::Exactly(points) => Some(points),
+            Ceiling::AtMost(_) => rough.exactly(name),
+        };
+        let Some(points) = points else {
             return;
         };
         let score = rank::score(points, kind, self.place(entry.parent), 0.0);
         self.best.offer(Hit {
             at,
             score,
-            found,
+            found: None,
             newer: None,
         });
     }
@@ -355,18 +359,6 @@ impl Scan<'_> {
     }
 }
 
-/// The points a name's match is worth, with the match itself when finding
-/// it was the only way to know them.
-fn matched(pattern: &Pattern, name: &str, ceiling: Ceiling) -> Option<(f64, Option<Match>)> {
-    match ceiling {
-        Ceiling::Exactly(points) => Some((points, None)),
-        Ceiling::AtMost(_) => {
-            let found = pattern.find(name)?;
-            Some((found.points(), Some(found)))
-        }
-    }
-}
-
 fn kind_of(entry: Entry) -> Kind {
     match entry.is_folder() {
         true => Kind::Folder,
@@ -378,7 +370,8 @@ fn kind_of(entry: Entry) -> Kind {
 struct Hit {
     at: u32,
     score: f64,
-    /// Found while searching only when needed; the rows shown find it.
+    /// No letters, for a row listed by filters alone; a match's letters
+    /// are found for the rows shown alone.
     found: Option<Match>,
     /// When it was written, for ties among rows listed unmatched; none
     /// for a match, whose ties keep the order of the index.
