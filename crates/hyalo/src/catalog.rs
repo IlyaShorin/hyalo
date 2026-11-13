@@ -5,6 +5,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use hyalo_core::clipboard::Copied;
 use hyalo_core::item::{Item, ItemId};
 use hyalo_core::rates::Rates;
 use hyalo_core::system_settings;
@@ -44,6 +45,9 @@ pub enum Found {
     /// An uninstaller ended, whether it uninstalled or was called off:
     /// the apps may have changed.
     UninstallEnded,
+    /// Something copied, for the clipboard history, and its row's
+    /// picture, if it has one.
+    Copied(Copied, Option<Icon>),
 }
 
 /// What the window asks a provider for.
@@ -97,7 +101,11 @@ impl Catalog {
             Found::Windows(windows) => self.open(windows),
             // The window puts settings in force and updates hyalo; there
             // is nothing to list.
-            Found::Config(_) | Found::Latest(_) | Found::Installed(_) | Found::UninstallEnded => {}
+            Found::Config(_)
+            | Found::Latest(_)
+            | Found::Installed(_)
+            | Found::UninstallEnded
+            | Found::Copied(..) => {}
         }
     }
 

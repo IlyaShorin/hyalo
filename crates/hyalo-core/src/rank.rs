@@ -138,8 +138,11 @@ fn kind_weight(kind: Kind) -> f64 {
         // under files.
         Kind::App | Kind::Setting | Kind::Command => LAUNCHED,
         // A notice or a web search is never ranked; it goes first, as an
-        // answer does. Windows are ranked only among themselves.
-        Kind::Calculator | Kind::Web | Kind::Window | Kind::Notice => LAUNCHED + KIND_STEP,
+        // answer does. Windows and what was copied are ranked only among
+        // themselves.
+        Kind::Calculator | Kind::Web | Kind::Window | Kind::Notice | Kind::Clip => {
+            LAUNCHED + KIND_STEP
+        }
     }
 }
 

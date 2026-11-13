@@ -40,6 +40,11 @@ language = "en"
 # until you click Install. false stops looking.
 check_for_updates = true
 
+# Lists what you copy under the empty search bar, newest first: text,
+# pictures and files, kept in memory alone, never on disk, and nothing
+# password managers mark private. false stops it and forgets the list.
+clipboard_history = true
+
 [folders]
 # Left out of the file index with everything in them: full paths.
 # WinSxS keeps a copy of every system file each update brought, hundreds
@@ -88,6 +93,8 @@ pub struct Config {
     pub language: Option<Language>,
     /// Whether to look for a newer release.
     pub check_for_updates: bool,
+    /// Whether to keep what is copied, to list it under the empty bar.
+    pub clipboard_history: bool,
     /// Full paths the walk leaves out, with everything under them: with
     /// backslashes, without one at the end.
     pub exclude: Vec<String>,
@@ -119,6 +126,7 @@ impl Default for Config {
             hotkey: Hotkey::default(),
             language: None,
             check_for_updates: true,
+            clipboard_history: true,
             exclude: strings(List::Exclude).collect(),
             rank_lower: places(List::RankLower),
             rank_higher: places(List::RankHigher),
@@ -181,6 +189,7 @@ pub struct Written {
     pub hotkey: Hotkey,
     pub language: Option<Language>,
     pub check_for_updates: bool,
+    pub clipboard_history: bool,
     lists: [Vec<String>; 4],
 }
 
@@ -198,6 +207,7 @@ pub fn written(text: &str) -> Result<Written, Problem> {
         hotkey: config.hotkey,
         language: config.language,
         check_for_updates: config.check_for_updates,
+        clipboard_history: config.clipboard_history,
         lists,
     })
 }
@@ -327,6 +337,7 @@ fn read(text: &str) -> Result<(Config, [Vec<String>; 4]), Problem> {
             .map(|value| at.read(value, &language))
             .transpose()?,
         check_for_updates: file.check_for_updates.unwrap_or(defaults.check_for_updates),
+        clipboard_history: file.clipboard_history.unwrap_or(defaults.clipboard_history),
         exclude: at.each(folders.exclude, defaults.exclude, excluded)?,
         rank_lower: at.each(folders.rank_lower, defaults.rank_lower, place)?,
         rank_higher: at.each(folders.rank_higher, defaults.rank_higher, place)?,
@@ -376,6 +387,7 @@ struct File {
     hotkey: Option<Spanned<String>>,
     language: Option<Spanned<String>>,
     check_for_updates: Option<bool>,
+    clipboard_history: Option<bool>,
     folders: Option<Folders>,
     /// Each prefix and its address, the prefixes in order.
     search: Option<BTreeMap<String, Spanned<String>>>,
@@ -538,6 +550,26 @@ check_for_updates = 'no'
 ",
         );
         assert_eq!(wrong.line, 2);
+    }
+
+    #[test]
+    fn the_clipboard_history_is_on_unless_the_file_turns_it_off() {
+        assert!(parse(DEFAULT).expect("the default file").clipboard_history);
+        assert!(parse("").expect("a config").clipboard_history);
+        let off = "clipboard_history = false
+";
+        assert!(!parse(off).expect("a config").clipboard_history);
+        assert!(!written(off).expect("written").clipboard_history);
+        assert!(written("").expect("written").clipboard_history);
+        assert_eq!(
+            problem(
+                "
+clipboard_history = 1
+"
+            )
+            .line,
+            2
+        );
     }
 
     #[test]

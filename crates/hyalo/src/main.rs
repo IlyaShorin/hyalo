@@ -21,6 +21,7 @@ mod page;
 mod paint;
 mod panel;
 mod picker;
+mod picture;
 mod popup;
 mod rates;
 mod recorder;

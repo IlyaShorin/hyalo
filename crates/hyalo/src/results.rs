@@ -3,6 +3,7 @@
 use std::borrow::Cow;
 use std::collections::HashSet;
 
+use hyalo_core::clipboard::{self, Content};
 use hyalo_core::frecency::{Frecency, Timestamp};
 use hyalo_core::item::{Action, Item, Kind};
 use hyalo_core::matcher::Match;
@@ -45,15 +46,28 @@ pub fn subtitle(item: &Item, language: Language) -> &str {
 
 /// The symbol a row of `kind` shows where an icon goes, from Segoe Fluent
 /// Icons: a calculator for answers, a globe for web searches, a warning
-/// for a notice, a system command's own; `None` for the rest, which have
-/// icons (apps, files, settings pages, windows).
+/// for a notice, a system command's own, an entry of the clipboard
+/// history's; `None` for the rest, which have icons (apps, files,
+/// settings pages, windows).
 pub fn glyph(kind: Kind, action: &Action) -> Option<char> {
     match (kind, action) {
         (Kind::Calculator, _) => Some('\u{E8EF}'),
         (Kind::Web, _) => Some('\u{E774}'),
         (Kind::Notice, _) => Some('\u{E7BA}'),
         (_, Action::System(command)) => Some(command_glyph(*command)),
+        (_, Action::PutBack(content)) => Some(copied_glyph(content)),
         _ => None,
+    }
+}
+
+/// The symbol of an entry of the clipboard history: a clipboard for text;
+/// a picture or a page until the thumbnail or the first file's icon
+/// comes, which takes its place.
+fn copied_glyph(content: &Content) -> char {
+    match content {
+        Content::Text { .. } => '\u{E77F}',
+        Content::Image { .. } => '\u{E91B}',
+        Content::Files(_) => '\u{E8A5}',
     }
 }
 
@@ -160,8 +174,21 @@ impl Results {
     /// The open `windows` the switcher's `filter` finds, best first, at
     /// most `MAX_ROWS`, the first one selected.
     pub fn windows(filter: &str, windows: &[Item]) -> Self {
-        let ranked = switcher::ranked(filter, windows).into_iter();
-        let rows = ranked.map(|(item, matched)| Listed { item, matched });
+        Self::ranked(switcher::ranked(filter, windows))
+    }
+
+    /// The `rows` of the clipboard history `filter` finds, best first, at
+    /// most `MAX_ROWS`, the first one selected.
+    pub fn copied(filter: &str, rows: &[Item]) -> Self {
+        Self::ranked(clipboard::ranked(filter, rows))
+    }
+
+    /// The first `MAX_ROWS` of what was `ranked`, each with the letters
+    /// its title matched, the first one selected.
+    fn ranked(ranked: Vec<(Item, Vec<usize>)>) -> Self {
+        let rows = ranked
+            .into_iter()
+            .map(|(item, matched)| Listed { item, matched });
         Self {
             rows: rows.take(MAX_ROWS).collect(),
             ..Self::default()
@@ -281,6 +308,7 @@ impl Results {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hyalo_core::clipboard::{Content, Copied, History};
     use hyalo_core::item::{ItemId, Kind};
     use hyalo_core::system_commands;
     use hyalo_core::uninstall::Uninstall;
@@ -469,6 +497,34 @@ mod tests {
         assert_eq!(titles(&found), ["Window 10"]);
         assert_eq!(found.rows()[0].matched, [7, 8]);
         assert_eq!(picked(&found), Some("Window 10"));
+    }
+
+    #[test]
+    fn the_history_lists_at_most_eight_entries_marking_what_the_filter_matched() {
+        let mut history = History::default();
+        for n in 1..=10 {
+            let copied = Copied {
+                content: Content::Text {
+                    text: format!("copy {n:02}"),
+                    html: None,
+                    rtf: None,
+                },
+                app: String::new(),
+                at: NOW,
+            };
+            history.add(copied).expect("kept");
+        }
+        let entries = history.entries().iter();
+        let rows: Vec<Item> = entries
+            .map(|entry| entry.item(NOW, Language::English))
+            .collect();
+        let all = Results::copied("", &rows);
+        assert_eq!(titles(&all).len(), MAX_ROWS);
+        assert_eq!(titles(&all)[0], "copy 10", "newest first");
+        let found = Results::copied("01", &rows);
+        assert_eq!(titles(&found), ["copy 01"]);
+        assert_eq!(found.rows()[0].matched, [5, 6]);
+        assert_eq!(picked(&found), Some("copy 01"));
     }
 
     #[test]
@@ -774,6 +830,23 @@ mod tests {
         let page = Action::Open("ms-settings:display".to_string());
         assert_eq!(glyph(Kind::Setting, &page), None);
         assert_eq!(glyph(Kind::App, &Action::Open("x".to_string())), None);
+        let back = |content| Action::PutBack(std::sync::Arc::new(content));
+        let text = back(Content::Text {
+            text: "a".to_string(),
+            html: None,
+            rtf: None,
+        });
+        assert_eq!(glyph(Kind::Clip, &text), Some('\u{E77F}'));
+        let picture = back(Content::Image {
+            width: 1,
+            height: 1,
+            png: Vec::new(),
+        });
+        let until = "until its thumbnail comes";
+        assert_eq!(glyph(Kind::Clip, &picture), Some('\u{E91B}'), "{until}");
+        let files = back(Content::Files(Vec::new()));
+        let until = "until the first one's icon comes";
+        assert_eq!(glyph(Kind::Clip, &files), Some('\u{E8A5}'), "{until}");
     }
 
     #[test]

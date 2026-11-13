@@ -34,6 +34,8 @@ pub enum Target {
     Install,
     /// The switch for checking for updates.
     CheckUpdates,
+    /// The switch for the clipboard history.
+    ClipboardHistory,
 }
 
 /// What the window shows.
