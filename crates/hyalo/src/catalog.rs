@@ -15,6 +15,7 @@ use windows::core::Result;
 
 use crate::apps::{self, Icon};
 use crate::com::Com;
+use crate::results::MAX_ROWS;
 
 /// One piece of what a provider found.
 pub enum Found {
@@ -66,6 +67,11 @@ pub type Provider = Arc<dyn Fn(&Request, &dyn Fn(Found)) + Send + Sync>;
 /// square, on a thread of its own, reporting each as `Found::Icon`.
 pub type FileIcons = Arc<dyn Fn(&[ItemId], u32, &dyn Fn(Found)) + Send + Sync>;
 
+/// How many files' and folders' icons the window keeps: those listed now
+/// and the ones listed most recently before them, 32 full lists. Icons
+/// are 32 to 64 pixels square, so at most 4 MB.
+pub const KEPT_FILE_ICONS: usize = 32 * MAX_ROWS;
+
 /// The items to search and the icons found for them so far.
 #[derive(Default)]
 pub struct Catalog {
@@ -84,6 +90,9 @@ pub struct Catalog {
     pub rates: Option<Rates>,
     /// The open windows the switcher lists, front first.
     pub windows: Vec<Item>,
+    /// The files and folders listed lately, the latest first: those whose
+    /// icons were asked for or are kept.
+    lately: Vec<ItemId>,
 }
 
 impl Catalog {
@@ -122,6 +131,25 @@ impl Catalog {
             self.icons.remove(&id);
         }
         self.windows = windows;
+    }
+
+    /// Notes the files and folders `listed` now as the latest listed. The
+    /// icons of those listed least recently beyond `kept` in all go, and
+    /// those files count as never listed; the ones listed now stay. The
+    /// files whose icons to ask for: listed anew, with none here yet.
+    pub fn list_files(&mut self, listed: Vec<ItemId>, kept: usize) -> Vec<ItemId> {
+        let anew = listed.iter().filter(|id| !self.lately.contains(id));
+        let wanted = anew
+            .filter(|id| !self.icons.contains_key(id))
+            .cloned()
+            .collect();
+        self.lately.retain(|id| !listed.contains(id));
+        let others = kept.saturating_sub(listed.len()).min(self.lately.len());
+        for id in self.lately.split_off(others) {
+            self.icons.remove(&id);
+        }
+        self.lately.splice(0..0, listed);
+        wanted
     }
 
     /// Remembers a picked file or folder, once.
@@ -300,6 +328,91 @@ mod tests {
         assert!(catalog.icons.contains_key(&two.id), "still open");
         assert!(catalog.icons.contains_key(&app("Paint").id), "not a window");
         assert_eq!(catalog.items, [app("Paint")]);
+    }
+
+    fn files(names: &[&str]) -> Vec<ItemId> {
+        let path = |name: &&str| ItemId(format!(r"C:\{name}"));
+        names.iter().map(path).collect()
+    }
+
+    /// Lists the files `names` in `catalog`, which keeps the icons of
+    /// `kept`; each icon asked for comes at once. The names asked for.
+    fn list(catalog: &mut Catalog, names: &[&str], kept: usize) -> Vec<String> {
+        let asked = catalog.list_files(files(names), kept);
+        for id in &asked {
+            catalog.take(Found::Icon(id.clone(), dot()));
+        }
+        asked.iter().map(|id| id.0[3..].to_string()).collect()
+    }
+
+    const NONE: [&str; 0] = [];
+
+    #[test]
+    fn a_files_icon_is_asked_for_once_while_it_is_kept() {
+        let mut catalog = Catalog::default();
+        assert_eq!(list(&mut catalog, &["a", "b"], 4), ["a", "b"]);
+        assert_eq!(list(&mut catalog, &["b", "c"], 4), ["c"]);
+        assert_eq!(list(&mut catalog, &["c", "a", "b"], 4), NONE);
+        assert_eq!(catalog.icons.len(), 3);
+    }
+
+    #[test]
+    fn an_icon_still_coming_is_not_asked_for_again() {
+        let mut catalog = Catalog::default();
+        assert_eq!(catalog.list_files(files(&["a"]), 2), files(&["a"]));
+        assert_eq!(catalog.list_files(files(&["a"]), 2), files(&[]));
+    }
+
+    #[test]
+    fn beyond_the_bound_the_files_listed_least_recently_lose_their_icons_till_listed_again() {
+        let mut catalog = Catalog::default();
+        list(&mut catalog, &["a", "b"], 3);
+        list(&mut catalog, &["c"], 3);
+        list(&mut catalog, &["a"], 3);
+        assert_eq!(list(&mut catalog, &["d"], 3), ["d"]);
+        assert!(
+            !catalog.icons.contains_key(&files(&["b"])[0]),
+            "listed least recently"
+        );
+        assert_eq!(catalog.icons.len(), 3);
+        assert_eq!(list(&mut catalog, &["d", "c", "a"], 3), NONE, "kept");
+        assert_eq!(list(&mut catalog, &["b"], 3), ["b"], "asked for again");
+    }
+
+    #[test]
+    fn files_listed_now_keep_their_icons_whatever_the_bound() {
+        let mut catalog = Catalog::default();
+        list(&mut catalog, &["a"], 2);
+        assert_eq!(list(&mut catalog, &["b", "c", "d"], 2), ["b", "c", "d"]);
+        assert_eq!(catalog.icons.len(), 3, "a's went");
+        assert_eq!(list(&mut catalog, &["d", "c", "b"], 2), NONE);
+    }
+
+    #[test]
+    fn only_icons_of_files_go() {
+        let mut catalog = Catalog::default();
+        let paint = app("Paint").id;
+        catalog.take(Found::Icon(paint.clone(), dot()));
+        list(&mut catalog, &["a"], 1);
+        list(&mut catalog, &["b"], 1);
+        assert!(catalog.icons.contains_key(&paint));
+        assert_eq!(catalog.icons.len(), 2);
+    }
+
+    /// Such as one that came after its file had gone from the list.
+    #[test]
+    fn a_files_icon_already_there_is_not_asked_for_and_goes_like_the_others() {
+        let mut catalog = Catalog::default();
+        catalog.take(Found::Icon(files(&["a"])[0].clone(), dot()));
+        assert_eq!(list(&mut catalog, &["a"], 1), NONE);
+        list(&mut catalog, &["b"], 1);
+        assert!(!catalog.icons.contains_key(&files(&["a"])[0]));
+    }
+
+    #[test]
+    fn the_files_icons_kept_take_4_mb_at_most_at_200_percent() {
+        let side = crate::layout::icon_pixels(192) as usize;
+        assert_eq!(KEPT_FILE_ICONS * side * side * 4, 4 << 20);
     }
 
     #[test]
