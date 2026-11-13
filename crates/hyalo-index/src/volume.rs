@@ -44,6 +44,36 @@ impl Volume {
         let links: usize = self.links.values().map(|links| 8 + 4 * links.len()).sum();
         self.records.capacity() * size_of::<u32>() + links
     }
+
+    /// The volume whose root is `root`, its records mapped back to the
+    /// entries `found` pairs with them, as noting each record in turn
+    /// maps them: a record's lowest entry first, its other names after,
+    /// lowest first. In one pass, with no sort and no room asked for a
+    /// record with one name, which is nearly every record.
+    fn mapped(root: u32, found: &[(u32, u32)], position: Option<Position>) -> Volume {
+        let size = found.iter().map(|&(record, _)| record as usize + 1).max();
+        let mut records = vec![NONE; size.unwrap_or(0)];
+        let mut links: HashMap<u32, Vec<u32>> = HashMap::new();
+        for &(record, entry) in found {
+            let first = &mut records[record as usize];
+            match *first {
+                NONE => *first = entry,
+                _ => links.entry(record).or_default().push(entry),
+            }
+        }
+        for (&record, others) in &mut links {
+            let first = &mut records[record as usize];
+            others.push(*first);
+            others.sort_unstable();
+            *first = others.remove(0);
+        }
+        Volume {
+            root,
+            records,
+            links,
+            position,
+        }
+    }
 }
 
 impl Index {
@@ -318,12 +348,7 @@ impl Index {
         if found.is_empty() && position.is_none() {
             return;
         }
-        found.sort_unstable();
-        for links in found.chunk_by(|one, other| one.0 == other.0) {
-            let entries: Vec<u32> = links.iter().map(|&(_, at)| at).collect();
-            self.remember(root, links[0].0, &entries);
-        }
-        self.volume_mut(root).position = position;
+        *self.volume_mut(root) = Volume::mapped(root, &found, position);
     }
 
     /// Maps every root's records, with the positions saved for them;
@@ -783,5 +808,27 @@ mod tests {
         walked.settle(c, &gone(97)).unwrap();
         assert!(!found(&walked, r"C:\Users\a"), "every link's entry known");
         assert!(!found(&walked, r"C:\Windows\b"));
+    }
+
+    #[test]
+    fn a_volume_is_mapped_in_one_go_as_record_by_record() {
+        // Record 3's three names come out of order; 7 and 9 have one each.
+        let found = [(7, 20), (3, 12), (3, 5), (9, 1), (3, 30)];
+        let volume = Volume::mapped(4, &found, Some(position(8)));
+        let records = [NONE, NONE, NONE, 5, NONE, NONE, NONE, 20, NONE, 1];
+        assert_eq!(volume.records, records, "each record's lowest entry");
+        assert_eq!(volume.links, HashMap::from([(3, vec![12, 30])]));
+        assert_eq!((volume.root, volume.position), (4, Some(position(8))));
+        let none = Volume::mapped(4, &[], None);
+        assert!(none.records.is_empty() && none.links.is_empty());
+    }
+
+    #[test]
+    fn a_volume_counts_the_room_its_hard_links_take() {
+        // Four places for records 0 to 3; then two more names of record 3.
+        let one = Volume::mapped(4, &[(3, 5)], None);
+        assert_eq!(one.memory(), 4 * 4);
+        let linked = Volume::mapped(4, &[(3, 5), (3, 6), (3, 7)], None);
+        assert_eq!(linked.memory(), 4 * 4 + 8 + 2 * 4);
     }
 }
