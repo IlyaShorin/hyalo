@@ -4,7 +4,7 @@ A fast, glassy Spotlight-style launcher for Windows 11. Press a hotkey, type a f
 
 *hyalo* comes from Greek ὕαλος, "glass".
 
-> **Status:** 0.2.7, with all of v0.1 and v0.2 below: finds and opens apps, files and folders (kept current as they change, narrowed by filters), Windows' own settings pages and Control Panel items, answers arithmetic, converts currencies, searches the web, switches windows, lists what you copied under the empty search bar to copy it again, uninstalls apps, locks, restarts or shuts down the PC (asking first); lives in the tray, with a TOML config applied as you save it and a settings window that edits it; speaks English or Russian; updates itself from GitHub Releases. Download `hyalo.exe` from the latest release and run it: it installs itself.
+> **Status:** 0.2.8, with all of v0.1 and v0.2 below: finds and opens apps, files and folders (kept current as they change, narrowed by filters), Windows' own settings pages and Control Panel items, answers arithmetic, converts currencies, searches the web, switches windows, lists what you copied under the empty search bar to copy it again, uninstalls apps, locks, restarts or shuts down the PC (asking first); lives in the tray, with a TOML config applied as you save it and a settings window that edits it; speaks English or Russian; updates itself from GitHub Releases. Download `hyalo.exe` from the latest release and run it: it installs itself.
 
 ## Goals
 
@@ -51,7 +51,7 @@ The launcher never runs elevated. Only the indexer service does, because MFT acc
 - Uninstall an app from its row: Shift+Delete, then Enter
 - A menu on every row (right click, the Menu key or Shift+F10): what the row can do, each with the keys that do it
 
-**After 0.2.7** (done, not released yet)
+**In 0.2.8**
 - Clipboard history under the empty search bar: text, pictures and files, kept in memory only; Enter copies an entry again
 
 **Later**
