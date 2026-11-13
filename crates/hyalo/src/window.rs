@@ -2188,20 +2188,19 @@ mod tests {
     use windows::Win32::Foundation::RECT;
     use windows::Win32::Graphics::Dwm::DwmGetWindowAttribute;
     use windows::Win32::Graphics::Gdi::MonitorFromWindow;
-    use windows::Win32::System::Threading::GetCurrentThreadId;
     use windows::Win32::UI::Input::KeyboardAndMouse::{
         SetKeyboardState, VK_A, VK_BACK, VK_C, VK_DELETE, VK_DOWN, VK_END, VK_ESCAPE, VK_F10,
         VK_HOME, VK_LEFT, VK_RETURN, VK_RIGHT, VK_UP, VK_V, VK_X,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
-        EndMenu, FindWindowExW, GW_HWNDPREV, GetClientRect, GetCursor, GetWindow, GetWindowRect,
-        IsWindow, KillTimer, PM_QS_POSTMESSAGE, PM_REMOVE, PeekMessageW, SW_SHOWNOACTIVATE,
-        SendMessageW, SetTimer, WA_ACTIVE, WM_CLOSE, WM_NULL, WM_QUIT, WM_RBUTTONDOWN,
-        WM_RBUTTONUP,
+        EndMenu, GW_HWNDPREV, GetClientRect, GetCursor, GetWindow, GetWindowRect, IsWindow,
+        KillTimer, PM_QS_POSTMESSAGE, PM_REMOVE, PeekMessageW, SW_SHOWNOACTIVATE, SendMessageW,
+        SetTimer, WA_ACTIVE, WM_CLOSE, WM_NULL, WM_QUIT, WM_RBUTTONDOWN, WM_RBUTTONUP,
     };
 
     use super::*;
     use crate::autostart;
+    use crate::popup::tests::menu_up;
     use crate::render::Frame;
     use crate::scratch::Scratch;
     use crate::test_desktop::{
@@ -5316,19 +5315,6 @@ mod tests {
         /// was still shown, and where the menu was.
         static IN_MENU: RefCell<Option<(bool, RECT)>> = const { RefCell::new(None) };
         static TICKS: RefCell<u32> = const { RefCell::new(0) };
-    }
-
-    /// The popup menu this thread has up, if any.
-    fn menu_up() -> Option<HWND> {
-        let mut after = None;
-        loop {
-            let menu = unsafe { FindWindowExW(None, after, w!("#32768"), PCWSTR::null()) }.ok()?;
-            let thread = unsafe { GetWindowThreadProcessId(menu, None) };
-            if thread == unsafe { GetCurrentThreadId() } {
-                return Some(menu);
-            }
-            after = Some(menu);
-        }
     }
 
     /// Ticks inside the real menu's own message loop: once the menu is

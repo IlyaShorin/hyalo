@@ -118,11 +118,27 @@ fn flags<C>(entry: &Entry<C>) -> MENU_ITEM_FLAGS {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+    use windows::Win32::System::Threading::GetCurrentThreadId;
     use windows::Win32::UI::WindowsAndMessaging::{
-        GetMenuItemCount, GetMenuItemID, GetMenuState, GetMenuStringW, MF_BYPOSITION,
+        FindWindowExW, GetMenuItemCount, GetMenuItemID, GetMenuState, GetMenuStringW,
+        GetWindowThreadProcessId, MF_BYPOSITION,
     };
+    use windows::core::w;
+
+    /// The popup menu this thread has up, if any.
+    pub fn menu_up() -> Option<HWND> {
+        let mut after = None;
+        loop {
+            let menu = unsafe { FindWindowExW(None, after, w!("#32768"), PCWSTR::null()) }.ok()?;
+            let thread = unsafe { GetWindowThreadProcessId(menu, None) };
+            if thread == unsafe { GetCurrentThreadId() } {
+                return Some(menu);
+            }
+            after = Some(menu);
+        }
+    }
 
     /// The menu Win32 holds: each item's label, or `None` for a
     /// separator, with its id and whether it is checked and grayed.
