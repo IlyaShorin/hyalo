@@ -24,6 +24,7 @@ mod picker;
 mod picture;
 mod popup;
 mod rates;
+mod recent;
 mod recorder;
 mod registry;
 mod render;

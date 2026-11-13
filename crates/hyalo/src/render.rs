@@ -14,7 +14,6 @@
 //! used only from the UI thread that created it.
 
 use std::borrow::Cow;
-use std::collections::HashMap;
 use std::ops::Range;
 
 use hyalo_core::item::ItemId;
@@ -23,6 +22,7 @@ use windows::Win32::Graphics::Direct2D::Common::{D2D_RECT_F, D2D_SIZE_U, D2D1_CO
 use windows::Win32::Graphics::Direct2D::{
     D2D1_ANTIALIAS_MODE_ALIASED, D2D1_BITMAP_OPTIONS_NONE, D2D1_BITMAP_PROPERTIES1, D2D1_ELLIPSE,
     D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC, D2D1_ROUNDED_RECT, ID2D1Bitmap1,
+    ID2D1DeviceContext,
 };
 use windows::Win32::Graphics::DirectWrite::{
     DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_TEXT_ALIGNMENT_CENTER,
@@ -34,6 +34,7 @@ use windows_numerics::Vector2;
 use crate::apps::Icon;
 use crate::field;
 use crate::layout::{BAR_HEIGHT, ICON_SIZE, ROW_HEIGHT, TEXT_LEFT, TEXT_RIGHT_PAD, row_top};
+use crate::recent::Recent;
 use crate::surface::{
     Behind, DISPLAY_FONT, Family, PREMULTIPLIED_BGRA, SELECTED_TEXT, Surface, TEXT_FONT, caret_x,
     hit, line_width, rgba, text_format, trimmed,
@@ -95,6 +96,11 @@ const SUBTITLE_LINE: (f32, f32) = (25.0, 18.0);
 /// The selected row's highlight: inset from the window's sides, radius.
 const SELECTION_INSET: f32 = 6.0;
 const SELECTION_RADIUS: f32 = 6.0;
+/// How many icons stay on the GPU: those of the rows drawn last, then the
+/// ones drawn before them. Eight full lists, so typing through a few
+/// queries and back uploads nothing again; at 200 % (icons of 64 px) they
+/// hold 1 MB.
+const KEPT_ICONS: usize = 64;
 
 /// Darkens the acrylic slightly so white text keeps its contrast.
 const TINT: D2D1_COLOR_F = rgba(0.06, 0.06, 0.08, 0.28);
@@ -117,8 +123,9 @@ const ASKING_TEXT: D2D1_COLOR_F = rgba(1.0, 0.78, 0.36, 0.95);
 pub struct Renderer {
     surface: Surface,
     fonts: Fonts,
-    /// Icons already on the GPU, by item.
-    icons: HashMap<ItemId, ID2D1Bitmap1>,
+    /// Icons already on the GPU, by item: the most recently drawn,
+    /// `KEPT_ICONS` at most.
+    icons: Recent<ItemId, ID2D1Bitmap1>,
     /// How far the query is scrolled left, in DIPs, so its caret shows.
     scroll: f32,
 }
@@ -140,7 +147,7 @@ impl Renderer {
         Ok(Self {
             surface,
             fonts,
-            icons: HashMap::new(),
+            icons: Recent::new(KEPT_ICONS),
             scroll: 0.0,
         })
     }
@@ -430,30 +437,10 @@ impl Renderer {
         self.surface.draw_text(&layout, ICON_LEFT, y, GLYPH)
     }
 
-    /// The icon as a Direct2D bitmap, uploaded the first time it is drawn.
+    /// The icon as a Direct2D bitmap, uploaded unless it is still kept.
     fn icon_bitmap(&mut self, id: &ItemId, icon: &Icon) -> Result<ID2D1Bitmap1> {
-        if let Some(bitmap) = self.icons.get(id) {
-            return Ok(bitmap.clone());
-        }
-        let size = D2D_SIZE_U {
-            width: icon.width,
-            height: icon.height,
-        };
-        let props = D2D1_BITMAP_PROPERTIES1 {
-            pixelFormat: PREMULTIPLIED_BGRA,
-            bitmapOptions: D2D1_BITMAP_OPTIONS_NONE,
-            ..Default::default()
-        };
-        let pixels = Some(icon.bgra.as_ptr().cast());
-        // SAFETY: `pixels` holds `height` rows of `width * 4` bytes, which
-        // CreateBitmap copies before it returns.
-        let bitmap = unsafe {
-            self.surface
-                .dc
-                .CreateBitmap(size, pixels, icon.width * 4, &props)?
-        };
-        self.icons.insert(id.clone(), bitmap.clone());
-        Ok(bitmap)
+        let dc = &self.surface.dc;
+        self.icons.get_or_make(id, || upload(dc, icon))
     }
 
     /// Marks the matched letters: semibold, in the accent colour.
@@ -486,6 +473,23 @@ impl Fonts {
             glyph: centred(text_format(dwrite, GLYPH_FONT, GLYPH_SIZE, normal)?)?,
         })
     }
+}
+
+/// `icon` on the GPU, as a bitmap `dc` draws.
+fn upload(dc: &ID2D1DeviceContext, icon: &Icon) -> Result<ID2D1Bitmap1> {
+    let size = D2D_SIZE_U {
+        width: icon.width,
+        height: icon.height,
+    };
+    let props = D2D1_BITMAP_PROPERTIES1 {
+        pixelFormat: PREMULTIPLIED_BGRA,
+        bitmapOptions: D2D1_BITMAP_OPTIONS_NONE,
+        ..Default::default()
+    };
+    let pixels = Some(icon.bgra.as_ptr().cast());
+    // SAFETY: `pixels` holds `height` rows of `width * 4` bytes, which
+    // CreateBitmap copies before it returns.
+    unsafe { dc.CreateBitmap(size, pixels, icon.width * 4, &props) }
 }
 
 /// Text centred across its layout's width too.
@@ -624,52 +628,98 @@ mod tests {
         }
     }
 
+    /// The ids of the rows found for "note".
+    fn note_ids() -> [ItemId; 3] {
+        ["notepad", "sticky", "long"].map(|id| ItemId(id.to_string()))
+    }
+
+    /// The icons of the first two rows found for "note": a blue disc and a
+    /// green one, 48 px for 150 %.
+    fn note_icons() -> [Icon; 2] {
+        [disc(48, [240, 160, 40]), disc(48, [90, 200, 80])]
+    }
+
+    /// Three rows found for "note", the second selected.
+    fn note<'a>(ids: &'a [ItemId; 3], [blue, green]: &'a [Icon; 2]) -> Scene<'a> {
+        let rows = vec![
+            Row {
+                id: &ids[0],
+                title: "Notepad",
+                subtitle: "App".into(),
+                highlights: utf16_ranges("Notepad", &[0, 1, 2, 3]),
+                icon: Some(blue),
+                glyph: None,
+            },
+            Row {
+                id: &ids[1],
+                title: "Sticky Notes",
+                subtitle: "App".into(),
+                highlights: utf16_ranges("Sticky Notes", &[7, 8, 9, 10]),
+                icon: Some(green),
+                glyph: None,
+            },
+            Row {
+                id: &ids[2],
+                title: "A name so long that it cannot fit in the window and has to end in an ellipsis just before the right edge",
+                subtitle: r"C:\Program Files\Some Vendor\Some Product\a path long enough that it, too, has to be cut short with an ellipsis\bin\app.exe".into(),
+                highlights: Vec::new(),
+                icon: None,
+                glyph: None,
+            },
+        ];
+        Scene {
+            rows,
+            selected: 1,
+            ..Scene::bar("note")
+        }
+    }
+
     #[test]
     fn lists_rows_under_the_bar_at_150_percent() {
         on_hidden_desktop(|| {
-            let ids = ["notepad", "sticky", "long"].map(|id| ItemId(id.to_string()));
-            let (blue, green) = (disc(48, [240, 160, 40]), disc(48, [90, 200, 80]));
-            let rows = || {
-                vec![
-                    Row {
-                        id: &ids[0],
-                        title: "Notepad",
-                        subtitle: "App".into(),
-                        highlights: utf16_ranges("Notepad", &[0, 1, 2, 3]),
-                        icon: Some(&blue),
-                        glyph: None,
-                    },
-                    Row {
-                        id: &ids[1],
-                        title: "Sticky Notes",
-                        subtitle: "App".into(),
-                        highlights: utf16_ranges("Sticky Notes", &[7, 8, 9, 10]),
-                        icon: Some(&green),
-                        glyph: None,
-                    },
-                    Row {
-                        id: &ids[2],
-                        title: "A name so long that it cannot fit in the window and has to end in an ellipsis just before the right edge",
-                        subtitle: r"C:\Program Files\Some Vendor\Some Product\a path long enough that it, too, has to be cut short with an ellipsis\bin\app.exe".into(),
-                        highlights: Vec::new(),
-                        icon: None,
-                        glyph: None,
-                    },
-                ]
-            };
+            let (ids, icons) = (note_ids(), note_icons());
             let canvas = Canvas::new();
             let mut renderer =
                 Renderer::new(canvas.0, 1080, 336, 144, Behind::Glass).expect("a renderer");
             for _ in 0..2 {
-                let scene = Scene {
-                    rows: rows(),
-                    selected: 1,
-                    ..Scene::bar("note")
-                };
-                renderer.draw(&scene).expect("draw");
+                renderer.draw(&note(&ids, &icons)).expect("draw");
                 let frame = renderer.read_frame().expect("read the frame back");
                 assert_looks_like("list-150", &frame);
             }
+        });
+    }
+
+    #[test]
+    fn icons_of_rows_drawn_long_ago_leave_the_gpu_and_come_back_when_drawn_again() {
+        on_hidden_desktop(|| {
+            let (ids, icons) = (note_ids(), note_icons());
+            let canvas = Canvas::new();
+            let mut renderer =
+                Renderer::new(canvas.0, 1080, 336, 144, Behind::Glass).expect("a renderer");
+            renderer.draw(&note(&ids, &icons)).expect("draw");
+            // As many windows as the renderer keeps icons of, each opened
+            // and listed once, then closed: a new id each.
+            for handle in 0..KEPT_ICONS {
+                let id = ItemId(format!("hyalo:window:{handle}"));
+                let scene = Scene {
+                    rows: vec![Row {
+                        id: &id,
+                        title: "notes.txt - Notepad",
+                        subtitle: "Notepad".into(),
+                        highlights: Vec::new(),
+                        icon: Some(&icons[0]),
+                        glyph: None,
+                    }],
+                    selected: 0,
+                    ..Scene::bar(">")
+                };
+                renderer.draw(&scene).expect("draw a window");
+            }
+            assert_eq!(renderer.icons.len(), KEPT_ICONS, "the latest windows'");
+            renderer.draw(&note(&ids, &icons)).expect("draw again");
+            let frame = renderer.read_frame().expect("read the frame back");
+            assert_looks_like("list-150", &frame);
+            assert_eq!(renderer.icons.len(), KEPT_ICONS, "two windows' fewer");
         });
     }
 
