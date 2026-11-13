@@ -200,3 +200,21 @@ impl Made {
         record
     }
 }
+
+/// The runs that say a value lies in `extents`, each where it starts on
+/// the volume and how many clusters.
+pub fn runs_bytes(extents: &[(u64, u64)]) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    let mut before = 0_i64;
+    for &(lcn, clusters) in extents {
+        let place = lcn as i64 - before;
+        before = lcn as i64;
+        let length = clusters.to_le_bytes();
+        let place = place.to_le_bytes();
+        bytes.push(8 << 4 | 8);
+        bytes.extend(length);
+        bytes.extend(place);
+    }
+    bytes.push(0);
+    bytes
+}

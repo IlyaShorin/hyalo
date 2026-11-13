@@ -59,4 +59,66 @@ fn records(answer: &[u8]) -> impl Iterator<Item = u32> + '_ {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod build;
+
+#[cfg(test)]
+mod tests {
+    use super::build::{answer, change};
+    use super::*;
+
+    #[test]
+    fn a_read_of_the_journal_says_which_files_changed_each_once() {
+        let read = answer(
+            4096,
+            &[
+                change(70, 5, "new folder"),
+                change(71, 70, "a.txt"),
+                change(70, 5, "renamed"),
+                change(72, 70, "b.txt"),
+                change(71, 70, "a.txt"),
+            ],
+        );
+        assert_eq!(changed(&read), Some((4096, vec![70, 71, 72])));
+    }
+
+    #[test]
+    fn a_read_with_nothing_new_says_where_to_read_on() {
+        assert_eq!(changed(&answer(77, &[])), Some((77, vec![])));
+        assert_eq!(changed(&[1, 2, 3]), None, "no place");
+    }
+
+    #[test]
+    fn a_record_of_another_version_is_passed_over() {
+        let mut third = change(80, 5, "v3");
+        third[4..6].copy_from_slice(&3_u16.to_le_bytes());
+        let read = answer(9, &[third, change(81, 5, "v2")]);
+        assert_eq!(changed(&read), Some((9, vec![81])));
+    }
+
+    #[test]
+    fn a_record_that_does_not_fit_ends_the_read() {
+        let mut cut = change(90, 5, "cut");
+        cut[0..4].copy_from_slice(&4000_u32.to_le_bytes());
+        let read = answer(9, &[change(91, 5, "kept"), cut, change(92, 5, "after")]);
+        assert_eq!(changed(&read), Some((9, vec![91])));
+        let mut empty = change(93, 5, "nothing");
+        empty[0..4].copy_from_slice(&0_u32.to_le_bytes());
+        let read = answer(9, &[change(94, 5, "kept"), empty]);
+        assert_eq!(changed(&read), Some((9, vec![94])), "no length: no loop");
+        let short = answer(9, &[change(95, 5, "kept")[..40].to_vec()]);
+        assert_eq!(changed(&short), Some((9, vec![])), "shorter than a record");
+    }
+
+    #[test]
+    fn a_record_beyond_the_index_s_numbers_is_passed_over() {
+        let mut huge = change(0, 5, "far");
+        huge[8..16].copy_from_slice(&((1_u64 << 40) | 1).to_le_bytes());
+        let read = answer(9, &[huge, change(96, 5, "near")]);
+        assert_eq!(changed(&read), Some((9, vec![96])));
+    }
+
+    #[test]
+    fn the_reasons_asked_for_are_those_that_change_what_the_index_holds() {
+        assert_eq!(REASONS, 0x1_b307);
+    }
+}
