@@ -3,6 +3,8 @@
 //! gave, and checks them where they come in, since names are anyone's to
 //! choose and this runs with the rights of the system.
 
+use crate::bytes::{i64_at, number, u16_at, u32_at, u64_at};
+
 /// Bytes of a record each entry of its update sequence stands for: NTFS's
 /// own sector, whatever the disk's.
 const STRIDE: usize = 512;
@@ -20,10 +22,6 @@ const DIRECTORY: u16 = 2;
 
 /// The namespace of a short 8.3 name kept beside the long one.
 const DOS: u8 = 2;
-
-/// A file reference: the record's number in its low 48 bits, the
-/// record's sequence number above them.
-const NUMBER: u64 = 0xFFFF_FFFF_FFFF;
 
 /// What the index needs of a record that holds a file or a folder.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -170,11 +168,6 @@ fn listed(value: &[u8]) -> Vec<u32> {
         at += length as usize;
     }
     records
-}
-
-/// The record number a file reference holds, if it fits the index's.
-fn number(reference: u64) -> Option<u32> {
-    u32::try_from(reference & NUMBER).ok()
 }
 
 /// One attribute of a record.
@@ -456,22 +449,6 @@ impl Table {
             })
             .collect()
     }
-}
-
-fn u16_at(bytes: &[u8], at: usize) -> Option<u16> {
-    Some(u16::from_le_bytes(bytes.get(at..at + 2)?.try_into().ok()?))
-}
-
-fn u32_at(bytes: &[u8], at: usize) -> Option<u32> {
-    Some(u32::from_le_bytes(bytes.get(at..at + 4)?.try_into().ok()?))
-}
-
-fn u64_at(bytes: &[u8], at: usize) -> Option<u64> {
-    Some(u64::from_le_bytes(bytes.get(at..at + 8)?.try_into().ok()?))
-}
-
-fn i64_at(bytes: &[u8], at: usize) -> Option<i64> {
-    Some(i64::from_le_bytes(bytes.get(at..at + 8)?.try_into().ok()?))
 }
 
 #[cfg(test)]

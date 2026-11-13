@@ -7,4 +7,6 @@
 //! write in a few seconds. The USN journal then says which files changed,
 //! and the table is read again for those alone.
 
+mod bytes;
 pub mod mft;
+pub mod usn;
