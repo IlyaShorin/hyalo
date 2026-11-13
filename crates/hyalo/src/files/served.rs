@@ -511,9 +511,13 @@ mod tests {
     /// the launcher to take the listing in, as it does at a first start.
     /// Talks to the real service, so it runs only when asked:
     /// `cargo test --release -p hyalo -- --ignored --nocapture service_lists`.
+    /// With `HYALO_BENCH_SNAPSHOT` naming a file, it saves there the index
+    /// of every drive listed, as the launcher saves it, for
+    /// `cargo bench -p hyalo-index` to load and search.
     #[test]
     #[ignore]
     fn service_lists_the_fixed_drives() {
+        let mut whole = Index::default();
         for root in crate::files::fixed_drives() {
             let started = Instant::now();
             let mut stream = Service.follow(&root, None).expect("the service follows it");
@@ -548,6 +552,16 @@ mod tests {
             println!(
                 "{name}: {sent} sent, {} in the index, {memory} MiB; listing began after {first:.2?}, all in {took:.2?}",
                 index.len()
+            );
+            whole.replace(&index);
+        }
+        if let Some(path) = std::env::var_os("HYALO_BENCH_SNAPSHOT") {
+            crate::files::save(&whole, Path::new(&path)).expect("saved");
+            println!(
+                "{} entries, {} MiB, saved to {}",
+                whole.len(),
+                whole.memory() >> 20,
+                Path::new(&path).display()
             );
         }
     }
