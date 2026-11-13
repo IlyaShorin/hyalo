@@ -285,6 +285,16 @@ table! {
     PickExclude => "Leave a folder out of the index", "Папка, которую не индексировать";
     PickLower => "Rank a folder lower", "Папка, файлы из которой показывать ниже";
     PickHigher => "Rank a folder higher", "Папка, файлы из которой показывать выше";
+    FileIndex => "File index", "Индекс файлов";
+    IndexerService => "Indexer service", "Служба индекса";
+    IndexerMissing => "Builds the index in seconds from the NTFS table; installed once, with an administrator's rights. Without it hyalo walks the folders",
+        "Строит индекс за секунды, читая таблицу NTFS; ставится один раз, с правами администратора. Без неё hyalo обходит папки";
+    IndexerInstalled => "Installed: files come from the NTFS table and its journal",
+        "Установлена: файлы приходят из таблицы NTFS и её журнала";
+    IndexerBusy => "Waiting for the administrator's yes", "Ждём разрешения администратора";
+    IndexerFailed => "It did not go: Windows refused, or the prompt was declined",
+        "Не вышло: Windows отказала или запрос отклонён";
+    Remove => "Remove", "Удалить";
     Updates => "Updates", "Обновления";
     /// The version that runs.
     InstallHelp => "You have {0}: Install downloads it, checks it and restarts hyalo",

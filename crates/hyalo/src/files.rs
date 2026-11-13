@@ -221,7 +221,7 @@ impl Recheck {
     }
 
     /// Whether it was asked since it last said so.
-    fn taken(&self) -> bool {
+    pub(crate) fn taken(&self) -> bool {
         self.0.swap(false, Ordering::SeqCst)
     }
 }

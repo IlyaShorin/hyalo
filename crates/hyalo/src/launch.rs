@@ -9,13 +9,13 @@ use std::path::Path;
 use hyalo_core::item::Action;
 use hyalo_core::uninstall::Uninstall;
 use windows::Win32::Foundation::{CloseHandle, ERROR_FILE_NOT_FOUND, HANDLE};
-use windows::Win32::System::Threading::{INFINITE, WaitForSingleObject};
+use windows::Win32::System::Threading::{GetExitCodeProcess, INFINITE, WaitForSingleObject};
 use windows::Win32::UI::Shell::{
     ASSOCF_INIT_IGNOREUNKNOWN, ASSOCSTR_EXECUTABLE, AssocQueryStringW, ILCreateFromPathW, ILFree,
     SEE_MASK_DEFAULT, SEE_MASK_FLAG_NO_UI, SEE_MASK_NOASYNC, SEE_MASK_NOCLOSEPROCESS,
     SHELLEXECUTEINFOW, SHOpenFolderAndSelectItems, ShellExecuteExW,
 };
-use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+use windows::Win32::UI::WindowsAndMessaging::{SHOW_WINDOW_CMD, SW_HIDE, SW_SHOWNORMAL};
 use windows::core::{HSTRING, PCWSTR, Result, w};
 
 use crate::clipboard::{copy, put};
@@ -154,21 +154,48 @@ fn uninstall_with(program: &str, arguments: &str, as_admin: bool) -> Result<()> 
         program,
         Some(arguments),
         verb(as_admin),
-        SEE_MASK_NOCLOSEPROCESS,
+        (SEE_MASK_NOCLOSEPROCESS, SW_SHOWNORMAL),
     )?;
     wait(process)
+}
+
+/// Starts `program` with `arguments`, hidden, as administrator when asked
+/// (the UAC prompt asks the user), and waits until it ends: its exit
+/// code. Call it off the UI thread.
+pub fn waited(program: &str, arguments: &str, as_admin: bool) -> Result<u32> {
+    let mask = (SEE_MASK_NOCLOSEPROCESS, SW_HIDE);
+    let process = started(program, Some(arguments), verb(as_admin), mask)?;
+    let code = exit_code(process);
+    wait(process)?;
+    code
+}
+
+/// The exit code of `process`, once it has ended.
+fn exit_code(process: HANDLE) -> Result<u32> {
+    let mut code = 0;
+    // SAFETY: the handle is ours, alive until `wait` closes it.
+    unsafe {
+        WaitForSingleObject(process, INFINITE);
+        GetExitCodeProcess(process, &mut code)?;
+    }
+    Ok(code)
 }
 
 /// Has the shell carry out `verb` (none: the usual one) on `file`, with
 /// `argument` if it is a program.
 fn execute(file: &str, argument: Option<&str>, verb: PCWSTR) -> Result<()> {
-    started(file, argument, verb, SEE_MASK_DEFAULT).map(drop)
+    started(file, argument, verb, (SEE_MASK_DEFAULT, SW_SHOWNORMAL)).map(drop)
 }
 
-/// The same, with `mask` besides the usual flags; the process the shell
-/// started, when `mask` asks to keep it and there is one, else a null
-/// handle.
-fn started(file: &str, argument: Option<&str>, verb: PCWSTR, mask: u32) -> Result<HANDLE> {
+/// The same, with `mask` besides the usual flags, shown as `show` says;
+/// the process the shell started, when `mask` asks to keep it and there
+/// is one, else a null handle.
+fn started(
+    file: &str,
+    argument: Option<&str>,
+    verb: PCWSTR,
+    (mask, show): (u32, SHOW_WINDOW_CMD),
+) -> Result<HANDLE> {
     let _com = Com::init()?;
     let file = HSTRING::from(file);
     let argument = argument.map(HSTRING::from);
@@ -181,7 +208,7 @@ fn started(file: &str, argument: Option<&str>, verb: PCWSTR, mask: u32) -> Resul
         lpParameters: argument
             .as_ref()
             .map_or(PCWSTR::null(), |argument| PCWSTR(argument.as_ptr())),
-        nShow: SW_SHOWNORMAL.0,
+        nShow: show.0,
         ..Default::default()
     };
     // SAFETY: `info` and the strings it points to outlive the call.
@@ -213,6 +240,18 @@ mod tests {
         let missing = r"shell:AppsFolder\hyalo.test.no-such-app";
         let error = run(&Action::Open(missing.to_string()), false).expect_err("no such app");
         assert_ne!(error.code(), E_NOTIMPL);
+    }
+
+    #[test]
+    fn a_program_waited_for_says_how_it_ended() {
+        let cmd = std::env::var("ComSpec").expect("ComSpec is set");
+        assert_eq!(waited(&cmd, "/c exit 3", false).expect("ran"), 3);
+        assert_eq!(waited(&cmd, "/c exit 0", false).expect("ran"), 0);
+        let missing = waited("hyalo-test-no-such-program.exe", "", false);
+        assert_eq!(
+            missing.expect_err("none").code(),
+            ERROR_FILE_NOT_FOUND.to_hresult()
+        );
     }
 
     #[test]

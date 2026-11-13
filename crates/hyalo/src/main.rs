@@ -11,6 +11,7 @@ mod files;
 mod highlight;
 mod hotkeys;
 mod http;
+mod indexer;
 mod install;
 mod instance;
 mod keys;

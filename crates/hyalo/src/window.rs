@@ -72,6 +72,7 @@ use crate::instance::Start;
 use crate::keys::{self, Command, Held};
 use crate::layout::{self, Part, Position, Rect};
 use crate::notice::Notice;
+use crate::panel::Indexing;
 use crate::picker::{self, Picker};
 use crate::render::{Renderer, Row, Scene};
 use crate::results::{self, Listed, MAX_ROWS, Results};
@@ -81,7 +82,7 @@ use crate::surface::Behind;
 use crate::switcher;
 use crate::tray::{self, Tray};
 use crate::update::Updates;
-use crate::{http, launch, rates, store, system, uninstall, update};
+use crate::{http, indexer, launch, rates, store, system, uninstall, update};
 
 mod settings_window;
 
@@ -201,6 +202,11 @@ pub struct Services {
     pub dwm: Dwm,
     /// Where the clipboard history comes from.
     pub clipboard: clipboard::Watch,
+    /// The indexer service: whether it is installed, and installing or
+    /// removing it.
+    pub indexer: Arc<dyn indexer::Control>,
+    /// Asks the files provider to look for the service again.
+    pub recheck: files::Recheck,
 }
 
 /// Sets one of a window's DWM attributes, each a 32-bit value, and says
@@ -228,8 +234,9 @@ impl Services {
         let drives: Roots = Arc::new(files::fixed_drives);
         let excluded = Excluded::default();
         let snapshot = files::default_snapshot();
+        let recheck = files::Recheck::default();
         let sources: (Arc<dyn files::served::Indexer>, _) =
-            (Arc::new(files::served::Service), files::Recheck::default());
+            (Arc::new(files::served::Service), recheck.clone());
         let walk = files::provider(writer, drives, snapshot, excluded.clone(), sources);
         Self {
             sources: vec![
@@ -269,6 +276,8 @@ impl Services {
             hibernates: system::hibernates(),
             dwm: set_attribute,
             clipboard: clipboard::Watch::real(),
+            indexer: Arc::new(indexer::System),
+            recheck,
         }
     }
 }
@@ -336,6 +345,8 @@ struct App {
     checked: Checked,
     /// The newer release GitHub named, and how far installing it came.
     update: Option<Update>,
+    /// How installing or removing the indexer service goes.
+    indexing: Indexing,
     /// What the launcher is drawn over: the glass DWM gave it, or not.
     behind: Behind,
     /// What was copied, newest first, while the config keeps it.
@@ -1274,6 +1285,7 @@ impl App {
             }
             Found::Latest(answer) => self.take_latest(answer),
             Found::Installed(installed) => self.take_installed(installed),
+            Found::Indexed(done) => self.take_indexed(done),
             Found::UninstallEnded => self.look_again_for_apps(),
             Found::Copied(copied, icon) => self.take_copied(copied, icon),
             found => self.catalog.take(found),
@@ -1471,6 +1483,7 @@ fn open(services: Services, shown: bool) -> Result<HWND> {
             position,
             checked: Checked::Never,
             update: None,
+            indexing: Indexing::default(),
             behind,
             history: History::default(),
             reader: None,
@@ -2282,6 +2295,32 @@ mod tests {
     /// What the launcher was asked to run, and whether as administrator.
     pub(super) type Ran = Rc<RefCell<Vec<(Action, bool)>>>;
 
+    /// The indexer service for a test: not installed until a test installs
+    /// it, which the stand-in only notes (true for install), and refuses
+    /// when told to.
+    #[derive(Default)]
+    pub(super) struct Unindexed {
+        pub(super) installed: std::sync::atomic::AtomicBool,
+        pub(super) asked: Mutex<Vec<bool>>,
+        pub(super) refuse: std::sync::atomic::AtomicBool,
+    }
+
+    impl indexer::Control for Unindexed {
+        fn installed(&self) -> bool {
+            self.installed.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        fn change(&self, install: bool) -> std::io::Result<()> {
+            use std::sync::atomic::Ordering::SeqCst;
+            self.asked.lock().expect("asked").push(install);
+            if self.refuse.load(SeqCst) {
+                return Err(std::io::ErrorKind::PermissionDenied.into());
+            }
+            self.installed.store(install, SeqCst);
+            Ok(())
+        }
+    }
+
     /// A clipboard a test copies to: it tells the launcher of nothing by
     /// itself, and hands over, once read, what the test copied last, the
     /// app it came from and its picture (`Launcher::copy`).
@@ -2424,6 +2463,8 @@ mod tests {
             hibernates: true,
             dwm: set_attribute,
             clipboard: Copies::default().watch(),
+            indexer: Arc::new(Unindexed::default()),
+            recheck: files::Recheck::default(),
         };
         (services, ran)
     }
