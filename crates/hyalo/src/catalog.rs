@@ -49,6 +49,8 @@ pub enum Found {
     /// Something copied, for the clipboard history, and its row's
     /// picture, if it has one.
     Copied(Copied, Option<Icon>),
+    /// Installing or removing the indexer service ended: whether it went.
+    Indexed(bool),
 }
 
 /// What the window asks a provider for.
@@ -114,7 +116,8 @@ impl Catalog {
             | Found::Latest(_)
             | Found::Installed(_)
             | Found::UninstallEnded
-            | Found::Copied(..) => {}
+            | Found::Copied(..)
+            | Found::Indexed(_) => {}
         }
     }
 

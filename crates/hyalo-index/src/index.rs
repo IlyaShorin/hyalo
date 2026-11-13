@@ -5,6 +5,9 @@ use std::borrow::Cow;
 
 use hyalo_core::item::Item;
 use hyalo_core::matcher;
+use hyalo_core::volume::Position;
+
+use crate::volume::{NO_FILE, Volume};
 
 /// One file or folder, as long as it is in the index. A removed entry's id
 /// may be given to an entry added later.
@@ -126,6 +129,9 @@ pub(crate) struct Parts {
     /// One for each entry.
     pub(crate) sizes: Vec<u64>,
     pub(crate) times: Vec<u32>,
+    pub(crate) files: Vec<u32>,
+    /// How far each volume's journal was taken in, by its root.
+    pub(crate) positions: Vec<(u32, Position)>,
 }
 
 /// The end of a list of entries, or a folder with none.
@@ -159,6 +165,11 @@ pub struct Index {
     /// written, in seconds since 1970.
     pub(crate) sizes: Vec<u64>,
     pub(crate) times: Vec<u32>,
+    /// Beside each entry, the record of its file in its volume's master
+    /// file table, or `NO_FILE`.
+    pub(crate) files: Vec<u32>,
+    /// The volumes whose files come by record number.
+    pub(crate) volumes: Vec<Volume>,
     /// The first root; the roots are listed as a folder's entries are.
     top: u32,
     /// Every name, one after another, as given.
@@ -180,6 +191,8 @@ impl Default for Index {
             links: Vec::new(),
             sizes: Vec::new(),
             times: Vec::new(),
+            files: Vec::new(),
+            volumes: Vec::new(),
             top: NONE,
             names: String::new(),
             folded: String::new(),
@@ -223,7 +236,9 @@ impl Index {
 
     /// Removes an entry and, if it is a folder, everything under it.
     pub fn remove(&mut self, id: EntryId) -> Result<(), Error> {
-        self.live(id)?;
+        if self.live(id)?.is_root() {
+            self.forget(id.0);
+        }
         self.version += 1;
         self.unlink(id.0);
         let mut doomed = vec![id.0];
@@ -246,6 +261,10 @@ impl Index {
         }
         let folded = checked(name, false)?;
         if let Some(there) = self.child(parent.0, name).filter(|&at| at != id.0) {
+            // Replacing a folder it is in would take the entry with it.
+            if self.ancestry(id.0).any(|at| at == there) {
+                return Err(Error::WouldLoop);
+            }
             self.remove(EntryId(there))?;
         }
         self.version += 1;
@@ -334,7 +353,7 @@ impl Index {
     }
 
     /// The entries in the folder `parent`, or the roots for `NO_PARENT`.
-    fn children(&self, parent: u32) -> impl Iterator<Item = u32> + '_ {
+    pub(crate) fn children(&self, parent: u32) -> impl Iterator<Item = u32> + '_ {
         let first = Some(self.first(parent)).filter(|&at| at != NONE);
         std::iter::successors(first, |&at| {
             let next = self.links[at as usize].next;
@@ -343,7 +362,7 @@ impl Index {
     }
 
     /// The entry named `name`, in any case, in the folder `parent`.
-    fn child(&self, parent: u32, name: &str) -> Option<u32> {
+    pub(crate) fn child(&self, parent: u32, name: &str) -> Option<u32> {
         self.children(parent)
             .find(|&at| same(self.name_at(at), name))
     }
@@ -417,6 +436,7 @@ impl Index {
         while let Some((from, to)) = copying.pop() {
             let (from_at, to_at) = (from as usize, to as usize);
             (self.sizes[to_at], self.times[to_at]) = (fresh.sizes[from_at], fresh.times[from_at]);
+            self.files[to_at] = fresh.files[from_at];
             for child in fresh.children(from) {
                 let entry = fresh.entries[child as usize];
                 if let Ok(copy) = self.add(EntryId(to), fresh.name_of(entry), entry.is_folder()) {
@@ -424,6 +444,7 @@ impl Index {
                 }
             }
         }
+        self.map_volume(top.0, fresh.position(EntryId(root)));
     }
 
     /// Gives back the room kept for growth: after a walk, the arenas can
@@ -433,6 +454,8 @@ impl Index {
         self.links.shrink_to_fit();
         self.sizes.shrink_to_fit();
         self.times.shrink_to_fit();
+        self.files.shrink_to_fit();
+        self.volumes.iter_mut().for_each(Volume::shrink_to_fit);
         self.names.shrink_to_fit();
         self.folded.shrink_to_fit();
         self.free.shrink_to_fit();
@@ -444,6 +467,8 @@ impl Index {
             + self.links.capacity() * size_of::<Links>()
             + self.sizes.capacity() * size_of::<u64>()
             + self.times.capacity() * size_of::<u32>()
+            + self.files.capacity() * size_of::<u32>()
+            + self.volumes.iter().map(Volume::memory).sum::<usize>()
             + self.names.capacity()
             + self.folded.capacity()
             + self.free.capacity() * size_of::<u32>()
@@ -468,8 +493,12 @@ impl Index {
             free: parts.free,
             sizes: parts.sizes,
             times: parts.times,
+            files: parts.files,
             ..Index::default()
         };
+        if index.files.len() != index.entries.len() {
+            return None;
+        }
         let sound = index.entries.iter().all(|&entry| index.sound(entry));
         let whole = sound && index.rooted() && index.free_is_removed();
         if !(whole && index.rebuild(Fold::Again)) {
@@ -480,7 +509,7 @@ impl Index {
                 index.link(offset(at));
             }
         }
-        Some(index)
+        index.map_volumes(&parts.positions).then_some(index)
     }
 
     fn sound(&self, entry: Entry) -> bool {
@@ -582,7 +611,7 @@ impl Index {
     }
 
     /// The entry `id`, if it is in the index.
-    fn live(&self, id: EntryId) -> Result<Entry, Error> {
+    pub(crate) fn live(&self, id: EntryId) -> Result<Entry, Error> {
         let entry = self.entries.get(id.0 as usize).copied();
         entry
             .filter(|entry| entry.is_live())
@@ -608,7 +637,7 @@ impl Index {
         &self.folded[start..start + entry.folded_len()]
     }
 
-    fn name_at(&self, at: u32) -> &str {
+    pub(crate) fn name_at(&self, at: u32) -> &str {
         self.name_of(self.entries[at as usize])
     }
 
@@ -629,6 +658,7 @@ impl Index {
                 self.entries[at as usize] = entry;
                 self.links[at as usize] = UNLINKED;
                 (self.sizes[at as usize], self.times[at as usize]) = (0, 0);
+                self.files[at as usize] = NO_FILE;
                 at
             }
             None => {
@@ -636,6 +666,7 @@ impl Index {
                 self.links.push(UNLINKED);
                 self.sizes.push(0);
                 self.times.push(0);
+                self.files.push(NO_FILE);
                 offset(self.entries.len() - 1)
             }
         };
@@ -668,6 +699,7 @@ impl Index {
         entry.lengths |= REMOVED << (2 * LENGTH_BITS);
         self.garbage += entry.name_len();
         self.links[at as usize] = UNLINKED;
+        self.files[at as usize] = NO_FILE;
         self.free.push(at);
     }
 }
@@ -738,6 +770,18 @@ mod tests {
         let windows = index.add(c, "Windows", true).unwrap();
         let system = index.add(windows, "System32", true).unwrap();
         (index, [c, users, me, notes, windows, system])
+    }
+
+    #[test]
+    fn an_entry_never_takes_the_name_of_a_folder_it_is_in() {
+        let (mut index, [c, users, me, notes, ..]) = drive();
+        let len = index.len();
+        // Users\Me\notes.txt as C:\Users would replace its own folder.
+        assert_eq!(index.rename(notes, c, "Users"), Err(Error::WouldLoop));
+        assert_eq!(index.rename(notes, users, "me"), Err(Error::WouldLoop));
+        assert_eq!(index.len(), len, "nothing removed");
+        assert_eq!(index.path(notes).as_deref(), Some(r"C:\Users\Me\notes.txt"));
+        assert_eq!(index.path(me).as_deref(), Some(r"C:\Users\Me"));
     }
 
     #[test]
@@ -1206,9 +1250,9 @@ mod tests {
         let (mut index, [_, _, _, notes, ..]) = drive();
         index.remove(notes).unwrap();
         index.shrink_to_fit();
-        // Six entries, their links, sizes and times; C:, Users, Me,
-        // notes.txt, Windows, System32 twice; one free place.
-        assert_eq!(index.memory(), 6 * (16 + 12 + 12) + 2 * 33 + 4);
+        // Six entries, their links, sizes, times and records; C:, Users,
+        // Me, notes.txt, Windows, System32 twice; one free place.
+        assert_eq!(index.memory(), 6 * (16 + 12 + 12 + 4) + 2 * 33 + 4);
         assert_eq!(
             index.path(EntryId(5)).as_deref(),
             Some(r"C:\Windows\System32")

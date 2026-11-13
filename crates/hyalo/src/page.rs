@@ -36,6 +36,10 @@ pub enum Target {
     CheckUpdates,
     /// The switch for the clipboard history.
     ClipboardHistory,
+    /// "Install" for the indexer service.
+    IndexerInstall,
+    /// "Remove" for the indexer service.
+    IndexerRemove,
 }
 
 /// What the window shows.

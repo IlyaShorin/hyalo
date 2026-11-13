@@ -67,6 +67,7 @@ version = "0.2.9"
 dependencies = [
  "hyalo-core",
  "hyalo-index",
+ "hyalo-indexer",
  "png",
  "windows",
  "windows-numerics",
@@ -87,6 +88,14 @@ name = "hyalo-index"
 version = "0.2.9"
 dependencies = [
  "hyalo-core",
+]
+
+[[package]]
+name = "hyalo-indexer"
+version = "0.2.9"
+dependencies = [
+ "hyalo-core",
+ "windows",
 ]
 
 [[package]]

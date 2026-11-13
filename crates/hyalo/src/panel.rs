@@ -40,7 +40,21 @@ pub enum Effect {
     Paste,
     /// Install the newer release.
     Install,
+    /// Install the indexer service (true), or remove it.
+    Indexer(bool),
     Close,
+}
+
+/// The indexer service, as the page shows it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Indexing {
+    /// Whether it is installed on this machine.
+    pub installed: bool,
+    /// Being installed or removed now: waiting for an administrator's
+    /// yes, then for the work.
+    pub busy: bool,
+    /// The last install or removal did not go: refused, or failed.
+    pub failed: bool,
 }
 
 /// What the updates section shows: the version that runs, and the newer
@@ -75,11 +89,12 @@ enum Spot {
 
 /// The page's sections, top to bottom; each is left out when it has
 /// nothing to show.
-const SECTIONS: [fn(&Panel) -> Option<Section>; 7] = [
+const SECTIONS: [fn(&Panel) -> Option<Section>; 8] = [
     Panel::problem,
     Panel::news,
     Panel::launcher,
     Panel::folders,
+    Panel::index,
     Panel::search,
     Panel::updates,
     Panel::file,
@@ -117,6 +132,8 @@ pub struct Panel {
     /// The versions, where hyalo updates itself; `None` shows no updates
     /// section.
     updates: Option<Versions>,
+    /// The indexer service; `None` shows no section for it.
+    indexing: Option<Indexing>,
 }
 
 impl Panel {
@@ -202,6 +219,12 @@ impl Panel {
     /// What is known of the versions now.
     pub fn set_updates(&mut self, updates: Option<Versions>) {
         self.updates = updates;
+        self.settle_focus();
+    }
+
+    /// How the indexer service is now: the page shows it from then on.
+    pub fn set_indexing(&mut self, indexing: Indexing) {
+        self.indexing = Some(indexing);
         self.settle_focus();
     }
 
@@ -461,7 +484,9 @@ impl Panel {
         match target {
             Target::Fix | Target::OpenConfig => Some(Effect::OpenConfig),
             Target::StartWithWindows => self.starts.map(|on| Effect::StartWithWindows(!on)),
-            Target::Install => Some(Effect::Install),
+            Target::Install | Target::IndexerInstall | Target::IndexerRemove => {
+                Some(installing(target))
+            }
             Target::CheckUpdates => self
                 .written
                 .as_ref()
@@ -486,6 +511,9 @@ impl Panel {
             Target::Install => self
                 .update()
                 .is_some_and(|update| update.progress != Progress::Installing),
+            Target::IndexerInstall | Target::IndexerRemove => {
+                self.indexing.is_some_and(|indexing| !indexing.busy)
+            }
             _ => self.problem.is_none(),
         };
         self.has(target) && free
@@ -497,6 +525,8 @@ impl Panel {
             Target::Fix => self.problem.is_some(),
             Target::OpenConfig => true,
             Target::Install => self.update().is_some(),
+            Target::IndexerInstall => self.indexing.is_some_and(|indexing| !indexing.installed),
+            Target::IndexerRemove => self.indexing.is_some_and(|indexing| indexing.installed),
             Target::Remove(list, at) => at < self.entries(list).len(),
             setting => self.written.is_some() && self.shows(setting),
         }
@@ -705,6 +735,32 @@ impl Panel {
         })
     }
 
+    /// The indexer service: how it is, and Install or Remove.
+    fn index(&self) -> Option<Section> {
+        let indexing = self.indexing?;
+        let help = match (indexing.busy, indexing.failed, indexing.installed) {
+            (true, _, _) => Text::IndexerBusy,
+            (false, true, _) => Text::IndexerFailed,
+            (false, false, true) => Text::IndexerInstalled,
+            (false, false, false) => Text::IndexerMissing,
+        };
+        let alarm = indexing.failed && !indexing.busy;
+        let button = match indexing.installed {
+            true => button(&self.say(Text::Remove), Target::IndexerRemove),
+            false => button(&self.say(Text::Install), Target::IndexerInstall),
+        };
+        let name = self.say(Text::IndexerService);
+        let strip = setting(
+            &name,
+            (self.say(help), alarm),
+            Some(Control::Button(button)),
+        );
+        Some(Section {
+            title: Some(self.say(Text::FileIndex)),
+            cards: vec![card(alarm, false, vec![strip])],
+        })
+    }
+
     /// The switch alone, near the end, while there is no newer release.
     fn updates(&self) -> Option<Section> {
         if self.update().is_some() {
@@ -778,6 +834,16 @@ impl Panel {
             title: Some("config.toml".to_string()),
             cards: vec![card(false, false, vec![strip])],
         })
+    }
+}
+
+/// What a button that installs does: the newer release, or the indexer
+/// service in or out.
+fn installing(target: Target) -> Effect {
+    match target {
+        Target::IndexerInstall => Effect::Indexer(true),
+        Target::IndexerRemove => Effect::Indexer(false),
+        _ => Effect::Install,
     }
 }
 
@@ -1090,6 +1156,17 @@ mod tests {
             (false, false),
         ];
         assert_eq!(muted(&panel), cards);
+        panel.set_indexing(Indexing::default());
+        let shown = muted(&panel);
+        assert_eq!(shown.len(), cards.len() + 1);
+        assert!(
+            shown.contains(&(false, false)),
+            "the index card is no setting"
+        );
+        assert_eq!(
+            shown.iter().filter(|&&card| card == (false, false)).count(),
+            2
+        );
     }
 
     #[test]
@@ -2094,6 +2171,138 @@ notes
             What::Button { label, target } if *target == Target::Install => Some(label.clone()),
             _ => None,
         });
+        assert_eq!(install.as_deref(), Some("Установить"));
+    }
+
+    /// The label of the button for `target`, if the page shows one.
+    fn button_of(panel: &Panel, target: Target) -> Option<String> {
+        let marks = laid(panel).marks.into_iter();
+        marks
+            .filter_map(|mark| match mark.what {
+                What::Button {
+                    label,
+                    target: shown,
+                } if shown == target => Some(label),
+                _ => None,
+            })
+            .next()
+    }
+
+    fn indexing(installed: bool, busy: bool, failed: bool) -> Indexing {
+        Indexing {
+            installed,
+            busy,
+            failed,
+        }
+    }
+
+    fn help(text: Text, alarm: bool) -> What {
+        What::Help {
+            text: Language::English.say(text).to_string(),
+            alarm,
+        }
+    }
+
+    #[test]
+    fn the_indexer_service_not_installed_is_offered_to_install() {
+        let mut panel = panel();
+        assert!(
+            !texts(&panel).contains(&"File index".to_string()),
+            "none without it"
+        );
+        panel.set_indexing(indexing(false, false, false));
+        let shown = texts(&panel);
+        let at = shown
+            .iter()
+            .position(|text| text == "File index")
+            .expect("the section");
+        assert_eq!(shown[at + 1], "Indexer service");
+        assert_eq!(
+            help_of(&panel, "Indexer service"),
+            help(Text::IndexerMissing, false)
+        );
+        assert_eq!(
+            button_of(&panel, Target::IndexerInstall).as_deref(),
+            Some("Install")
+        );
+        assert_eq!(button_of(&panel, Target::IndexerRemove), None);
+        assert_eq!(
+            click(&mut panel, Target::IndexerInstall),
+            Some(Effect::Indexer(true))
+        );
+        assert_eq!(
+            click(&mut panel, Target::IndexerRemove),
+            None,
+            "not on the page"
+        );
+    }
+
+    #[test]
+    fn the_indexer_service_installed_is_offered_to_remove() {
+        let mut panel = panel();
+        panel.set_indexing(indexing(true, false, false));
+        assert_eq!(
+            help_of(&panel, "Indexer service"),
+            help(Text::IndexerInstalled, false)
+        );
+        assert_eq!(
+            button_of(&panel, Target::IndexerRemove).as_deref(),
+            Some("Remove")
+        );
+        assert_eq!(button_of(&panel, Target::IndexerInstall), None);
+        assert_eq!(
+            click(&mut panel, Target::IndexerRemove),
+            Some(Effect::Indexer(false))
+        );
+    }
+
+    #[test]
+    fn while_it_is_installed_or_removed_its_button_waits() {
+        let mut panel = panel();
+        panel.set_indexing(indexing(false, true, false));
+        assert_eq!(
+            help_of(&panel, "Indexer service"),
+            help(Text::IndexerBusy, false)
+        );
+        assert!(!panel.look(Target::IndexerInstall).enabled);
+        assert_eq!(click(&mut panel, Target::IndexerInstall), None);
+        panel.set_indexing(indexing(true, false, false));
+        assert!(panel.look(Target::IndexerRemove).enabled);
+    }
+
+    #[test]
+    fn a_failure_is_told_in_alarm_and_may_be_tried_again() {
+        let mut panel = panel();
+        panel.set_indexing(indexing(false, false, true));
+        assert_eq!(
+            help_of(&panel, "Indexer service"),
+            help(Text::IndexerFailed, true)
+        );
+        assert_eq!(
+            click(&mut panel, Target::IndexerInstall),
+            Some(Effect::Indexer(true))
+        );
+    }
+
+    #[test]
+    fn the_service_is_no_setting_and_may_be_installed_while_the_file_is_broken() {
+        let mut panel = Panel::new(Err(broken()), Some(false), Language::English);
+        panel.set_indexing(indexing(false, false, false));
+        assert!(panel.look(Target::IndexerInstall).enabled);
+        assert_eq!(
+            click(&mut panel, Target::IndexerInstall),
+            Some(Effect::Indexer(true))
+        );
+    }
+
+    #[test]
+    fn the_indexer_service_speaks_russian_too() {
+        let mut panel = russian();
+        panel.set_indexing(indexing(false, false, false));
+        let shown = texts(&panel);
+        assert!(shown.contains(&"Индекс файлов".to_string()), "{shown:?}");
+        assert!(shown.contains(&"Служба индекса".to_string()), "{shown:?}");
+        let install = button_of(&panel, Target::IndexerInstall);
         assert_eq!(install.as_deref(), Some("Установить"));
     }
 }

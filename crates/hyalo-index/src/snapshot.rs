@@ -1,23 +1,34 @@
 //! The index on disk, so a restart does not walk the drives again.
 //!
-//! Little-endian: the magic `HYALOIDX`, a version, three lengths
-//! (entries, bytes of names, free places), then each part as it lies in
-//! memory: entries, names, free places, then each entry's size (8 bytes)
-//! and last write (4). The folded names are not kept: loading folds the names again,
-//! which also makes sure the copy matches. A snapshot is checked where it
-//! comes in; one that is damaged, cut short or of another version is
-//! refused, never trusted.
+//! Little-endian: the magic `HYALOIDX`, a version, four lengths
+//! (entries, bytes of names, free places, positions), then each part as
+//! it lies in memory: entries, names, free places, then each entry's size
+//! (8 bytes), last write (4) and record (4), then each volume's position:
+//! its root (4), the volume (8), its journal (8) and the place in it (8).
+//! The folded names are not kept: loading folds the names again, which
+//! also makes sure the copy matches. A snapshot is checked where it comes
+//! in; one that is damaged, cut short or of another version is refused,
+//! never trusted. Version 2, without records and positions, is still read.
 
 use std::io::{self, Read, Write};
 
+use hyalo_core::volume::Position;
+
 use crate::Index;
 use crate::index::{Entry, Parts};
+use crate::volume::NO_FILE;
 
 const MAGIC: &[u8; 8] = b"HYALOIDX";
 
 /// Changes with the format, and with the way names are folded. 2: sizes
-/// and times.
-const VERSION: u32 = 2;
+/// and times; 3: records and positions.
+const VERSION: u32 = 3;
+
+/// The version before, still read: what it saved had no records.
+const BEFORE: u32 = 2;
+
+/// The bytes of a volume's position.
+const POSITION: usize = 4 + 8 + 8 + 8;
 
 /// Why a snapshot was refused.
 #[derive(Debug)]
@@ -33,47 +44,112 @@ impl Index {
     /// Writes the whole index to `out`. Many small writes: buffer them.
     pub fn save(&self, out: &mut impl Write) -> io::Result<()> {
         let (entries, names, free) = self.parts();
-        out.write_all(&header(entries.len(), names.len(), free.len()))?;
-        entries
-            .iter()
-            .try_for_each(|entry| out.write_all(&entry.to_bytes()))?;
+        let positions = self.positions();
+        let lengths = [entries.len(), names.len(), free.len(), positions.len()];
+        out.write_all(&header(lengths))?;
+        all(out, entries.iter().map(|entry| entry.to_bytes()))?;
         out.write_all(names.as_bytes())?;
-        free.iter()
-            .try_for_each(|at| out.write_all(&at.to_le_bytes()))?;
-        let sizes = self.sizes.iter().map(|size| size.to_le_bytes());
-        sizes
-            .into_iter()
-            .try_for_each(|size| out.write_all(&size))?;
-        let times = self.times.iter().map(|time| time.to_le_bytes());
-        times.into_iter().try_for_each(|time| out.write_all(&time))
+        all(out, free.iter().map(|at| at.to_le_bytes()))?;
+        all(out, self.sizes.iter().map(|size| size.to_le_bytes()))?;
+        all(out, self.times.iter().map(|time| time.to_le_bytes()))?;
+        all(out, self.files.iter().map(|record| record.to_le_bytes()))?;
+        all(
+            out,
+            positions.iter().map(|&(root, at)| position_bytes(root, at)),
+        )
     }
 
     /// Reads back what `save` wrote, all of it and nothing after.
     pub fn load(input: &mut impl Read) -> Result<Index, LoadError> {
-        ours(input)?;
-        let [entries, names, free] = lengths(input)?;
-        let entries = exactly(input, entries * 16)?;
-        let names = String::from_utf8(exactly(input, names)?).map_err(|_| LoadError::Damaged)?;
-        let free = exactly(input, free * 4)?;
-        let (sizes, times) = stats(input, entries.len() / 16)?;
-        let parts = Parts {
-            entries: decoded(&entries, Entry::from_bytes),
-            names,
-            free: decoded(&free, u32::from_le_bytes),
-            sizes: decoded(&sizes, u64::from_le_bytes),
-            times: decoded(&times, u32::from_le_bytes),
-        };
+        let version = ours(input)?;
+        let lengths = lengths(input, version)?;
+        let parts = parts(input, version, lengths)?;
         Index::from_parts(parts).ok_or(LoadError::Damaged)
     }
 }
 
-/// The bytes of each of `count` entries' sizes, then of their times;
-/// nothing may follow.
-fn stats(input: &mut impl Read, count: usize) -> Result<(Vec<u8>, Vec<u8>), LoadError> {
-    let sizes = exactly(input, count * 8)?;
-    let times = exactly(input, count * 4)?;
+/// Writes each of `pieces`.
+fn all<const N: usize>(
+    out: &mut impl Write,
+    mut pieces: impl Iterator<Item = [u8; N]>,
+) -> io::Result<()> {
+    pieces.try_for_each(|piece| out.write_all(&piece))
+}
+
+/// A volume's position, as a snapshot keeps it.
+fn position_bytes(root: u32, at: Position) -> [u8; POSITION] {
+    let mut bytes = [0; POSITION];
+    bytes[..4].copy_from_slice(&root.to_le_bytes());
+    bytes[4..12].copy_from_slice(&at.volume.to_le_bytes());
+    bytes[12..20].copy_from_slice(&at.journal.to_le_bytes());
+    bytes[20..].copy_from_slice(&at.next.to_le_bytes());
+    bytes
+}
+
+/// The root and position a snapshot keeps in `bytes`.
+fn position_of(bytes: [u8; POSITION]) -> (u32, Position) {
+    let (root, rest) = bytes.split_at(4);
+    let (volume, rest) = rest.split_at(8);
+    let (journal, next) = rest.split_at(8);
+    let eight = |bytes: &[u8]| -> [u8; 8] { bytes.try_into().expect("eight bytes") };
+    let position = Position {
+        volume: u64::from_le_bytes(eight(volume)),
+        journal: u64::from_le_bytes(eight(journal)),
+        next: i64::from_le_bytes(eight(next)),
+    };
+    let root: [u8; 4] = root.try_into().expect("four bytes");
+    (u32::from_le_bytes(root), position)
+}
+
+/// The parts after the lengths, of a snapshot of `version`; nothing may
+/// follow.
+fn parts(
+    input: &mut impl Read,
+    version: u32,
+    [entries, names, free, positions]: [usize; 4],
+) -> Result<Parts, LoadError> {
+    let entries = decoded(&exactly(input, entries * 16)?, Entry::from_bytes);
+    let names = String::from_utf8(exactly(input, names)?).map_err(|_| LoadError::Damaged)?;
+    let free = decoded(&exactly(input, free * 4)?, u32::from_le_bytes);
+    let Beside {
+        sizes,
+        times,
+        files,
+    } = beside(input, version, entries.len())?;
+    let positions = decoded(&exactly(input, positions * POSITION)?, position_of);
     ended(input)?;
-    Ok((sizes, times))
+    Ok(Parts {
+        entries,
+        names,
+        free,
+        sizes,
+        times,
+        files,
+        positions,
+    })
+}
+
+/// What a snapshot keeps beside each entry.
+struct Beside {
+    sizes: Vec<u64>,
+    times: Vec<u32>,
+    files: Vec<u32>,
+}
+
+/// What a snapshot of `version` keeps beside each of `count` entries: its
+/// size, its last write and its record; none came by record before.
+fn beside(input: &mut impl Read, version: u32, count: usize) -> Result<Beside, LoadError> {
+    let sizes = decoded(&exactly(input, count * 8)?, u64::from_le_bytes);
+    let times = decoded(&exactly(input, count * 4)?, u32::from_le_bytes);
+    let files = match version {
+        BEFORE => vec![NO_FILE; count],
+        _ => decoded(&exactly(input, count * 4)?, u32::from_le_bytes),
+    };
+    Ok(Beside {
+        sizes,
+        times,
+        files,
+    })
 }
 
 /// `bytes` cut into pieces of `N`, each read by `read`.
@@ -86,34 +162,40 @@ fn decoded<const N: usize, T>(bytes: &[u8], read: fn([u8; N]) -> T) -> Vec<T> {
         .collect()
 }
 
-/// How a snapshot starts: the magic, the version and the three lengths.
-fn header(entries: usize, names: usize, free: usize) -> Vec<u8> {
-    let lengths = [entries, names, free].map(|length| (length as u64).to_le_bytes());
+/// How a snapshot starts: the magic, the version and the four lengths.
+fn header(lengths: [usize; 4]) -> Vec<u8> {
+    let lengths = lengths.map(|length| (length as u64).to_le_bytes());
     [MAGIC.as_slice(), &VERSION.to_le_bytes(), &lengths.concat()].concat()
 }
 
-/// Reads the magic and the version, and refuses anything but ours.
-fn ours(input: &mut impl Read) -> Result<(), LoadError> {
+/// Reads the magic and the version, and refuses anything but ours: the
+/// version it is.
+fn ours(input: &mut impl Read) -> Result<u32, LoadError> {
     let magic = exactly(input, MAGIC.len()).map_err(|_| LoadError::Foreign)?;
-    let version = exactly(input, 4)?;
-    match magic == MAGIC && version == VERSION.to_le_bytes() {
-        true => Ok(()),
+    let version: [u8; 4] = exactly(input, 4)?
+        .try_into()
+        .map_err(|_| LoadError::Foreign)?;
+    let version = u32::from_le_bytes(version);
+    match magic == MAGIC && [VERSION, BEFORE].contains(&version) {
+        true => Ok(version),
         false => Err(LoadError::Foreign),
     }
 }
 
-/// Reads the three lengths. Offsets are u32: no part is longer.
-fn lengths(input: &mut impl Read) -> Result<[usize; 3], LoadError> {
-    let bytes = exactly(input, 3 * 8)?;
+/// Reads the lengths a snapshot of `version` has: the version before kept
+/// no positions. Offsets are u32: no part is longer.
+fn lengths(input: &mut impl Read, version: u32) -> Result<[usize; 4], LoadError> {
+    let count = match version {
+        BEFORE => 3,
+        _ => 4,
+    };
+    let bytes = exactly(input, count * 8)?;
     let length = |&bytes: &[u8; 8]| u32::try_from(u64::from_le_bytes(bytes));
-    let lengths: Result<Vec<usize>, _> = bytes
-        .as_chunks::<8>()
-        .0
-        .iter()
-        .map(|bytes| length(bytes).map(|length| length as usize))
-        .collect();
-    let lengths = lengths.map_err(|_| LoadError::Damaged)?;
-    lengths.try_into().map_err(|_| LoadError::Damaged)
+    let mut lengths = [0; 4];
+    for (at, bytes) in bytes.as_chunks::<8>().0.iter().enumerate() {
+        lengths[at] = length(bytes).map_err(|_| LoadError::Damaged)? as usize;
+    }
+    Ok(lengths)
 }
 
 /// Refuses anything after the end.
@@ -146,8 +228,10 @@ mod tests {
     use crate::{EntryId, synthetic};
     use hyalo_core::places::Places;
 
-    /// The magic, the version and three lengths, in bytes.
-    const HEADER: usize = 8 + 4 + 3 * 8;
+    use hyalo_core::volume::{Change, File, Name, Position, ROOT};
+
+    /// The magic, the version and four lengths, in bytes.
+    const HEADER: usize = 8 + 4 + 4 * 8;
 
     fn saved(index: &Index) -> Vec<u8> {
         let mut bytes = Vec::new();
@@ -232,10 +316,10 @@ mod tests {
     #[test]
     fn loading_takes_no_more_memory_than_it_needs() {
         let back = loaded(&saved(&small())).expect("load");
-        // Four entries, their links, sizes and times; C:, a and Ёлка.txt
-        // as given and folded (the name of the one removed is not
+        // Four entries, their links, sizes, times and records; C:, a and
+        // Ёлка.txt as given and folded (the name of the one removed is not
         // loaded); one free place.
-        assert_eq!(back.memory(), 4 * (16 + 12 + 12) + 15 + 15 + 4);
+        assert_eq!(back.memory(), 4 * (16 + 12 + 12 + 4) + 15 + 15 + 4);
     }
 
     #[test]
@@ -357,8 +441,8 @@ mod tests {
 
     #[test]
     fn a_free_place_must_be_a_removed_entry_listed_once() {
-        // Each entry's size and time come after the free places.
-        let after = |index: &Index| index.entries.len() * (8 + 4);
+        // Each entry's size, time and record come after the free places.
+        let after = |index: &Index| index.entries.len() * (8 + 4 + 4);
         let bytes = saved(&small());
         let free = bytes.len() - after(&small()) - 4;
         assert!(damaged(&with(&bytes, free, 1)), "a live entry");
@@ -396,5 +480,116 @@ mod tests {
         let mut rooted = bytes.clone();
         rooted[a - 1] = b'\\';
         assert!(loaded(&rooted).is_ok(), "a root may hold one: C\\");
+    }
+
+    fn named(record: u32, folder: bool, names: &[(u32, &str)]) -> Change {
+        let names = names.iter().map(|&(parent, text)| Name {
+            parent,
+            text: text.to_string(),
+        });
+        Change {
+            record,
+            file: Some(File {
+                folder,
+                size: 1,
+                written: 2,
+                names: names.collect(),
+            }),
+        }
+    }
+
+    const POSITION: Position = Position {
+        volume: 0x0123_4567_89AB_CDEF,
+        journal: 7,
+        next: -9,
+    };
+
+    /// `small`, with files of C:'s table beside what was walked: a
+    /// folder, a file in it, and a file with a hard link in each.
+    fn listed() -> Index {
+        let mut index = small();
+        let c = EntryId(0);
+        index
+            .settle(c, &named(40, true, &[(ROOT, "listed")]))
+            .unwrap();
+        index
+            .settle(c, &named(50, false, &[(40, "one.txt")]))
+            .unwrap();
+        let links = named(51, false, &[(40, "x.txt"), (ROOT, "y.txt")]);
+        index.settle(c, &links).unwrap();
+        index.set_position(c, POSITION).unwrap();
+        index
+    }
+
+    fn gone(record: u32) -> Change {
+        Change { record, file: None }
+    }
+
+    #[test]
+    fn a_volume_s_records_and_position_load_back() {
+        let mut back = loaded(&saved(&listed())).expect("load");
+        let c = EntryId(0);
+        assert_eq!(back.position(c), Some(POSITION));
+        back.settle(c, &gone(40)).unwrap();
+        back.settle(c, &gone(51)).unwrap();
+        assert_eq!(back.find(r"C:\listed"), None);
+        assert_eq!(back.find(r"C:\y.txt"), None, "every link known");
+        assert!(back.find(r"C:\a\Ёлка.txt").is_some(), "the walked stay");
+    }
+
+    /// What version 2 saved of `index`: no records, no positions.
+    fn version_2(index: &Index) -> Vec<u8> {
+        let (entries, names, free) = index.parts();
+        let lengths = [entries.len(), names.len(), free.len()];
+        let lengths = lengths.map(|length| (length as u64).to_le_bytes());
+        let mut bytes = [MAGIC.as_slice(), &2_u32.to_le_bytes(), &lengths.concat()].concat();
+        bytes.extend(entries.iter().flat_map(|entry| entry.to_bytes()));
+        bytes.extend(names.as_bytes());
+        bytes.extend(free.iter().flat_map(|at| at.to_le_bytes()));
+        bytes.extend(index.sizes.iter().flat_map(|size| size.to_le_bytes()));
+        bytes.extend(index.times.iter().flat_map(|time| time.to_le_bytes()));
+        bytes
+    }
+
+    #[test]
+    fn a_snapshot_of_the_version_before_loads_with_no_records() {
+        let index = listed();
+        let mut back = loaded(&version_2(&index)).expect("load");
+        assert_eq!(paths(&back), paths(&index));
+        let c = EntryId(0);
+        assert_eq!(back.position(c), None);
+        back.settle(c, &gone(40)).unwrap();
+        assert!(back.find(r"C:\listed").is_some(), "not known by its record");
+        let cut = version_2(&index);
+        assert!(damaged(&cut[..cut.len() - 1]));
+    }
+
+    #[test]
+    fn a_position_for_what_is_not_a_root_is_refused() {
+        let bytes = saved(&listed());
+        // The position comes last: its root, then the rest.
+        let root = bytes.len() - 28;
+        assert!(loaded(&with(&bytes, root, 0)).is_ok());
+        assert!(damaged(&with(&bytes, root, 1)), "a folder");
+        assert!(damaged(&with(&bytes, root, 99)), "past the end");
+    }
+
+    #[test]
+    fn a_record_no_volume_could_have_is_refused() {
+        let index = listed();
+        let bytes = saved(&index);
+        // The records come before the one position: one per entry.
+        let records = bytes.len() - 28 - index.entries.len() * 4;
+        let first = u32::from_le_bytes(bytes[records..records + 4].try_into().unwrap());
+        assert_eq!(first, crate::volume::NO_FILE, "C: came by no record");
+        assert!(loaded(&with(&bytes, records, (1 << 28) - 1)).is_ok());
+        assert!(damaged(&with(&bytes, records, 1 << 28)));
+    }
+
+    #[test]
+    fn a_record_for_every_entry_is_kept() {
+        let bytes = saved(&listed());
+        let longer = [bytes.as_slice(), &[0; 4]].concat();
+        assert!(damaged(&longer));
     }
 }

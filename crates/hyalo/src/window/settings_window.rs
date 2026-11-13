@@ -41,17 +41,18 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use windows::core::{BOOL, HSTRING, PCWSTR, Result, w};
 
 use super::{
-    App, Dwm, MOUSE_SHIFT, Placement, client_point, double_click_room, double_click_time, down,
-    placement_under_cursor, with_app,
+    App, Dwm, Found, MOUSE_SHIFT, Placement, client_point, double_click_room, double_click_time,
+    down, hand_over, placement_under_cursor, with_app,
 };
 use crate::field;
 use crate::layout;
 use crate::page::{self, Laid, Target, What};
 use crate::paint::Painter;
-use crate::panel::{Effect, Panel, Versions};
+use crate::panel::{Effect, Indexing, Panel, Versions};
 use crate::recorder::Mods;
 use crate::surface::Behind;
 use crate::{clipboard, settings, tray};
+use std::sync::Arc;
 
 const CLASS: PCWSTR = w!("hyalo.settings");
 
@@ -514,7 +515,72 @@ impl App {
         );
         let mut panel = Panel::new(file, self.starts(), self.services.windows_language);
         panel.set_updates(self.versions());
+        panel.set_indexing(self.indexing_now());
         Some(panel)
+    }
+
+    /// How the indexer service is now, as the settings window shows it.
+    fn indexing_now(&self) -> Indexing {
+        Indexing {
+            installed: self.services.indexer.installed(),
+            ..self.indexing
+        }
+    }
+
+    /// Shows the indexer service as it is now in the settings window, if
+    /// it is open.
+    fn show_indexing(&mut self) {
+        let indexing = self.indexing_now();
+        if let Some(window) = &mut self.settings {
+            window.panel.set_indexing(indexing);
+            window.redraw_or_say();
+        }
+    }
+
+    /// Installs what a button asked to: the newer release, or the indexer
+    /// service in or out.
+    fn installing(&mut self, effect: &Effect) {
+        match effect {
+            Effect::Indexer(install) => self.change_indexer(*install),
+            _ => self.install(),
+        }
+    }
+
+    /// Installs the indexer service, or removes it, on a thread of its
+    /// own: the UAC prompt waits for the user. One at a time.
+    pub(super) fn change_indexer(&mut self, install: bool) {
+        if self.indexing.busy {
+            return;
+        }
+        self.indexing = Indexing {
+            busy: true,
+            ..self.indexing
+        };
+        let control = Arc::clone(&self.services.indexer);
+        let (sender, window) = (self.found.0.clone(), self.hwnd.0 as isize);
+        std::thread::spawn(move || {
+            let done = control.change(install);
+            if let Err(error) = &done {
+                eprintln!("hyalo: the indexer service did not change: {error}");
+            }
+            hand_over(&sender, window, Found::Indexed(done.is_ok()));
+        });
+        self.show_indexing();
+    }
+
+    /// Installing or removing the service ended: the files provider looks
+    /// for it again, so a root it reads now comes from it, or one it no
+    /// longer reads is walked.
+    pub(super) fn take_indexed(&mut self, done: bool) {
+        self.indexing = Indexing {
+            busy: false,
+            failed: !done,
+            ..self.indexing
+        };
+        if done {
+            self.services.recheck.ask();
+        }
+        self.show_indexing();
     }
 
     /// The versions the settings window shows, where hyalo updates
@@ -671,8 +737,8 @@ fn carry_out(hwnd: HWND, effect: Effect) {
         Effect::OpenConfig => {
             with_app(App::open_config);
         }
-        Effect::Install => {
-            with_app(App::install);
+        Effect::Install | Effect::Indexer(_) => {
+            with_app(|app| app.installing(&effect));
         }
         Effect::Copy(text) => {
             with_app(|app| app.run_action(&Action::CopyText(text)));
@@ -814,12 +880,13 @@ mod tests {
     };
 
     use super::super::tests::{
-        Chooser, Copies, Keyboard, Launcher, Ran, Taskbar, config_file, hold, listing, named,
-        pump_until_closed, release_json, releasing, services, text, windows_10,
+        Chooser, Copies, Keyboard, Launcher, Ran, Taskbar, Unindexed, config_file, hold, listing,
+        named, pump_until_closed, release_json, releasing, services, text, windows_10,
     };
-    use super::super::{HOTKEY_TOGGLE, MOUSE_SHIFT, tray};
+    use super::super::{HOTKEY_TOGGLE, MOUSE_SHIFT, Services, tray};
     use super::*;
     use crate::autostart::{self, Autostart};
+    use crate::files;
     use crate::scratch::Scratch;
     use crate::surface::Frame;
     use crate::test_desktop::{in_own_window_station, on_hidden_desktop};
@@ -851,6 +918,15 @@ mod tests {
         autostart: Option<Autostart>,
         updates: Option<Updates>,
     ) -> Setup {
+        set_up_with(test, text, |services| {
+            services.autostart = autostart;
+            services.updates = updates;
+        })
+    }
+
+    /// A launcher whose config holds `text`, its services as `adjust`
+    /// leaves them.
+    fn set_up_with(test: &str, text: &str, adjust: impl FnOnce(&mut Services)) -> Setup {
         let (scratch, path) = config_file(test, text);
         let (mut services, ran) = services(listing(&["Notepad"]).0, None);
         let (taskbar, keyboard) = (Rc::new(Taskbar::default()), Rc::new(Keyboard::default()));
@@ -859,8 +935,7 @@ mod tests {
         services.hotkeys = Box::new(keyboard.clone());
         services.picker = chooser.clone();
         services.config = Some(path.clone());
-        services.autostart = autostart;
-        services.updates = updates;
+        adjust(&mut services);
         let copies = Copies::default();
         services.clipboard = copies.watch();
         let launcher = Launcher::serving(services);
@@ -1885,6 +1960,80 @@ mod tests {
                 named(&[("hyalo.exe", "new build"), ("hyalo.exe.old", "old build")])
             );
             assert_eq!(releases.started(), std::slice::from_ref(&releases.exe));
+        });
+    }
+
+    /// A launcher with an indexer service of `unindexed`'s, asking the
+    /// files provider to look for it through `recheck`.
+    fn set_up_indexing(test: &str, unindexed: &Arc<Unindexed>, recheck: &files::Recheck) -> Setup {
+        set_up_with(test, DEFAULT, |services| {
+            services.indexer = unindexed.clone();
+            services.recheck = recheck.clone();
+        })
+    }
+
+    #[test]
+    fn installing_the_indexer_service_hands_the_roots_to_it_and_removing_it_takes_them_back() {
+        on_hidden_desktop(|| {
+            let (unindexed, recheck) = (Arc::new(Unindexed::default()), files::Recheck::default());
+            let setup = set_up_indexing("settings-indexer", &unindexed, &recheck);
+            let settings = setup.settings();
+            assert!(settings.shows("Indexer service"), "{:?}", settings.texts());
+            settings.click(Target::IndexerInstall);
+            // The button shows once installed, and works once it is done.
+            let ended = |target| {
+                move |window: &SettingsWindow| {
+                    window.laid.area(target).is_some() && window.panel.look(target).enabled
+                }
+            };
+            setup.until(ended(Target::IndexerRemove));
+            assert_eq!(*unindexed.asked.lock().expect("asked"), [true]);
+            assert!(recheck.taken(), "the provider looks for it");
+            settings.click(Target::IndexerRemove);
+            setup.until(ended(Target::IndexerInstall));
+            assert_eq!(*unindexed.asked.lock().expect("asked"), [true, false]);
+            assert!(recheck.taken(), "and walks its roots again");
+        });
+    }
+
+    #[test]
+    fn while_the_indexer_service_changes_the_card_waits_and_asks_nothing_more() {
+        on_hidden_desktop(|| {
+            let (unindexed, recheck) = (Arc::new(Unindexed::default()), files::Recheck::default());
+            let setup = set_up_indexing("settings-indexer-busy", &unindexed, &recheck);
+            let settings = setup.settings();
+            // Both clicks come before the launcher hears the change ended.
+            settings.click(Target::IndexerInstall);
+            assert!(!settings.state(|window| window.panel.look(Target::IndexerInstall).enabled));
+            settings.click(Target::IndexerInstall);
+            setup.until(|window| window.panel.look(Target::IndexerRemove).enabled);
+            assert_eq!(
+                *unindexed.asked.lock().expect("asked"),
+                [true],
+                "asked once"
+            );
+        });
+    }
+
+    #[test]
+    fn an_indexer_service_refused_is_told_and_may_be_asked_for_again() {
+        on_hidden_desktop(|| {
+            let (unindexed, recheck) = (Arc::new(Unindexed::default()), files::Recheck::default());
+            unindexed
+                .refuse
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            let setup = set_up_indexing("settings-indexer-refused", &unindexed, &recheck);
+            let settings = setup.settings();
+            settings.click(Target::IndexerInstall);
+            let failed = "It did not go: Windows refused, or the prompt was declined";
+            setup.until(|window| {
+                let marks = &window.laid.marks;
+                marks.iter().any(
+                    |mark| matches!(&mark.what, What::Help { text, alarm: true } if text == failed),
+                )
+            });
+            assert!(!recheck.taken());
+            assert!(settings.state(|window| window.panel.look(Target::IndexerInstall).enabled));
         });
     }
 

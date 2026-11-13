@@ -13,15 +13,18 @@ use std::fs::{self, DirEntry, File};
 use std::io::{self, BufReader, BufWriter, Write};
 use std::os::windows::fs::{FileTypeExt, MetadataExt};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{self, Receiver};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard, TryLockError};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use hyalo_core::filter::Filters;
 use hyalo_core::item::{Item, ItemId};
+use hyalo_core::pipe::Answer;
 use hyalo_core::places::{self, Places};
 use hyalo_core::rank::Ranked;
+use hyalo_core::volume::{Change as Seen, Position};
 use hyalo_index::{EntryId, Index};
 use windows::Win32::Storage::FileSystem::{GetDriveTypeW, GetLogicalDriveStringsW};
 use windows::Win32::System::Com::CoTaskMemFree;
@@ -35,9 +38,11 @@ use crate::catalog::{Found, Provider, Request};
 use crate::store;
 
 mod changes;
+pub mod served;
 mod watch;
 
 use changes::{Change, Kind, Record, Stat};
+use served::{Following, Indexer, Listing};
 use watch::{Event, Watch};
 
 /// The file index the window searches.
@@ -163,28 +168,32 @@ const SAVE_EVERY: Duration = Duration::from_secs(6 * 60 * 60);
 pub type Roots = Arc<dyn Fn() -> Vec<PathBuf> + Send + Sync>;
 
 /// The files provider. The first run loads the snapshot, if there is
-/// one; every run takes out what is `excluded`, watches the roots, walks
-/// them leaving it out, saves the snapshot, then follows what the watches
-/// see until nobody searches the index any more. A run that starts while
-/// another is at work does nothing: that one keeps up with what is
-/// excluded.
+/// one; every run takes out what is `excluded`, has `indexer` follow the
+/// roots it reads, from where the index was saved, and watches and walks
+/// the others leaving it out, saves the snapshot, then follows what the
+/// service and the watches tell until nobody searches the index any more.
+/// A run that starts while another is at work does nothing: that one keeps
+/// up with what is excluded.
 pub fn provider(
     writer: Writer,
     roots: Roots,
     snapshot: Option<PathBuf>,
     excluded: Excluded,
+    (indexer, recheck): (Arc<dyn Indexer>, Recheck),
 ) -> Provider {
     let writer = Mutex::new(writer);
     Arc::new(move |_: &Request, report: &dyn Fn(Found)| {
         let writer = match writer.try_lock() {
             Ok(writer) => writer,
             Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
-            Err(TryLockError::WouldBlock) => return,
+            Err(TryLockError::WouldBlock) => return recheck.ask(),
         };
         let walk = Walk {
             roots: &*roots,
             snapshot: snapshot.as_deref(),
             excluded: &excluded,
+            indexer: &*indexer,
+            recheck: &recheck,
         };
         walk.serve(&writer.0, report);
     })
@@ -195,6 +204,96 @@ struct Walk<'a> {
     roots: &'a dyn Fn() -> Vec<PathBuf>,
     snapshot: Option<&'a Path>,
     excluded: &'a Excluded,
+    indexer: &'a dyn Indexer,
+    recheck: &'a Recheck,
+}
+
+/// Asks the files provider to look for the indexer service again, for
+/// the roots it walks: the window does once the service is installed, and
+/// so does a run of the provider that finds one at work, as showing the
+/// launcher now and then starts.
+#[derive(Clone, Default)]
+pub struct Recheck(Arc<AtomicBool>);
+
+impl Recheck {
+    pub fn ask(&self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+
+    /// Whether it was asked since it last said so.
+    pub(crate) fn taken(&self) -> bool {
+        self.0.swap(false, Ordering::SeqCst)
+    }
+}
+
+/// What the provider hears of a root: from its watch, or from the service.
+enum Heard {
+    Watch(Event),
+    Service(io::Result<Answer>),
+}
+
+/// Where each root's changes come from: the service, or a watch (none
+/// for a root Windows will not watch); and a listing the service is
+/// sending.
+struct Sources {
+    send: Sender<(usize, Heard)>,
+    served: Vec<Option<Following>>,
+    watches: Vec<Option<Watch>>,
+    listings: Vec<Option<Listing>>,
+}
+
+impl Sources {
+    fn new(send: Sender<(usize, Heard)>, roots: usize) -> Sources {
+        Sources {
+            send,
+            served: (0..roots).map(|_| None).collect(),
+            watches: (0..roots).map(|_| None).collect(),
+            listings: (0..roots).map(|_| None).collect(),
+        }
+    }
+
+    /// Has `indexer` follow the root `root`, the `at`th, from `from`;
+    /// whether it does.
+    fn serve(
+        &mut self,
+        at: usize,
+        root: &Path,
+        from: Option<Position>,
+        indexer: &dyn Indexer,
+    ) -> bool {
+        let Ok(stream) = indexer.follow(root, from) else {
+            return false;
+        };
+        self.served[at] = Some(Following::start(
+            stream,
+            at,
+            self.send.clone(),
+            Heard::Service,
+        ));
+        true
+    }
+
+    /// Watches the root `root`, the `at`th, in place of the service.
+    fn watch(&mut self, at: usize, root: &Path) {
+        let send = self.send.clone();
+        let tell = Box::new(move |event| send.send((at, Heard::Watch(event))).is_ok());
+        (self.served[at], self.listings[at]) = (None, None);
+        self.watches[at] = Watch::start(root, tell);
+    }
+
+    fn is_served(&self, at: usize) -> bool {
+        self.served[at].is_some()
+    }
+
+    /// Has `indexer` follow the roots that are walked, from where the
+    /// index is, in place of their watches, where it will.
+    fn serve_walked(&mut self, shared: &RwLock<Index>, roots: &[PathBuf], indexer: &dyn Indexer) {
+        for (at, root) in roots.iter().enumerate() {
+            if !self.is_served(at) && self.serve(at, root, position_of(shared, root), indexer) {
+                self.watches[at] = None;
+            }
+        }
+    }
 }
 
 impl Walk<'_> {
@@ -211,38 +310,49 @@ impl Walk<'_> {
         }
         prune(shared, self.excluded, report);
         let roots = (self.roots)();
-        let (sender, events) = mpsc::channel();
-        // Each root's events say which root they are about.
-        let tell = |sender: mpsc::Sender<(usize, Event)>, root: usize| {
-            Box::new(move |event| sender.send((root, event)).is_ok())
-        };
-        // A root Windows will not watch is walked at start alone.
-        let watches: Vec<Watch> = roots
-            .iter()
-            .enumerate()
-            .filter_map(|(at, root)| Watch::start(root, tell(sender.clone(), at)))
-            .collect();
+        let (send, heard) = mpsc::channel();
+        let mut sources = Sources::new(send, roots.len());
+        // The roots the service reads come from it, from where the index
+        // was saved; the others are watched, then walked. A root Windows
+        // will not watch is walked at start alone.
+        let mut walked = Vec::new();
+        for (at, root) in roots.iter().enumerate() {
+            let from = position_of(shared, root);
+            if !sources.serve(at, root, from, self.indexer) {
+                sources.watch(at, root);
+                walked.push(root.clone());
+            }
+        }
         // What the index leaves out: what the walk did, as it began, and
         // what its end took out, which a config saved meanwhile may name.
         let mut left_out = self.excluded.paths();
-        for path in self.walk(shared, &roots, report) {
+        let whole = walked.len() == roots.len();
+        // Every root the service's, nothing to walk or save: the listings
+        // are saved as they come.
+        let pruned = match walked.is_empty() && !roots.is_empty() {
+            true => Vec::new(),
+            false => self.walk(shared, &walked, whole, report),
+        };
+        for path in pruned {
             if !left_out.contains(&path) {
                 left_out.push(path);
             }
         }
-        self.follow(shared, &roots, &events, left_out, report);
-        drop(watches);
+        self.follow(shared, &roots, &heard, left_out, report, &mut sources);
+        drop(sources);
     }
 
     /// Walks the roots, takes out what was excluded while it went, and
-    /// saves the snapshot; what it took out as excluded.
+    /// saves the snapshot; what it took out as excluded. `whole`: whether
+    /// they are all the roots, so what the walk found is all the index.
     fn walk(
         &self,
         shared: &RwLock<Index>,
         roots: &[PathBuf],
+        whole: bool,
         report: &dyn Fn(Found),
     ) -> Vec<String> {
-        walk_into(shared, roots, self.excluded, report);
+        walk_into(shared, roots, whole, self.excluded, report);
         let pruned = prune(shared, self.excluded, report);
         save_to(shared, self.snapshot);
         pruned
@@ -258,9 +368,10 @@ impl Walk<'_> {
         &self,
         shared: &Arc<RwLock<Index>>,
         roots: &[PathBuf],
-        events: &Receiver<(usize, Event)>,
+        heard: &Receiver<(usize, Heard)>,
         excluded: Vec<String>,
         report: &dyn Fn(Found),
+        sources: &mut Sources,
     ) {
         let version = read(shared).version();
         let mut kept = Kept {
@@ -271,15 +382,14 @@ impl Walk<'_> {
         while Arc::strong_count(shared) > 1 {
             // Out of the match, which would hold the lock through it.
             let patience = kept.patience(read(shared).version());
-            match events.recv_timeout(patience) {
-                Ok((_, Event::Changed(records))) => self.take(shared, &records),
-                Ok((root, Event::Lost)) => {
-                    self.rewalk(shared, &roots[root]);
-                    kept.saved = Mark::new(read(shared).version());
-                }
-                Err(_) => {}
+            if let Ok((at, heard)) = heard.recv_timeout(patience) {
+                let root = (at, roots[at].as_path());
+                self.heard(shared, root, heard, (sources, &mut kept.saved));
             }
-            self.keep_out(shared, &mut kept.excluded, report);
+            self.keep_out(shared, roots, &mut kept.excluded, report, sources);
+            if self.recheck.taken() {
+                sources.serve_walked(shared, roots, self.indexer);
+            }
             let version = read(shared).version();
             if kept.told.due(version, Instant::now(), TELL_EVERY) {
                 report(Found::Files);
@@ -296,16 +406,100 @@ impl Walk<'_> {
         }
     }
 
+    /// Takes in what was heard of the root `root`, the `at`th: changes a
+    /// watch saw, a watch that lost track (the root is walked again and
+    /// saved, which `saved` notes), or what the service said.
+    fn heard(
+        &self,
+        shared: &RwLock<Index>,
+        (at, root): (usize, &Path),
+        heard: Heard,
+        (sources, saved): (&mut Sources, &mut Mark),
+    ) {
+        match heard {
+            Heard::Watch(Event::Changed(records)) => self.take(shared, &records),
+            Heard::Watch(Event::Lost) => {
+                self.rewalk(shared, root);
+                self.save(shared, saved);
+            }
+            Heard::Service(answer) => self.hear(shared, (at, root), answer, (sources, saved)),
+        }
+    }
+
+    /// Saves the snapshot, and notes in `saved` that it was, so it is not
+    /// saved again for nothing.
+    fn save(&self, shared: &RwLock<Index>, saved: &mut Mark) {
+        save_to(shared, self.snapshot);
+        *saved = Mark::new(read(shared).version());
+    }
+
+    /// Takes in what the service said of the root `root`, the `at`th: a
+    /// listing is put together, then put in place of what the index held
+    /// of the root and saved; changes are made at once, the folders that
+    /// came in asked for. A root the service no longer reads is watched
+    /// and walked again, and saved.
+    fn hear(
+        &self,
+        shared: &RwLock<Index>,
+        (at, root): (usize, &Path),
+        answer: io::Result<Answer>,
+        (sources, saved): (&mut Sources, &mut Mark),
+    ) {
+        match answer {
+            Ok(Answer::Listing(position)) => {
+                sources.listings[at] = Listing::new(&root_name(root), position);
+            }
+            Ok(Answer::Files(changes)) => {
+                if let Some(listing) = &mut sources.listings[at] {
+                    listing.take(&changes);
+                }
+            }
+            Ok(Answer::Listed) => {
+                if let Some(listing) = sources.listings[at].take() {
+                    self.listed(shared, listing);
+                    self.save(shared, saved);
+                }
+            }
+            Ok(Answer::Changed(position, changes)) => {
+                self.changed(shared, root, &changes, position)
+            }
+            _ => {
+                sources.watch(at, root);
+                self.rewalk(shared, root);
+                self.save(shared, saved);
+            }
+        }
+    }
+
+    /// Puts the listing `listing` in place of what the index held of its
+    /// root, and takes out what is excluded.
+    fn listed(&self, shared: &RwLock<Index>, listing: Listing) {
+        write(shared).replace(&listing.done());
+        prune(shared, self.excluded, &|_| {});
+    }
+
+    /// Makes the service's `changes` to the root `root`, read up to
+    /// `position`, and those under the folders they brought in; takes out
+    /// what is excluded.
+    fn changed(&self, shared: &RwLock<Index>, root: &Path, changes: &[Seen], position: Position) {
+        let came = settled(shared, root, changes, position);
+        if !came.is_empty()
+            && let Ok(under) = self.indexer.subtree(root, &came)
+        {
+            settled(shared, root, &under, position);
+        }
+        prune(shared, self.excluded, &|_| {});
+    }
+
     /// Walks `root` again into an index of its own and puts what it found
-    /// in place of what the index held of it; takes out what is excluded,
-    /// and saves the snapshot. The other roots stay as they are.
+    /// in place of what the index held of it, and takes out what is
+    /// excluded. The other roots stay as they are.
     fn rewalk(&self, shared: &RwLock<Index>, root: &Path) {
         let fresh = RwLock::default();
         walk(root, &fresh, self.excluded);
         let fresh = fresh.into_inner().unwrap_or_else(PoisonError::into_inner);
         write(shared).replace(&fresh);
         prune(shared, self.excluded, &|_| {});
-        save_to(shared, self.snapshot);
     }
 
     /// Makes the changes `records` hold, then walks the folders they
@@ -328,14 +522,33 @@ impl Walk<'_> {
     }
 
     /// Puts in force what is excluded, if it changed since `seen`: takes
-    /// out what is excluded now, and brings back what no longer is.
-    fn keep_out(&self, shared: &RwLock<Index>, seen: &mut Vec<String>, report: &dyn Fn(Found)) {
+    /// out what is excluded now, and brings back what no longer is: on a
+    /// root the service reads, by listing it again, for the files it
+    /// brings back must come with their records.
+    fn keep_out(
+        &self,
+        shared: &RwLock<Index>,
+        roots: &[PathBuf],
+        seen: &mut Vec<String>,
+        report: &dyn Fn(Found),
+        sources: &mut Sources,
+    ) {
         let now = self.excluded.paths();
         if now == *seen {
             return;
         }
         prune(shared, self.excluded, report);
-        let back = seen.iter().filter(|path| !now.contains(path));
+        let back: Vec<&String> = seen.iter().filter(|path| !now.contains(path)).collect();
+        let read_by_service: Vec<bool> = (0..roots.len()).map(|at| sources.is_served(at)).collect();
+        let served = |path: &&String| {
+            let under = roots.iter().position(|root| under_root(path, root));
+            under.filter(|&at| read_by_service[at])
+        };
+        let relisted: Vec<usize> = back.iter().filter_map(served).collect();
+        for at in relisted {
+            sources.serve(at, &roots[at], None, self.indexer);
+        }
+        let back = back.into_iter().filter(|path| served(path).is_none());
         let back = back.filter_map(|path| {
             let (kind, stat) = on_disk(path)?;
             Some(Change::Added(path.clone(), kind, stat))
@@ -389,6 +602,32 @@ impl Mark {
         }
         due
     }
+}
+
+/// How far the index took in the journal of the volume whose root is
+/// `root`, if it is one the service read before.
+fn position_of(shared: &RwLock<Index>, root: &Path) -> Option<Position> {
+    let index = read(shared);
+    index.position(index.find(&root_name(root))?)
+}
+
+/// Makes `changes` to the volume whose root is `root`, read up to
+/// `position`: the folders that came in; none if the index holds no such
+/// root.
+fn settled(shared: &RwLock<Index>, root: &Path, changes: &[Seen], position: Position) -> Vec<u32> {
+    let mut index = write(shared);
+    let Some(top) = index.find(&root_name(root)) else {
+        return Vec::new();
+    };
+    served::settle(&mut index, top, changes, position)
+}
+
+/// Whether the full path `path` lies under the root `root`.
+fn under_root(path: &str, root: &Path) -> bool {
+    let name = lowercase(&root_name(root));
+    let path = lowercase(path);
+    path.strip_prefix(&name)
+        .is_some_and(|rest| rest.starts_with('\\'))
 }
 
 /// What the walk would take the name at `path` for, if it is there, and
@@ -489,11 +728,13 @@ fn load_into(shared: &RwLock<Index>, snapshot: Option<&Path>, report: &dyn Fn(Fo
 }
 
 /// Walks the roots: straight into an empty index, so files turn up as
-/// they are found, or into a fresh one swapped in whole. Either way gives
-/// back the room kept for growth.
+/// they are found, or into a fresh one, swapped in whole if they are all
+/// the roots (`whole`), else put in place of what the index held of them.
+/// Either way gives back the room kept for growth.
 fn walk_into(
     shared: &RwLock<Index>,
     roots: &[PathBuf],
+    whole: bool,
     excluded: &Excluded,
     report: &dyn Fn(Found),
 ) {
@@ -507,7 +748,10 @@ fn walk_into(
         walk_all(roots, &fresh, excluded, &|| {});
         let mut fresh = fresh.into_inner().unwrap_or_else(PoisonError::into_inner);
         fresh.shrink_to_fit();
-        *write(shared) = fresh;
+        match whole {
+            true => *write(shared) = fresh,
+            false => write(shared).replace(&fresh),
+        }
     }
     report(Found::Files);
     let index = read(shared);
@@ -746,7 +990,12 @@ mod tests {
     use std::sync::atomic::AtomicUsize;
     use std::sync::atomic::Ordering::SeqCst;
 
-    fn walked(root: &Path) -> Index {
+    /// No service: every root is walked.
+    fn walked() -> Arc<dyn Indexer> {
+        Arc::new(served::Walked)
+    }
+
+    fn walked_index(root: &Path) -> Index {
         walked_leaving_out(root, &Excluded::default())
     }
 
@@ -843,7 +1092,7 @@ mod tests {
     fn a_walk_finds_every_file_and_folder_under_its_root() {
         let folder =
             Scratch::new("walk").with(&["notes.txt", "a\\", "a\\b\\", "a\\b\\deep notes.md"]);
-        let index = walked(&folder.0);
+        let index = walked_index(&folder.0);
         assert_eq!(index.len(), 5, "the root and four entries");
         assert_eq!(
             found(&index, "notes"),
@@ -867,7 +1116,7 @@ mod tests {
     fn a_walk_keeps_each_files_size_and_last_write() {
         let folder = Scratch::new("walk-stat").with(&["sub\\"]);
         fs::write(folder.0.join(r"sub\five.txt"), b"12345").expect("write");
-        let index = walked(&folder.0);
+        let index = walked_index(&folder.0);
         let five = index.find(&folder.path(r"sub\five.txt")).expect("found");
         assert_eq!(
             index.stat(five),
@@ -887,7 +1136,7 @@ mod tests {
             .output()
             .expect("run mklink");
         assert!(made.status.success(), "make a junction");
-        let index = walked(&folder.0);
+        let index = walked_index(&folder.0);
         assert_eq!(found(&index, "inside"), [folder.path(r"real\inside.txt")]);
         let rows = index.search("link", &Places::default(), 5).rows;
         assert_eq!(rows[0].item.id.0, folder.path("link"));
@@ -918,7 +1167,7 @@ mod tests {
             "sub\\$kept\\",
             r"sub\$kept\kept.txt",
         ]);
-        let index = walked(&folder.0);
+        let index = walked_index(&folder.0);
         assert_eq!(found(&index, "deleted"), Vec::<String>::new());
         assert_eq!(found(&index, "volume"), Vec::<String>::new());
         assert_eq!(
@@ -955,7 +1204,13 @@ mod tests {
         let roots: Roots = Arc::new(move || vec![root.clone()]);
         let excluded = Excluded::default();
         (
-            provider(writer, roots, snapshot, excluded.clone()),
+            provider(
+                writer,
+                roots,
+                snapshot,
+                excluded.clone(),
+                (walked(), Recheck::default()),
+            ),
             files,
             excluded,
         )
@@ -1103,7 +1358,16 @@ mod tests {
         let root = folder.0.join("watched");
         let (files, writer) = Files::new();
         let roots: Roots = Arc::new(move || vec![root.clone()]);
-        let serving = Serving::new(provider(writer, roots, None, Excluded::default()), files);
+        let serving = Serving::new(
+            provider(
+                writer,
+                roots,
+                None,
+                Excluded::default(),
+                (walked(), Recheck::default()),
+            ),
+            files,
+        );
         serving.until(|serving| serving.reports() >= 1);
         fs::rename(outside.0.join("brought"), folder.0.join(r"watched\brought")).expect("move in");
         serving.finds("inside", &[folder.path(r"watched\brought\deep\inside.txt")]);
@@ -1302,14 +1566,17 @@ mod tests {
             roots: &|| Vec::new(),
             snapshot: None,
             excluded: &excluded,
+            indexer: &served::Walked,
+            recheck: &Recheck::default(),
         };
         let roots = [kept.0.clone(), lost.0.clone()];
-        walk.walk(&writer.0, &roots, &|_| {});
+        walk.walk(&writer.0, &roots, true, &|_| {});
         // Made while nothing watches: only a walk finds them.
         fs::write(lost.0.join("unseen.txt"), b"x").expect("write");
         fs::write(kept.0.join("unseen.txt"), b"x").expect("write");
         let (sender, events) = mpsc::channel();
-        sender.send((1, Event::Lost)).expect("send");
+        let mut sources = Sources::new(sender.clone(), roots.len());
+        sender.send((1, Heard::Watch(Event::Lost))).expect("send");
         // Searches until it finds, then lets the index go, which ends the
         // following.
         let searching = thread::spawn(move || {
@@ -1319,7 +1586,14 @@ mod tests {
             }
             search(&files, "unseen")
         });
-        walk.follow(&writer.0, &roots, &events, Vec::new(), &|_| {});
+        walk.follow(
+            &writer.0,
+            &roots,
+            &events,
+            Vec::new(),
+            &|_| {},
+            &mut sources,
+        );
         let found = searching.join().expect("the search");
         assert_eq!(
             found,
@@ -1402,7 +1676,16 @@ mod tests {
             Vec::new()
         });
         let excluded = excluding(&[folder.path("gone")]);
-        let serving = Serving::new(provider(writer, roots, Some(snapshot), excluded), files);
+        let serving = Serving::new(
+            provider(
+                writer,
+                roots,
+                Some(snapshot),
+                excluded,
+                (walked(), Recheck::default()),
+            ),
+            files,
+        );
         // Before the walk asks for its roots, the snapshot is in, what is
         // excluded is out, and the window was told of both.
         let pruned = |serving: &Serving| {
@@ -1476,7 +1759,13 @@ mod tests {
             vec![]
         });
         let serving = Serving::new(
-            provider(writer, roots, Some(path), Excluded::default()),
+            provider(
+                writer,
+                roots,
+                Some(path),
+                Excluded::default(),
+                (walked(), Recheck::default()),
+            ),
             files,
         );
         serving.until(|_| before_walking.lock().expect("seen").is_some());
@@ -1510,7 +1799,13 @@ mod tests {
             gate.1.wait();
             vec![root.clone()]
         });
-        let provider = provider(writer, roots, None, Excluded::default());
+        let provider = provider(
+            writer,
+            roots,
+            None,
+            Excluded::default(),
+            (walked(), Recheck::default()),
+        );
         let serving = Serving::new(Arc::clone(&provider), files);
         shared.0.wait();
         assert_eq!(run(&provider), 0, "busy");
@@ -1524,6 +1819,321 @@ mod tests {
         let local = std::env::var_os("LOCALAPPDATA").expect("LOCALAPPDATA is set on Windows");
         let expected = PathBuf::from(local).join("hyalo").join("files.idx");
         assert_eq!(default_snapshot(), Some(expected));
+    }
+
+    /// The service as a test speaks for it: each follow takes the next
+    /// stream given, whose answers the test sends; where it was asked to
+    /// follow from is noted; the folders it is asked for hold `under`.
+    struct Scripted {
+        streams: Mutex<Vec<Receiver<io::Result<Answer>>>>,
+        asked: Mutex<Vec<Option<Position>>>,
+        under: Mutex<Vec<Seen>>,
+    }
+
+    impl Scripted {
+        /// The service, with one stream, and where its answers are sent.
+        fn new() -> (Arc<Scripted>, Sender<io::Result<Answer>>) {
+            let (send, answers) = mpsc::channel();
+            let scripted = Scripted {
+                streams: Mutex::new(vec![answers]),
+                asked: Mutex::new(Vec::new()),
+                under: Mutex::new(Vec::new()),
+            };
+            (Arc::new(scripted), send)
+        }
+
+        fn asked(&self) -> Vec<Option<Position>> {
+            self.asked.lock().expect("asked").clone()
+        }
+    }
+
+    impl Indexer for Scripted {
+        fn follow(&self, _: &Path, from: Option<Position>) -> io::Result<Box<dyn served::Stream>> {
+            self.asked.lock().expect("asked").push(from);
+            let stream = self.streams.lock().expect("streams").pop();
+            let stream = stream.ok_or(io::ErrorKind::Unsupported)?;
+            Ok(Box::new(Scripting(stream)))
+        }
+
+        fn subtree(&self, _: &Path, _: &[u32]) -> io::Result<Vec<Seen>> {
+            Ok(self.under.lock().expect("under").clone())
+        }
+    }
+
+    /// A stream of the answers a test sends; it fails once the test lets
+    /// go of it.
+    struct Scripting(Receiver<io::Result<Answer>>);
+
+    impl served::Stream for Scripting {
+        fn next(&mut self, stop: &std::sync::atomic::AtomicBool) -> io::Result<Option<Answer>> {
+            loop {
+                match self.0.recv_timeout(Duration::from_millis(20)) {
+                    Ok(answer) => return answer.map(Some),
+                    Err(mpsc::RecvTimeoutError::Disconnected) => {
+                        return Err(io::ErrorKind::BrokenPipe.into());
+                    }
+                    Err(mpsc::RecvTimeoutError::Timeout) if stop.load(SeqCst) => return Ok(None),
+                    Err(mpsc::RecvTimeoutError::Timeout) => {}
+                }
+            }
+        }
+    }
+
+    /// What the service says of the file of `record`: there, a folder or
+    /// not, named `name` in the folder of `parent`.
+    fn seen(record: u32, folder: bool, parent: u32, name: &str) -> Seen {
+        Seen {
+            record,
+            file: Some(hyalo_core::volume::File {
+                folder,
+                size: 7,
+                written: 1_700_000_000,
+                names: vec![hyalo_core::volume::Name {
+                    parent,
+                    text: name.to_string(),
+                }],
+            }),
+        }
+    }
+
+    const ROOT: u32 = hyalo_core::volume::ROOT;
+
+    fn at(next: i64) -> Position {
+        Position {
+            volume: 0xAB,
+            journal: 2,
+            next,
+        }
+    }
+
+    /// The provider following `folder` through `indexer`, keeping its
+    /// snapshot at `snapshot`, leaving out `excluded`.
+    fn served(
+        folder: &Scratch,
+        indexer: Arc<dyn Indexer>,
+        snapshot: Option<PathBuf>,
+        excluded: &Excluded,
+    ) -> Serving {
+        let (files, writer) = Files::new();
+        let root = folder.0.clone();
+        let roots: Roots = Arc::new(move || vec![root.clone()]);
+        Serving::new(
+            provider(
+                writer,
+                roots,
+                snapshot,
+                excluded.clone(),
+                (indexer, Recheck::default()),
+            ),
+            files,
+        )
+    }
+
+    /// Sends a listing of `folder`'s volume: a folder `listed` (record
+    /// 40) holding `inside.txt` (41).
+    fn list(send: &Sender<io::Result<Answer>>, position: Position) {
+        for answer in [
+            Answer::Listing(position),
+            Answer::Files(vec![seen(40, true, ROOT, "listed")]),
+            Answer::Files(vec![seen(41, false, 40, "inside.txt")]),
+            Answer::Listed,
+        ] {
+            send.send(Ok(answer)).expect("sent");
+        }
+    }
+
+    #[test]
+    fn a_root_the_service_reads_comes_from_it_and_is_not_walked() {
+        let folder = Scratch::new("served").with(&["walked.txt"]);
+        let (indexer, send) = Scripted::new();
+        let serving = served(&folder, indexer.clone(), None, &Excluded::default());
+        list(&send, at(100));
+        serving.finds("inside", &[folder.path(r"listed\inside.txt")]);
+        assert_eq!(search(serving.files(), "walked"), Vec::<String>::new());
+        assert_eq!(indexer.asked(), [None], "from nothing: no snapshot");
+    }
+
+    #[test]
+    fn what_the_service_says_changed_is_in_the_index_at_once() {
+        let folder = Scratch::new("served-changed");
+        let (indexer, send) = Scripted::new();
+        let serving = served(&folder, indexer, None, &Excluded::default());
+        list(&send, at(100));
+        serving.finds("inside", &[folder.path(r"listed\inside.txt")]);
+        let renamed = Answer::Changed(at(200), vec![seen(41, false, 40, "renamed.txt")]);
+        send.send(Ok(renamed)).expect("sent");
+        serving.finds("renamed", &[folder.path(r"listed\renamed.txt")]);
+        assert_eq!(search(serving.files(), "inside"), Vec::<String>::new());
+    }
+
+    #[test]
+    fn a_folder_that_came_in_whole_brings_what_it_holds() {
+        let folder = Scratch::new("served-came");
+        let (indexer, send) = Scripted::new();
+        *indexer.under.lock().expect("under") = vec![seen(43, false, 42, "restored.txt")];
+        let serving = served(&folder, indexer, None, &Excluded::default());
+        list(&send, at(100));
+        let restored = Answer::Changed(at(200), vec![seen(42, true, 40, "back")]);
+        send.send(Ok(restored)).expect("sent");
+        serving.finds("restored", &[folder.path(r"listed\back\restored.txt")]);
+    }
+
+    #[test]
+    fn a_root_the_service_refuses_is_walked_and_watched() {
+        let folder = Scratch::new("served-refused").with(&["walked.txt"]);
+        let (indexer, send) = Scripted::new();
+        let serving = served(&folder, indexer, None, &Excluded::default());
+        send.send(Ok(Answer::Refused)).expect("sent");
+        serving.finds("walked", &[folder.path("walked.txt")]);
+        fs::write(folder.0.join("later.txt"), b"x").expect("write");
+        serving.finds("later", &[folder.path("later.txt")]);
+    }
+
+    #[test]
+    fn a_root_the_service_let_go_of_is_walked_again() {
+        let folder = Scratch::new("served-gone").with(&["walked.txt"]);
+        let (indexer, send) = Scripted::new();
+        let serving = served(&folder, indexer, None, &Excluded::default());
+        list(&send, at(100));
+        serving.finds("inside", &[folder.path(r"listed\inside.txt")]);
+        drop(send);
+        serving.finds("walked", &[folder.path("walked.txt")]);
+        assert_eq!(search(serving.files(), "inside"), Vec::<String>::new());
+    }
+
+    #[test]
+    fn the_service_is_asked_from_where_the_index_was_saved() {
+        let folder = Scratch::new("served-saved");
+        let snapshot = Scratch::new("served-saved-snapshot");
+        let path = snapshot.0.join("files.idx");
+        let (indexer, send) = Scripted::new();
+        let first = served(&folder, indexer, Some(path.clone()), &Excluded::default());
+        list(&send, at(100));
+        let later = Answer::Changed(at(300), vec![seen(44, false, 40, "later.txt")]);
+        send.send(Ok(later)).expect("sent");
+        first.finds("later", &[folder.path(r"listed\later.txt")]);
+        first.stop();
+        let (again, _send) = Scripted::new();
+        let second = served(&folder, again.clone(), Some(path), &Excluded::default());
+        second.until(|_| !again.asked().is_empty());
+        assert_eq!(again.asked(), [Some(at(300))]);
+        second.finds("inside", &[folder.path(r"listed\inside.txt")]);
+    }
+
+    #[test]
+    fn what_is_excluded_stays_out_of_a_listing() {
+        let folder = Scratch::new("served-excluded");
+        let (indexer, send) = Scripted::new();
+        let excluded = excluding(&[folder.path("listed")]);
+        let serving = served(&folder, indexer, None, &excluded);
+        send.send(Ok(Answer::Listing(at(100)))).expect("sent");
+        let files = vec![
+            seen(40, true, ROOT, "listed"),
+            seen(41, false, 40, "inside.txt"),
+            seen(45, false, ROOT, "kept.txt"),
+        ];
+        send.send(Ok(Answer::Files(files))).expect("sent");
+        send.send(Ok(Answer::Listed)).expect("sent");
+        serving.finds("kept", &[folder.path("kept.txt")]);
+        assert_eq!(search(serving.files(), "inside"), Vec::<String>::new());
+    }
+
+    /// When the snapshot at `path` was last written, once it is there.
+    fn written_at(serving: &Serving, path: &Path) -> std::time::SystemTime {
+        serving.until(|_| path.exists());
+        fs::metadata(path)
+            .and_then(|file| file.modified())
+            .expect("saved")
+    }
+
+    #[test]
+    fn a_listing_is_saved_at_once_and_not_again_when_nothing_changed_since() {
+        let folder = Scratch::new("served-saved-once");
+        let snapshot = Scratch::new("served-saved-once-snapshot");
+        let path = snapshot.0.join("files.idx");
+        let (indexer, send) = Scripted::new();
+        let serving = served(&folder, indexer, Some(path.clone()), &Excluded::default());
+        list(&send, at(100));
+        serving.finds("inside", &[folder.path(r"listed\inside.txt")]);
+        let saved = written_at(&serving, &path);
+        serving.stop();
+        assert_eq!(
+            fs::metadata(&path).and_then(|file| file.modified()).ok(),
+            Some(saved)
+        );
+    }
+
+    #[test]
+    fn roots_the_service_reads_are_not_saved_until_listed() {
+        let folder = Scratch::new("served-not-saved");
+        let snapshot = Scratch::new("served-not-saved-snapshot");
+        let path = snapshot.0.join("files.idx");
+        let (indexer, send) = Scripted::new();
+        let serving = served(
+            &folder,
+            indexer.clone(),
+            Some(path.clone()),
+            &Excluded::default(),
+        );
+        serving.until(|_| !indexer.asked().is_empty());
+        thread::sleep(3 * TELL_EVERY);
+        assert!(!path.exists(), "nothing walked, nothing saved");
+        list(&send, at(100));
+        serving.finds("inside", &[folder.path(r"listed\inside.txt")]);
+        assert!(serving.until(|_| path.exists()), "the listing saved");
+    }
+
+    #[test]
+    fn a_root_walked_again_once_the_service_refused_it_is_saved_once() {
+        let folder = Scratch::new("served-refused-saved").with(&["walked.txt"]);
+        let snapshot = Scratch::new("served-refused-saved-snapshot");
+        let path = snapshot.0.join("files.idx");
+        let (indexer, send) = Scripted::new();
+        let serving = served(&folder, indexer, Some(path.clone()), &Excluded::default());
+        send.send(Ok(Answer::Refused)).expect("sent");
+        serving.finds("walked", &[folder.path("walked.txt")]);
+        let saved = written_at(&serving, &path);
+        // Long enough for a watch's first read to have nothing to tell.
+        thread::sleep(3 * TELL_EVERY);
+        let saved = fs::metadata(&path)
+            .and_then(|file| file.modified())
+            .unwrap_or(saved);
+        serving.stop();
+        assert_eq!(
+            fs::metadata(&path).and_then(|file| file.modified()).ok(),
+            Some(saved)
+        );
+    }
+
+    #[test]
+    fn asking_to_look_for_the_service_again_is_taken_once() {
+        let recheck = Recheck::default();
+        assert!(!recheck.taken());
+        recheck.ask();
+        recheck.ask();
+        assert!(recheck.taken());
+        assert!(!recheck.taken(), "taken already");
+    }
+
+    #[test]
+    fn a_service_that_comes_later_takes_over_a_walked_root() {
+        let folder = Scratch::new("served-later").with(&["walked.txt"]);
+        let (indexer, send) = Scripted::new();
+        let waiting = indexer.streams.lock().expect("streams").pop().expect("one");
+        let (files, writer) = Files::new();
+        let root = folder.0.clone();
+        let roots: Roots = Arc::new(move || vec![root.clone()]);
+        let sources = (indexer.clone() as Arc<dyn Indexer>, Recheck::default());
+        let provider = provider(writer, roots, None, Excluded::default(), sources);
+        let serving = Serving::new(Arc::clone(&provider), files);
+        serving.finds("walked", &[folder.path("walked.txt")]);
+        indexer.streams.lock().expect("streams").push(waiting);
+        // Showing the launcher runs the provider, which finds one at work.
+        assert_eq!(run(&provider), 0);
+        list(&send, at(100));
+        serving.finds("inside", &[folder.path(r"listed\inside.txt")]);
+        assert_eq!(search(serving.files(), "walked"), Vec::<String>::new());
+        assert_eq!(indexer.asked(), [None, None]);
     }
 
     #[test]

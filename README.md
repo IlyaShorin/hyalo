@@ -97,9 +97,9 @@ Measured on one machine, with more than two million names on two NVMe drives, ag
 | A search, median | 2–6 ms | 2–11 ms |
 | Loading the saved index at start | 0.36 s | 0.55 s |
 | Memory the index takes | 212 MB | 220 MB |
-| Building the index from nothing | 104 s, with your rights | 10.6 s, with admin rights |
+| Building the index from nothing | 2.7 s with its indexer service; 104 s walking, with your rights | 10.6 s, with admin rights |
 
-Everything reads the drive's master file table, which needs administrator rights; hyalo walks the folders as you, and only once. After that it loads its saved index and follows every change as it happens. The [full results and method](docs/benchmarks.md) are written up.
+Reading a drive's master file table needs administrator rights. hyalo's indexer service, installed once from the settings window, reads it, so hyalo itself never runs as administrator; without the service hyalo walks the folders as you, and only once. Either way it then loads its saved index and follows every change as it happens. The [full results and method](docs/benchmarks.md) are written up.
 
 ## Settings
 

@@ -5,7 +5,7 @@ How hyalo is built, tested and released, what it aims at, and what may come next
 ## Goals
 
 - The window is on screen one frame after the hotkey. Zero CPU and GPU while hidden.
-- Any file on any NTFS drive, instantly: read the MFT and follow the USN journal instead of crawling.
+- Any file on any NTFS drive, instantly: read the MFT and follow the USN journal instead of crawling (the indexer service: 2.7 s for 2.3 million names here).
 - Ranking that matches intent: apps above files, your folders above caches, results you pick rise.
 - Frosted glass UI drawn natively (DWM Acrylic backdrop + Direct2D). No Electron, no WebView, no .NET.
 - No in-process plugins. Extensibility through script commands that run out of process.
@@ -16,10 +16,10 @@ How hyalo is built, tested and released, what it aims at, and what may come next
 |---|---|
 | `hyalo` | Launcher: window, hotkey, tray, rendering, providers (apps and their uninstallers, files, exchange rates, settings, windows, what is copied), updating itself |
 | `hyalo-core` | Items, matching (incl. wrong keyboard layout), ranking, frecency, location boosts, the calculator and currency answers, web search prefixes, which windows the switcher lists, the table of Windows' settings and the system commands, which uninstaller removes an app, the clipboard history (what it keeps, what an app marks private, how each entry shows as a row, the bitmaps, files and HTML it reads), the config and hotkey names, releases (versions, GitHub's answer, SHA-256 sums, when to ask again); later the query language and pipe protocol. Pure and tested |
-| `hyalo-index` | The file index: every name once in an arena (and folded in another), 16-byte entries, search split over every core, a snapshot on disk. Pure: a directory walk and the drives' change notifications feed it now, the indexer service later |
-| `hyalo-indexer` (planned) | Windows service: reads the MFT, follows the USN journal, answers queries over a named pipe restricted to the user |
+| `hyalo-index` | The file index: every name once in an arena (and folded in another), 16-byte entries, search split over every core, a snapshot on disk. Pure: a directory walk and the drives' change notifications feed it, or the indexer service, by record number |
+| `hyalo-indexer` | The indexer service, linked into hyalo.exe: reads NTFS master file tables (`mft`, `listing`, pure) and USN journals (`usn`, pure) through a `Disk` (`ntfs`, the real one), sends each volume over a named pipe only the system and its users may open (`server`, `client`, the protocol in `hyalo_core::pipe`), and installs, runs and removes itself through the service manager (`scm`, `manager`, `service`) |
 
-The launcher never runs elevated. Only the indexer service does, because MFT access needs admin rights. Without the service the launcher falls back to walking directories (what it does today).
+The launcher never runs elevated. Only the indexer service does, because MFT access needs admin rights: it is hyalo.exe copied to Program Files and run by the service manager with `--indexer`, installed by hyalo.exe started through the UAC prompt with `--indexer-install <SID>`. It keeps no index and writes nothing: it sends each volume's files by record number, then what each changed file is now, and the launcher keeps the index. Without the service the launcher walks directories and watches them, as before, root by root.
 
 ## Roadmap
 
@@ -92,6 +92,7 @@ Changes follow [ub-mode](https://github.com/unclebob/ub-mode): test first, small
 scripts/gates.sh          # CRAP < 10 and duplication < 0.8
 scripts/gates.sh mutate   # mutation testing
 cargo bench -p hyalo-index                            # search a million made-up names
+cargo test --release -p hyalo -- --ignored --nocapture service_   # time the installed indexer service
 HYALO_BENCH_NAMES=3000000 cargo bench -p hyalo-index  # or as many as you like
 ```
 

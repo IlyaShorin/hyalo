@@ -9,16 +9,17 @@
 - Windows 11 Pro, build 26300
 - hyalo 0.2.7 (release build), Everything 1.4.1.1032 (x64) with its service
 - Measured on 13 November 2026, with warm caches. hyalo's search times were measured again later that day, after the search changes that followed 0.2.8, on a fresh walk of the same drives (2,220,790 names).
+- hyalo's indexer service was measured that evening, from the build that brought it (after 0.2.9), installed as hyalo installs it.
 
 ## Results
 
-| | hyalo | Everything |
-|---|---|---|
-| Names in the index | 2,217,570 | 2,384,839 |
-| Building the index from nothing | 104 s | 10.6 s |
-| Loading the saved index at start | 0.36 s | 0.55 s |
-| Memory the index takes | 212 MB | 220 MB |
-| Search, median of one query | 2–6 ms | 2–11 ms |
+| | hyalo, walking | hyalo, with its indexer service | Everything |
+|---|---|---|---|
+| Names in the index | 2,217,570 | 2,296,194 | 2,384,839 |
+| Building the index from nothing | 104 s | 2.7 s | 10.6 s |
+| Loading the saved index at start | 0.36 s | 0.36 s | 0.55 s |
+| Memory the index takes | 212 MB | 236 MB | 220 MB |
+| Search, median of one query | 2–6 ms | 2–6 ms | 2–11 ms |
 
 Search times per query, in milliseconds, the median of many runs:
 
@@ -39,13 +40,16 @@ Search times per query, in milliseconds, the median of many runs:
 ## What the numbers mean
 
 - **Searching is as quick, or quicker.** Over more than two million names hyalo answered every query here in 2 to 6 ms, Everything in 2 to 11 ms, both faster than a screen refreshes. hyalo also does more with each name than Everything does: besides finding the letters anywhere, it scores word starts and acronyms (`vsc` finds Visual Studio Code) and the other keyboard layout, then ranks the results.
-- **Building the index from nothing is where Everything wins**, by ten times. Everything reads the NTFS master file table through a service that runs as administrator. hyalo never asks for admin rights: it walks the folders with your own rights, and only on its first start. After that it loads its saved index in a third of a second and follows every change to the drives as it happens, so the walk is not something you wait for again.
-- **Memory is the same**, about 100 bytes a name.
-- The two indexes are not the same size. Everything lists every file record on the volumes. hyalo leaves out `$Recycle.Bin`, `System Volume Information` and the other `$` folders, never enters junctions or symbolic links, and cannot see into folders your account may not open. A real hyalo config also leaves out `C:\Windows\WinSxS` by default, which brings it to about 1.9 million names here.
+- **Building the index from nothing takes hyalo 2.7 seconds with its indexer service**, four times quicker than Everything, forty times quicker than its own walk. The service, which you install once from the settings window with an administrator's yes, reads each NTFS drive's master file table as Everything does: 1.5 s to have the system drive's table read and the first files sent, then the launcher takes in 2.29 million names in 0.8 s; the data drive, with 4,685, takes 0.05 s. The launcher itself never runs as administrator. Without the service hyalo walks the folders with your own rights, as before: 104 s, and only on its first start. Either way it then loads its saved index in a third of a second and follows every change as it happens: with the service through each drive's journal, told within a tenth of a second.
+- **Searching is the same either way**: the index is the launcher's own, wherever its names came from.
+- **Memory is the same**, about 100 bytes a name. With the service each entry also keeps the number of its file's record (4 bytes), so a change from the journal finds it.
+- The indexes are not the same size. Everything lists every file record on the volumes. hyalo leaves out `$Recycle.Bin`, `System Volume Information` and the other `$` folders; walking, it never enters junctions or symbolic links and cannot see into folders your account may not open, which the service's master file table lists like any other (other users' profiles, `WindowsApps`), as Everything does. A real hyalo config also leaves out `C:\Windows\WinSxS` by default, which brings it to about 1.9 million names here.
 
 ## How it was measured
 
 **hyalo.** The index came from hyalo's own walk of both drives with nothing excluded, saved as a snapshot. `cargo bench -p hyalo-index` with `HYALO_BENCH_SNAPSHOT` naming that snapshot loads it as the launcher does at start and runs each query 21 times in the same process, asking for the 16 best rows, as the launcher does. Its memory is the index's own count of the bytes it holds.
+
+**hyalo's indexer service.** Installed from the build that brought it, as the settings window installs it. `service_lists_the_fixed_drives`, an ignored test (`cargo test --release -p hyalo -- --ignored --nocapture service_lists`), asks the service for each fixed drive from nothing, as the launcher does at a first start, and takes the listing into an index as the launcher does; the time runs from the request to the index whole, and includes the service flushing what Windows holds of the drive to the disk before it reads the table. The median of five runs: C: 2.61 s (1.46 s to the first files, 0.82 s taking them in), D: 0.05 s; the launcher asks for both drives at once. Its memory is the index's own count of its bytes. `service_tells_of_changes_on_the_system_drive` makes, renames and removes a file in `%TEMP%`: the service told of each within 0.1 to 0.3 s.
 
 **Everything.** Started with an empty database, the time until it said, through its IPC, that its database was loaded; then closed and started again on the saved database. Searches went through Everything's IPC (`WM_COPYDATA`, as its SDK sends them) from another process, so they include the hop between processes. Each query ran 51 times, asking for the first 16 results in Everything's default order, by name. Its memory is the working set of its process after indexing, without its service.
 

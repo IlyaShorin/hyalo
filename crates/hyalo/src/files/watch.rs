@@ -66,8 +66,23 @@ pub type Tell = Box<dyn Fn(Event) -> bool + Send>;
 
 /// A watch on one root, on a thread of its own until it is dropped.
 pub struct Watch {
+    _thread: Stopping,
+}
+
+/// A thread that goes on until its flag says stop: dropped, it is told
+/// to, and waited for.
+pub struct Stopping {
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
+}
+
+impl Stopping {
+    pub fn new(stop: Arc<AtomicBool>, thread: JoinHandle<()>) -> Stopping {
+        Stopping {
+            stop,
+            thread: Some(thread),
+        }
+    }
 }
 
 impl Watch {
@@ -91,13 +106,12 @@ impl Watch {
             return None;
         }
         Some(Watch {
-            stop,
-            thread: Some(thread),
+            _thread: Stopping::new(stop, thread),
         })
     }
 }
 
-impl Drop for Watch {
+impl Drop for Stopping {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::SeqCst);
         if let Some(thread) = self.thread.take() {

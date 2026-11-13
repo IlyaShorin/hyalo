@@ -11,6 +11,7 @@ mod files;
 mod highlight;
 mod hotkeys;
 mod http;
+mod indexer;
 mod install;
 mod instance;
 mod keys;
@@ -59,8 +60,11 @@ use windows::Win32::UI::HiDpi::{
 /// A new build an update started (`--replace`) waits for the old one to
 /// end, then runs in its place. A release build started from anywhere
 /// but `%LOCALAPPDATA%\Programs\hyalo` installs itself there first.
+/// Started as the indexer service, or to install or remove it, it does
+/// that and nothing else: no launcher, no window.
 fn main() -> windows::core::Result<()> {
     let arguments: Vec<String> = std::env::args().collect();
+    hyalo_indexer::run_if_asked(&arguments);
     let start = instance::Start::from_args(arguments.clone());
     if install::elsewhere(&arguments, start) {
         return Ok(());
