@@ -554,7 +554,6 @@ impl App {
         }
         self.indexing = Indexing {
             busy: true,
-            failed: false,
             ..self.indexing
         };
         let control = Arc::clone(&self.services.indexer);
@@ -1994,6 +1993,25 @@ mod tests {
             setup.until(ended(Target::IndexerInstall));
             assert_eq!(*unindexed.asked.lock().expect("asked"), [true, false]);
             assert!(recheck.taken(), "and walks its roots again");
+        });
+    }
+
+    #[test]
+    fn while_the_indexer_service_changes_the_card_waits_and_asks_nothing_more() {
+        on_hidden_desktop(|| {
+            let (unindexed, recheck) = (Arc::new(Unindexed::default()), files::Recheck::default());
+            let setup = set_up_indexing("settings-indexer-busy", &unindexed, &recheck);
+            let settings = setup.settings();
+            // Both clicks come before the launcher hears the change ended.
+            settings.click(Target::IndexerInstall);
+            assert!(!settings.state(|window| window.panel.look(Target::IndexerInstall).enabled));
+            settings.click(Target::IndexerInstall);
+            setup.until(|window| window.panel.look(Target::IndexerRemove).enabled);
+            assert_eq!(
+                *unindexed.asked.lock().expect("asked"),
+                [true],
+                "asked once"
+            );
         });
     }
 
