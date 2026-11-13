@@ -17,6 +17,8 @@ pub enum Change {
     Language(Language),
     /// hyalo looks for a newer release, or stops looking.
     CheckForUpdates(bool),
+    /// hyalo keeps what is copied, or stops and forgets it.
+    ClipboardHistory(bool),
     /// An entry is added at the end of a list, unless it is there.
     Add(List, String),
     /// An entry, as written, leaves a list; one not there is gone already.
@@ -72,12 +74,20 @@ fn make_setting(document: &mut DocumentMut, before: &Written, change: &Change) -
             differs && set(document, "language", language.code().into())
         }
         Change::CheckForUpdates(on) => {
-            let differs = *on != before.check_for_updates;
-            differs && set(document, "check_for_updates", (*on).into())
+            switch(document, "check_for_updates", *on, before.check_for_updates)
+        }
+        Change::ClipboardHistory(on) => {
+            switch(document, "clipboard_history", *on, before.clipboard_history)
         }
         Change::Add(list, entry) => add(document, before, *list, entry),
         Change::Remove(list, entry) => remove(document, before, *list, entry),
     }
+}
+
+/// Turns the setting `key` at the file's top `on`, unless it `was` so
+/// already; whether that changed it.
+fn switch(document: &mut DocumentMut, key: &str, on: bool, was: bool) -> bool {
+    on != was && set(document, key, on.into())
 }
 
 /// `after` with the line endings of `before`: toml_edit ends every line
@@ -631,6 +641,26 @@ check_for_updates = false
 
 [folders]
 exclude = []
+"
+        );
+    }
+
+    #[test]
+    fn the_clipboard_history_turned_off_is_written_in_its_place_and_on_again() {
+        let off = edited(DEFAULT, Change::ClipboardHistory(false));
+        let expected = DEFAULT.replace("clipboard_history = true", "clipboard_history = false");
+        assert_ne!(expected, DEFAULT);
+        assert_eq!(off, expected);
+        assert_eq!(edited(&off, Change::ClipboardHistory(false)), off);
+        assert_eq!(edited(&off, Change::ClipboardHistory(true)), DEFAULT);
+        let text = "hotkey = 'F4'
+";
+        assert_eq!(edited(text, Change::ClipboardHistory(true)), text);
+        let added = edited(text, Change::ClipboardHistory(false));
+        assert_eq!(
+            added,
+            "hotkey = 'F4'
+clipboard_history = false
 "
         );
     }

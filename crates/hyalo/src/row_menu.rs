@@ -18,7 +18,8 @@ pub type Line = popup::Line<Command>;
 /// The menu of `item`'s row, in `language`: what Enter does with it,
 /// named for what that is; Run as administrator for an app; Show in
 /// folder and Copy path for a file or folder; then, after a line,
-/// Uninstall… for an app hyalo knows the uninstaller of (`uninstalls`).
+/// Uninstall… for an app hyalo knows the uninstaller of (`uninstalls`),
+/// or Remove from history for an entry of the clipboard history.
 pub fn lines(item: &Item, uninstalls: bool, language: Language) -> Vec<Line> {
     let app = item.kind == Kind::App;
     let file = item.path().is_some();
@@ -34,9 +35,14 @@ pub fn lines(item: &Item, uninstalls: bool, language: Language) -> Vec<Line> {
         Line::entry(command, label)
     };
     let mut lines: Vec<Line> = entries.into_iter().flatten().map(entry).collect();
-    if uninstalls {
+    let after = match (uninstalls, item.kind) {
+        (true, _) => Some((Command::Uninstall, Text::Uninstall)),
+        (false, Kind::Clip) => Some((Command::Forget, Text::RemoveFromHistory)),
+        (false, _) => None,
+    };
+    if let Some(after) = after {
         lines.push(Line::Separator);
-        lines.push(entry((Command::Uninstall, Text::Uninstall)));
+        lines.push(entry(after));
     }
     lines
 }
@@ -45,7 +51,7 @@ pub fn lines(item: &Item, uninstalls: bool, language: Language) -> Vec<Line> {
 /// names it.
 fn enter(action: &Action) -> Text {
     match action {
-        Action::CopyText(_) => Text::Copy,
+        Action::CopyText(_) | Action::PutBack(_) => Text::Copy,
         Action::Switch(_) => Text::SwitchTo,
         Action::System(_) => Text::Run,
         _ => Text::Open,
@@ -89,6 +95,7 @@ impl RowMenu for Popup {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hyalo_core::clipboard::Content;
     use hyalo_core::item::ItemId;
     use hyalo_core::system_commands;
 
@@ -189,6 +196,27 @@ mod tests {
             assert_eq!(labels(&lines), [Some(expected.as_str())], "{row:?}");
             assert_eq!(commands(&lines), [OPEN]);
         }
+    }
+
+    #[test]
+    fn an_entry_of_the_clipboard_history_copies_and_is_taken_out_after_a_line() {
+        let back = Action::PutBack(std::sync::Arc::new(Content::Files(Vec::new())));
+        let entry = item(Kind::Clip, back);
+        let lines = lines(&entry, false, Language::English);
+        let expected = [
+            Some("Copy\tEnter"),
+            None,
+            Some("Remove from history\tDelete"),
+        ];
+        assert_eq!(labels(&lines), expected);
+        assert_eq!(commands(&lines), [OPEN, Command::Forget]);
+        let russian = super::lines(&entry, false, Language::Russian);
+        let expected = [
+            Some("Копировать\tEnter"),
+            None,
+            Some("Убрать из истории\tDelete"),
+        ];
+        assert_eq!(labels(&russian), expected);
     }
 
     #[test]

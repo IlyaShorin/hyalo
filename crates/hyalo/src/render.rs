@@ -850,6 +850,110 @@ mod tests {
         });
     }
 
+    /// A picture copied, 320 by 180: sky over a hill, a sun in the sky.
+    fn landscape() -> hyalo_core::clipboard::picture::Pixels {
+        let (width, height) = (320_u32, 180_u32);
+        let pixel = |index: u32| {
+            let (x, y) = ((index % width) as f32, (index / width) as f32);
+            let hill = 120.0 - 30.0 * (x / 60.0).sin();
+            let sun = (x - 240.0).hypot(y - 50.0) < 22.0;
+            match (y > hill, sun) {
+                (true, _) => [60, 150, 70, 255],
+                (false, true) => [70, 210, 250, 255],
+                (false, false) => [235, 190, 120, 255],
+            }
+        };
+        hyalo_core::clipboard::picture::Pixels {
+            width,
+            height,
+            bgra: (0..width * height).flat_map(pixel).collect(),
+        }
+    }
+
+    #[test]
+    fn the_clipboard_history_under_the_empty_bar_in_russian_at_100_percent() {
+        use hyalo_core::clipboard::{Content, Copied, History, picture};
+        use hyalo_core::frecency::Timestamp;
+        use hyalo_core::text::Language;
+        on_hidden_desktop(|| {
+            const NOW: u64 = 1_800_000_000;
+            let text = |text: &str| Content::Text {
+                text: text.to_string(),
+                html: None,
+                rtf: None,
+            };
+            let paths = [
+                r"C:\Users\Илья\Documents\отчёт за ноябрь.pdf",
+                r"C:\Users\Илья\Documents\план.xlsx",
+            ];
+            let copies = [
+                (
+                    Content::Files(paths.map(String::from).to_vec()),
+                    "Проводник",
+                    NOW - 3 * 86_400,
+                ),
+                (text("SELECT name FROM users"), "", NOW - 7200),
+                (
+                    Content::Image {
+                        width: 320,
+                        height: 180,
+                        png: vec![1],
+                    },
+                    "Ножницы",
+                    NOW - 300,
+                ),
+                (
+                    text("Добрый день!\r\n\r\nОтчёт пришлю завтра.\r\n"),
+                    "Outlook",
+                    NOW - 20,
+                ),
+            ];
+            let mut history = History::default();
+            for (content, app, at) in copies {
+                let copied = Copied {
+                    content,
+                    app: app.to_string(),
+                    at: Timestamp(at),
+                };
+                history.add(copied).expect("kept");
+            }
+            let entries = history.entries().iter();
+            let items: Vec<_> = entries
+                .map(|entry| entry.item(Timestamp(NOW), Language::Russian))
+                .collect();
+            let found = crate::results::Results::copied("", &items);
+            let thumbnail = picture::thumbnail(&landscape(), 32);
+            let thumbnail = Icon {
+                width: thumbnail.width,
+                height: thumbnail.height,
+                bgra: thumbnail.bgra,
+            };
+            let pdf = disc(32, [60, 60, 220]);
+            let pictures = [None, Some(&thumbnail), None, Some(&pdf)];
+            let rows = found
+                .rows()
+                .iter()
+                .zip(pictures)
+                .map(|(listed, icon)| Row {
+                    id: &listed.item.id,
+                    title: &listed.item.title,
+                    subtitle: listed.item.subtitle.as_str().into(),
+                    highlights: Vec::new(),
+                    icon,
+                    glyph: crate::results::glyph(listed.item.kind, &listed.item.action),
+                })
+                .collect();
+            let scene = Scene {
+                rows,
+                selected: 0,
+                placeholder: Language::Russian.say(hyalo_core::text::Text::Placeholder),
+                ..Scene::bar("")
+            };
+            let frame = drawn(&scene, (720, 272), 96);
+            assert_looks_like("history-ru-100", &frame);
+        });
+    }
+
     #[test]
     fn an_app_asked_to_uninstall_names_what_goes_in_amber_at_100_percent() {
         use hyalo_core::frecency::{Frecency, Timestamp};

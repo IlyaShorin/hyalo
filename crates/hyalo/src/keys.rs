@@ -26,6 +26,10 @@ pub enum Command {
     /// deleting for good. With text selected in the bar it cuts the text,
     /// as in any field: the window decides, and knows the uninstallers.
     Uninstall,
+    /// Take the selected entry out of the clipboard history: Delete. Where
+    /// the bar has something to erase it erases, as in any field: the
+    /// window decides, and keeps the history.
+    Forget,
 }
 
 /// Which modifier keys are held.
@@ -44,6 +48,7 @@ pub fn command(key: VIRTUAL_KEY, held: Held) -> Option<Command> {
         VK_DOWN => Some(Command::Down),
         VK_RETURN => Some(enter(held)),
         VK_DELETE if held.shift && !held.ctrl => Some(Command::Uninstall),
+        VK_DELETE if !held.ctrl => Some(Command::Forget),
         _ => None,
     }
 }
@@ -58,17 +63,22 @@ pub fn alt_command(key: VIRTUAL_KEY) -> Option<Command> {
 /// The keys that give `command`, as menus write them beside an entry:
 /// the ones `command` reads, or for copying the path the field's Ctrl+C.
 pub fn shortcut(command: Command) -> &'static str {
-    match command {
-        Command::Hide => "Esc",
-        Command::Up => "Up",
-        Command::Down => "Down",
-        Command::Open { as_admin: false } => "Enter",
-        Command::Open { as_admin: true } => "Ctrl+Shift+Enter",
-        Command::Reveal => "Ctrl+Enter",
-        Command::Copy => "Ctrl+C",
-        Command::Uninstall => "Shift+Delete",
-    }
+    let found = SHORTCUTS.iter().find(|&&(given, _)| given == command);
+    found.map_or("", |&(_, keys)| keys)
 }
+
+/// Each command and its keys, as menus write them.
+const SHORTCUTS: [(Command, &str); 9] = [
+    (Command::Hide, "Esc"),
+    (Command::Up, "Up"),
+    (Command::Down, "Down"),
+    (Command::Open { as_admin: false }, "Enter"),
+    (Command::Open { as_admin: true }, "Ctrl+Shift+Enter"),
+    (Command::Reveal, "Ctrl+Enter"),
+    (Command::Copy, "Ctrl+C"),
+    (Command::Uninstall, "Shift+Delete"),
+    (Command::Forget, "Delete"),
+];
 
 /// Enter opens, Ctrl+Enter shows in the folder, Ctrl+Shift+Enter opens as
 /// administrator.
@@ -82,20 +92,26 @@ fn enter(held: Held) -> Command {
 
 /// What `command` does with `item`, and whether as administrator; `None`
 /// when it does nothing with it: only files and folders are shown in
-/// their folder or have a path to copy, moving or hiding acts on no row,
-/// and what uninstalls an app the item does not say.
+/// their folder or have a path to copy, an entry of the clipboard
+/// history is copied as Enter copies it, moving or hiding acts on no
+/// row, and what uninstalls an app, or what the history keeps, the item
+/// does not say.
 pub fn action(command: Command, item: &Item) -> Option<(Action, bool)> {
-    match command {
-        Command::Open { as_admin } => Some((item.action.clone(), as_admin)),
-        Command::Reveal => Some((Action::Reveal(item.path()?.to_string()), false)),
-        Command::Copy => Some((Action::CopyText(item.path()?.to_string()), false)),
-        Command::Hide | Command::Up | Command::Down | Command::Uninstall => None,
+    match (command, &item.action) {
+        (Command::Open { as_admin }, _) => Some((item.action.clone(), as_admin)),
+        (Command::Reveal, _) => Some((Action::Reveal(item.path()?.to_string()), false)),
+        (Command::Copy, Action::PutBack(_)) => Some((item.action.clone(), false)),
+        (Command::Copy, _) => Some((Action::CopyText(item.path()?.to_string()), false)),
+        (Command::Hide | Command::Up | Command::Down | Command::Uninstall | Command::Forget, _) => {
+            None
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hyalo_core::clipboard::Content;
     use hyalo_core::item::{ItemId, Kind};
     use windows::Win32::UI::Input::KeyboardAndMouse::{VK_A, VK_SPACE};
 
@@ -157,7 +173,7 @@ mod tests {
     }
 
     #[test]
-    fn shift_delete_asks_to_uninstall_and_delete_with_ctrl_or_alone_is_the_fields() {
+    fn shift_delete_asks_to_uninstall_delete_alone_forgets_and_with_ctrl_is_the_fields() {
         let shift = Held {
             ctrl: false,
             shift: true,
@@ -167,10 +183,23 @@ mod tests {
             shift: true,
         };
         assert_eq!(command(VK_DELETE, shift), Some(Command::Uninstall));
-        assert_eq!(command(VK_DELETE, NONE), None);
+        assert_eq!(command(VK_DELETE, NONE), Some(Command::Forget));
         assert_eq!(command(VK_DELETE, CTRL), None);
         assert_eq!(command(VK_DELETE, both), None);
         assert_eq!(action(Command::Uninstall, &app()), None, "the window's");
+        assert_eq!(action(Command::Forget, &app()), None, "the window's");
+    }
+
+    #[test]
+    fn copying_an_entry_of_the_clipboard_history_puts_it_back() {
+        let back = Action::PutBack(std::sync::Arc::new(Content::Files(Vec::new())));
+        let entry = Item {
+            kind: Kind::Clip,
+            action: back.clone(),
+            ..app()
+        };
+        assert_eq!(action(Command::Copy, &entry), Some((back, false)));
+        assert_eq!(action(Command::Reveal, &entry), None);
     }
 
     #[test]
@@ -257,6 +286,7 @@ mod tests {
             Command::Open { as_admin: true },
             Command::Reveal,
             Command::Uninstall,
+            Command::Forget,
         ];
         for wanted in commands {
             let (key, held) = pressed(shortcut(wanted));
@@ -267,6 +297,7 @@ mod tests {
             "Ctrl+Shift+Enter"
         );
         assert_eq!(shortcut(Command::Uninstall), "Shift+Delete");
+        assert_eq!(shortcut(Command::Forget), "Delete");
     }
 
     #[test]

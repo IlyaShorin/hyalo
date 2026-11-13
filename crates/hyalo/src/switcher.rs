@@ -25,9 +25,9 @@ use windows::Win32::System::Threading::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     EnumChildWindows, EnumWindows, FLASHW_TIMERNOFG, FLASHW_TRAY, FLASHWINFO, FlashWindowEx,
-    GW_OWNER, GWL_EXSTYLE, GetShellWindow, GetWindow, GetWindowLongPtrW, GetWindowThreadProcessId,
-    InternalGetWindowText, IsIconic, IsWindow, IsWindowVisible, SW_RESTORE, SetForegroundWindow,
-    ShowWindowAsync, WS_EX_APPWINDOW, WS_EX_TOOLWINDOW,
+    GW_OWNER, GWL_EXSTYLE, GetForegroundWindow, GetShellWindow, GetWindow, GetWindowLongPtrW,
+    GetWindowThreadProcessId, InternalGetWindowText, IsIconic, IsWindow, IsWindowVisible,
+    SW_RESTORE, SetForegroundWindow, ShowWindowAsync, WS_EX_APPWINDOW, WS_EX_TOOLWINDOW,
 };
 use windows::core::{BOOL, HSTRING, PWSTR, Result};
 
@@ -242,6 +242,17 @@ fn image(process: u32) -> Option<String> {
         read.ok()?;
         Some(String::from_utf16_lossy(&path[..length as usize]))
     }
+}
+
+/// The app of the window in front, as the switcher names it; `None` when
+/// no window is in front, or its program cannot be read.
+pub fn foreground_app() -> Option<String> {
+    // SAFETY: a plain call.
+    let window = unsafe { GetForegroundWindow() };
+    if window.is_invalid() {
+        return None;
+    }
+    Some(app_name(&program(window, process_of(window))?))
 }
 
 /// What the switcher calls the program at `exe`: the description its

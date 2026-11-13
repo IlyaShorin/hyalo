@@ -814,8 +814,8 @@ mod tests {
     };
 
     use super::super::tests::{
-        Chooser, Keyboard, Launcher, Ran, Taskbar, config_file, hold, listing, named,
-        pump_until_closed, release_json, releasing, services, windows_10,
+        Chooser, Copies, Keyboard, Launcher, Ran, Taskbar, config_file, hold, listing, named,
+        pump_until_closed, release_json, releasing, services, text, windows_10,
     };
     use super::super::{HOTKEY_TOGGLE, MOUSE_SHIFT, tray};
     use super::*;
@@ -833,6 +833,7 @@ mod tests {
         keyboard: Rc<Keyboard>,
         chooser: Rc<Chooser>,
         ran: Ran,
+        copies: Copies,
         path: PathBuf,
         _scratch: Scratch,
     }
@@ -860,6 +861,8 @@ mod tests {
         services.config = Some(path.clone());
         services.autostart = autostart;
         services.updates = updates;
+        let copies = Copies::default();
+        services.clipboard = copies.watch();
         let launcher = Launcher::serving(services);
         Setup {
             launcher,
@@ -867,6 +870,7 @@ mod tests {
             keyboard,
             chooser,
             ran,
+            copies,
             path,
             _scratch: scratch,
         }
@@ -1304,11 +1308,15 @@ mod tests {
             settings.click(Target::StartWithWindows);
             assert_eq!(keys.run_value(), Some(format!("\"{exe}\" --hidden")));
             let on = settings.state(|window| {
-                window
-                    .laid
-                    .marks
-                    .iter()
-                    .any(|mark| matches!(mark.what, What::Toggle { on: true, .. }))
+                window.laid.marks.iter().any(|mark| {
+                    matches!(
+                        mark.what,
+                        What::Toggle {
+                            on: true,
+                            target: Target::StartWithWindows
+                        }
+                    )
+                })
             });
             assert!(on, "shown on");
             settings.press(VK_SPACE);
@@ -1744,9 +1752,15 @@ mod tests {
             let settings = setup.settings();
             let on = || {
                 let marks = settings.state(|window| window.laid.marks.clone());
-                marks
-                    .iter()
-                    .any(|mark| matches!(mark.what, What::Toggle { on: true, .. }))
+                marks.iter().any(|mark| {
+                    matches!(
+                        mark.what,
+                        What::Toggle {
+                            on: true,
+                            target: Target::StartWithWindows
+                        }
+                    )
+                })
             };
             keys.autostart(exe).set(true).expect("on, elsewhere");
             settings.send(WM_ACTIVATE, WA_INACTIVE as usize, 0);
@@ -1871,6 +1885,28 @@ mod tests {
                 named(&[("hyalo.exe", "new build"), ("hyalo.exe.old", "old build")])
             );
             assert_eq!(releases.started(), std::slice::from_ref(&releases.exe));
+        });
+    }
+
+    #[test]
+    fn the_clipboard_switch_turns_the_history_off_in_the_file_and_it_is_forgotten() {
+        on_hidden_desktop(|| {
+            let setup = set_up("settings-clipboard-switch", DEFAULT, None);
+            setup
+                .launcher
+                .copy(&setup.copies, text("copied"), "Notepad");
+            let settings = setup.settings();
+            settings.click(Target::ClipboardHistory);
+            let off = DEFAULT.replace("clipboard_history = true", "clipboard_history = false");
+            assert_eq!(setup.file(), off);
+            setup
+                .launcher
+                .pump_until(|app| app.history.entries().is_empty());
+            settings.click(Target::ClipboardHistory);
+            assert_eq!(setup.file(), DEFAULT);
+            setup
+                .launcher
+                .pump_until(|app| app.config.clipboard_history);
         });
     }
 

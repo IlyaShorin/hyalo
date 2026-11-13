@@ -3,7 +3,7 @@
 //! Enter brings the selected one to the front.
 
 use crate::item::{Action, Item, ItemId, Kind};
-use crate::matcher::Pattern;
+use crate::rank;
 
 /// What a query starts with to list the windows.
 pub const PREFIX: char = '>';
@@ -54,38 +54,12 @@ pub fn item(window: isize, title: &str, app: &str) -> Item {
     }
 }
 
-/// How much less a match in the app's name is worth than the same match
-/// in the title: one kind of match.
-const BY_APP: f64 = 16.0;
-
 /// The windows `filter` finds, best first, each with the letters of its
 /// title it matched: by its title, or, a little weaker and with nothing
 /// to highlight, by its app's name. Equal ones keep their order, front
 /// first; an empty filter keeps every window.
 pub fn ranked(filter: &str, windows: &[Item]) -> Vec<(Item, Vec<usize>)> {
-    if filter.is_empty() {
-        return windows
-            .iter()
-            .map(|item| (item.clone(), Vec::new()))
-            .collect();
-    }
-    let pattern = Pattern::new(filter);
-    let found = |item: &Item| match pattern.find(&item.title) {
-        Some(found) => Some((found.points(), found.positions)),
-        None => Some((pattern.find(&item.subtitle)?.points() - BY_APP, Vec::new())),
-    };
-    let mut ranked: Vec<(f64, Item, Vec<usize>)> = windows
-        .iter()
-        .filter_map(|item| {
-            let (points, positions) = found(item)?;
-            Some((points, item.clone(), positions))
-        })
-        .collect();
-    ranked.sort_by(|one, other| other.0.total_cmp(&one.0));
-    ranked
-        .into_iter()
-        .map(|(_, item, positions)| (item, positions))
-        .collect()
+    rank::listed(filter, windows, |window| vec![window.subtitle.as_str()])
 }
 
 #[cfg(test)]

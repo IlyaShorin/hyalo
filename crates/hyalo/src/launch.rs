@@ -18,7 +18,7 @@ use windows::Win32::UI::Shell::{
 use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 use windows::core::{HSTRING, PCWSTR, Result, w};
 
-use crate::clipboard::copy;
+use crate::clipboard::{copy, put};
 use crate::com::Com;
 use crate::{system, uninstall};
 
@@ -30,7 +30,7 @@ pub fn run(action: &Action, as_admin: bool) -> Result<()> {
         Action::Launch { program, arguments } => execute(program, Some(arguments), verb(as_admin)),
         Action::Reveal(path) => reveal(path),
         Action::System(_) | Action::Uninstall(_) => change(action, as_admin),
-        Action::CopyText(text) => copy(text),
+        Action::CopyText(_) | Action::PutBack(_) => put_back(action),
         Action::Edit(path) => edit(path),
         // The launcher opens its own window; there is nothing to run.
         Action::Settings => Ok(()),
@@ -49,6 +49,19 @@ fn change(action: &Action, as_admin: bool) -> Result<()> {
             program, arguments, ..
         }) => uninstall_with(program, arguments, as_admin),
         Action::Uninstall(Uninstall::Package { full_name, .. }) => uninstall::remove(full_name),
+        _ => Ok(()),
+    }
+}
+
+/// Puts text on the clipboard, or what was copied back on it; a picture
+/// is made pixels again through COM. `run` hands it nothing else.
+fn put_back(action: &Action) -> Result<()> {
+    match action {
+        Action::CopyText(text) => copy(text),
+        Action::PutBack(content) => {
+            let _com = Com::init()?;
+            put(content)
+        }
         _ => Ok(()),
     }
 }

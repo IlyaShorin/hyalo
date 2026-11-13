@@ -3,8 +3,11 @@
 //! The UI calls these results; the type is `Item` so it does not clash with
 //! `std::result::Result`.
 
+use std::sync::Arc;
+
 use serde::{Deserialize, Serialize};
 
+use crate::clipboard::Content;
 use crate::system_commands::Command;
 use crate::text::{Language, Text};
 use crate::uninstall::Uninstall;
@@ -53,6 +56,9 @@ pub enum Kind {
     /// What hyalo tells the user, such as a mistake in the config: never
     /// ranked, never remembered as a pick.
     Notice,
+    /// Something copied, from the clipboard history: listed newest first,
+    /// never ranked, never remembered as a pick.
+    Clip,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -78,6 +84,8 @@ pub enum Action {
     Edit(String),
     /// Uninstall an app.
     Uninstall(Uninstall),
+    /// Put what was copied back on the clipboard.
+    PutBack(Arc<Content>),
 }
 
 impl Action {
@@ -105,12 +113,7 @@ impl Item {
     /// The file or folder at the full path `path`: its own name is the
     /// title, the folder it is in the subtitle, and Enter opens it.
     pub fn file(path: String, folder: bool) -> Item {
-        let (parent, name) = path.rsplit_once('\\').unwrap_or(("", &path));
-        // A drive's root is `C:\`; `C:` alone is the current folder there.
-        let mut subtitle = parent.to_string();
-        if subtitle.ends_with(':') {
-            subtitle.push('\\');
-        }
+        let (name, subtitle) = split(&path);
         Item {
             id: ItemId(path.clone()),
             title: name.to_string(),
@@ -129,6 +132,18 @@ impl Item {
         let file = matches!(self.kind, Kind::File | Kind::Folder);
         file.then_some(self.id.0.as_str())
     }
+}
+
+/// The name of the file or folder at the full path `path`, and the
+/// folder it is in. A drive's root is `C:\`: `C:` alone is the current
+/// folder there.
+pub fn split(path: &str) -> (&str, String) {
+    let (parent, name) = path.rsplit_once('\\').unwrap_or(("", path));
+    let mut folder = parent.to_string();
+    if folder.ends_with(':') {
+        folder.push('\\');
+    }
+    (name, folder)
 }
 
 #[cfg(test)]

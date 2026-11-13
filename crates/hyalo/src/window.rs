@@ -17,6 +17,7 @@ use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::{Duration, Instant, SystemTime};
 
+use hyalo_core::clipboard::{self as copies, Copied, History};
 use hyalo_core::config::{Config, Problem};
 use hyalo_core::filter::{Clock, Filters, Query};
 use hyalo_core::frecency::{Frecency, Timestamp};
@@ -52,10 +53,10 @@ use windows::Win32::UI::WindowsAndMessaging::{
     IsWindow, IsWindowVisible, LoadCursorW, MSG, PostMessageW, PostQuitMessage, RegisterClassExW,
     SM_CXDOUBLECLK, SM_CYDOUBLECLK, SW_HIDE, SW_SHOW, SWP_NOACTIVATE, SWP_NOZORDER, SetCursor,
     SetForegroundWindow, SetWindowPos, ShowWindow, TranslateMessage, WA_INACTIVE, WM_ACTIVATE,
-    WM_APP, WM_CHAR, WM_CLOSE, WM_CONTEXTMENU, WM_DESTROY, WM_HOTKEY, WM_KEYDOWN, WM_LBUTTONDBLCLK,
-    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCCALCSIZE, WM_NCHITTEST, WM_SETCURSOR,
-    WM_SYSCHAR, WM_SYSKEYDOWN, WM_SYSKEYUP, WNDCLASSEXW, WS_CAPTION, WS_EX_NOREDIRECTIONBITMAP,
-    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_THICKFRAME,
+    WM_APP, WM_CHAR, WM_CLIPBOARDUPDATE, WM_CLOSE, WM_CONTEXTMENU, WM_DESTROY, WM_HOTKEY,
+    WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCCALCSIZE,
+    WM_NCHITTEST, WM_SETCURSOR, WM_SYSCHAR, WM_SYSKEYDOWN, WM_SYSKEYUP, WNDCLASSEXW, WS_CAPTION,
+    WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_THICKFRAME,
 };
 use windows::core::{BOOL, PCWSTR, Result, w};
 
@@ -198,6 +199,8 @@ pub struct Services {
     pub hibernates: bool,
     /// Asks DWM for a window's look.
     pub dwm: Dwm,
+    /// Where the clipboard history comes from.
+    pub clipboard: clipboard::Watch,
 }
 
 /// Sets one of a window's DWM attributes, each a 32-bit value, and says
@@ -263,6 +266,7 @@ impl Services {
             updates: Updates::real(),
             hibernates: system::hibernates(),
             dwm: set_attribute,
+            clipboard: clipboard::Watch::real(),
         }
     }
 }
@@ -334,6 +338,11 @@ struct App {
     update: Option<Update>,
     /// What the launcher is drawn over: the glass DWM gave it, or not.
     behind: Behind,
+    /// What was copied, newest first, while the config keeps it.
+    history: History,
+    /// Asks the thread that reads the clipboard to read it; `None` until
+    /// it first changed.
+    reader: Option<Sender<()>>,
 }
 
 /// A row's menu, made ready to open: what opens it, its lines, where it
@@ -420,6 +429,9 @@ impl App {
         self.places = places.with(&config.rank_higher, &config.rank_lower);
         self.leave_out(&config.exclude);
         self.find_if_stale();
+        if !config.clipboard_history {
+            self.forget_history();
+        }
         self.config = config;
         self.check_for_update();
         self.catalog.system = system_rows(self.language(), self.services.hibernates);
@@ -1023,7 +1035,7 @@ impl App {
         let kind = item.kind;
         if matches!(
             kind,
-            Kind::Calculator | Kind::Web | Kind::Window | Kind::Notice
+            Kind::Calculator | Kind::Web | Kind::Window | Kind::Notice | Kind::Clip
         ) {
             return;
         }
@@ -1059,6 +1071,12 @@ impl App {
         if let Some(filter) = hyalo_core::switcher::filter(text) {
             return Results::windows(filter, &self.catalog.windows);
         }
+        if let Some(filter) = copies::filter(text) {
+            return Results::copied(filter, &self.copied_rows());
+        }
+        if text.is_empty() {
+            return Results::copied("", &self.copied_rows()).answered(self.notice_row());
+        }
         let query = Query::parse(text, clock());
         let picked = self.picked(&query.filters);
         let (frecency, places, files) = (&self.frecency, &self.places, self.file_hits(&query));
@@ -1070,15 +1088,86 @@ impl App {
                 Results::search(&query.words, items, files, frecency, places, now())
             }
         };
-        let answer = match text.is_empty() {
-            true => self.notice_row(),
-            false => {
-                let rates = self.catalog.rates.as_ref();
-                let engines = self.config.engines(self.language());
-                results::answer(text, rates, &engines, self.language())
-            }
+        let rates = self.catalog.rates.as_ref();
+        let engines = self.config.engines(self.language());
+        found.answered(results::answer(text, rates, &engines, self.language()))
+    }
+
+    /// The rows of the clipboard history, newest first, as of now.
+    fn copied_rows(&self) -> Vec<Item> {
+        let (now, language) = (now(), self.language());
+        let entries = self.history.entries().iter();
+        entries.map(|entry| entry.item(now, language)).collect()
+    }
+
+    /// The clipboard changed: asks the thread that reads it to read it,
+    /// starting it the first time, while the config keeps the history.
+    fn read_clipboard(&mut self) {
+        if !self.config.clipboard_history {
+            return;
+        }
+        let side = layout::icon_pixels(self.placement.dpi);
+        let read = self.services.clipboard.read.clone();
+        let (found, window) = (self.found.0.clone(), self.hwnd.0 as isize);
+        let reader = self
+            .reader
+            .get_or_insert_with(|| start_reader(read, side, found, window));
+        let _ = reader.send(());
+    }
+
+    /// Takes what was copied into the history, with its row's picture,
+    /// while the config keeps the history; the pictures of the entries
+    /// that made room for it go.
+    fn take_copied(&mut self, copied: Copied, icon: Option<Icon>) {
+        if !self.config.clipboard_history {
+            return;
+        }
+        let Some(added) = self.history.add(copied) else {
+            return;
         };
-        found.answered(answer)
+        for gone in added.gone {
+            self.catalog.icons.remove(&copies::row_id(gone));
+        }
+        if let Some(icon) = icon {
+            self.catalog.icons.insert(copies::row_id(added.id), icon);
+        }
+    }
+
+    /// Forgets everything the clipboard history kept, pictures too.
+    fn forget_history(&mut self) {
+        for gone in self.history.clear() {
+            self.catalog.icons.remove(&copies::row_id(gone));
+        }
+    }
+
+    /// Delete, which the field makes `key` of: erases in the bar as in any
+    /// field; where that erases nothing, takes the selected entry out of
+    /// the clipboard history.
+    fn delete(&mut self, key: Option<field::Key>) -> Result<()> {
+        if let Some(field::Key::Edit(edit)) = key {
+            let edited = self.query.apply(edit);
+            if edited != Edited::Nothing {
+                return self.refresh(edited);
+            }
+        }
+        self.forget()
+    }
+
+    /// Takes the selected entry out of the clipboard history, with its
+    /// picture, and lists what is left, the row that took its place
+    /// selected; nothing for any other row.
+    fn forget(&mut self) -> Result<()> {
+        let picked = self.results.picked().map(|row| &row.item.id);
+        let Some(entry) = picked.and_then(copies::entry_of) else {
+            return Ok(());
+        };
+        self.history.remove(entry);
+        self.catalog.icons.remove(&copies::row_id(entry));
+        let selected = self.results.selected();
+        self.search();
+        let last = self.results.rows().len().saturating_sub(1);
+        self.results.select(selected.min(last));
+        self.present()
     }
 
     /// The picked files and folders `filters` lets through.
@@ -1175,6 +1264,23 @@ impl App {
         std::thread::spawn(move || hand_over(&sender, window, Found::Picked(files::picked(&ids))));
     }
 
+    /// Takes in one piece a provider handed over: settings, an answer about
+    /// updates, the end of an uninstaller, something copied; the rest is
+    /// the catalog's.
+    fn take(&mut self, found: Found) {
+        match found {
+            Found::Config(bytes) => {
+                self.configure(settings::read(bytes.clone()));
+                self.show_written(bytes);
+            }
+            Found::Latest(answer) => self.take_latest(answer),
+            Found::Installed(installed) => self.take_installed(installed),
+            Found::UninstallEnded => self.look_again_for_apps(),
+            Found::Copied(copied, icon) => self.take_copied(copied, icon),
+            found => self.catalog.take(found),
+        }
+    }
+
     /// Takes in what the providers handed over, searches again (keeping
     /// the selected item selected), and shows the result if the window is
     /// up. After an icon the search finds the same rows; it costs less
@@ -1182,16 +1288,7 @@ impl App {
     fn take_found(&mut self) -> Result<()> {
         let found: Vec<Found> = self.found.1.try_iter().collect();
         for found in found {
-            match found {
-                Found::Config(bytes) => {
-                    self.configure(settings::read(bytes.clone()));
-                    self.show_written(bytes);
-                }
-                Found::Latest(answer) => self.take_latest(answer),
-                Found::Installed(installed) => self.take_installed(installed),
-                Found::UninstallEnded => self.look_again_for_apps(),
-                found => self.catalog.take(found),
-            }
+            self.take(found);
         }
         self.results = self.results.kept(self.listed());
         self.fetch_icons();
@@ -1200,6 +1297,32 @@ impl App {
             false => Ok(()),
         }
     }
+}
+
+/// Starts the thread that reads the clipboard with read each time it is
+/// asked to, and hands what was copied to the window, its picture side
+/// pixels square; it ends once the window no longer asks. One thread
+/// reads, in turn, what one app after another put on the clipboard.
+fn start_reader(
+    read: clipboard::Reader,
+    side: u32,
+    found: Sender<Found>,
+    window: isize,
+) -> Sender<()> {
+    let (asks, asked) = channel::<()>();
+    std::thread::spawn(move || {
+        for () in asked {
+            if let Some((content, app, icon)) = read(side) {
+                let copied = Copied {
+                    content,
+                    app,
+                    at: now(),
+                };
+                hand_over(&found, window, Found::Copied(copied, icon));
+            }
+        }
+    });
+    asks
 }
 
 /// Sends a piece to the window and wakes it up. The window travels as a
@@ -1306,6 +1429,9 @@ fn begin(services: Services, start: Start) -> Result<HWND> {
 /// the window.
 fn open(services: Services, shown: bool) -> Result<HWND> {
     let hwnd = create_window()?;
+    if let Err(error) = (services.clipboard.listen)(hwnd) {
+        eprintln!("hyalo: cannot follow the clipboard: {error}");
+    }
     let placement = placement_under_cursor()?;
     let frecency = services
         .picks
@@ -1348,6 +1474,8 @@ fn open(services: Services, shown: bool) -> Result<HWND> {
             checked: Checked::Never,
             update: None,
             behind,
+            history: History::default(),
+            reader: None,
         };
         opened.find_picked();
         let loaded = seen.clone().map_or(Ok(Config::default()), settings::read);
@@ -1510,6 +1638,10 @@ fn on_message(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> Optio
 fn on_app_message(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> Option<Result<()>> {
     match message {
         WM_FOUND => Some(with_app(App::take_found).unwrap_or(Ok(()))),
+        WM_CLIPBOARDUPDATE => {
+            with_app(App::read_clipboard);
+            Some(Ok(()))
+        }
         WM_SHOW => Some(show(hwnd)),
         WM_SETTINGS => Some(open_settings()),
         tray::WM_TRAY => Some(on_tray(hwnd, wparam, lparam)),
@@ -1606,6 +1738,7 @@ fn on_picked(hwnd: HWND, command: Command) -> Result<()> {
     match command {
         Command::Open { .. } => on_enter(hwnd, command),
         Command::Uninstall => with_app(App::ask_to_uninstall).unwrap_or(Ok(())),
+        Command::Forget => with_app(App::forget).unwrap_or(Ok(())),
         command => {
             act_on_row(hwnd, command);
             Ok(())
@@ -1865,6 +1998,7 @@ fn on_other_key(
             None
         }
         Some(Command::Uninstall) => with_app(App::uninstall),
+        Some(Command::Forget) => with_app(|app| app.delete(field::key(key, held))),
         Some(command) => {
             act_on_row(hwnd, command);
             None
@@ -2051,6 +2185,7 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::Duration;
 
+    use hyalo_core::clipboard::Content;
     use hyalo_core::config::DEFAULT;
     use hyalo_core::item::{Action, Item, Kind};
     use hyalo_core::uninstall::Uninstall;
@@ -2149,6 +2284,31 @@ mod tests {
 
     /// What the launcher was asked to run, and whether as administrator.
     pub(super) type Ran = Rc<RefCell<Vec<(Action, bool)>>>;
+
+    /// A clipboard a test copies to: it tells the launcher of nothing by
+    /// itself, and hands over, once read, what the test copied last, the
+    /// app it came from and its picture (`Launcher::copy`).
+    #[derive(Clone, Default)]
+    pub(super) struct Copies(Arc<Mutex<Option<clipboard::Read>>>);
+
+    impl Copies {
+        pub(super) fn watch(&self) -> clipboard::Watch {
+            let copies = self.clone();
+            clipboard::Watch {
+                listen: |_| Ok(()),
+                read: Arc::new(move |_| copies.0.lock().expect("copies").take()),
+            }
+        }
+    }
+
+    /// Text copied, with nothing beside it.
+    pub(super) fn text(text: &str) -> Content {
+        Content::Text {
+            text: text.to_string(),
+            html: None,
+            rtf: None,
+        }
+    }
 
     /// Hotkeys as a test keeps them: what the launcher holds, by id, and
     /// the keys other apps hold.
@@ -2266,6 +2426,7 @@ mod tests {
             updates: None,
             hibernates: true,
             dwm: set_attribute,
+            clipboard: Copies::default().watch(),
         };
         (services, ran)
     }
@@ -4735,6 +4896,309 @@ mod tests {
 
     fn titles_listed() -> Vec<String> {
         with_app(|app| titles(app)).expect("app state")
+    }
+
+    /// A launcher whose clipboard the test copies to (`Launcher::copy`),
+    /// keeping picks in `picks`, hidden, as it is while the user copies;
+    /// and what it was asked to run.
+    fn copying(picks: Option<PathBuf>) -> (Launcher, Copies, Ran) {
+        let (mut services, ran) = services(listing(&[]).0, picks);
+        let copies = Copies::default();
+        services.clipboard = copies.watch();
+        (hidden(services), copies, ran)
+    }
+
+    /// A launcher serving `services`, hidden.
+    fn hidden(services: Services) -> Launcher {
+        let launcher = Launcher::serving(services);
+        launcher.press(VK_ESCAPE);
+        launcher
+    }
+
+    impl Launcher {
+        /// Copies `content` from `app`, its row's picture `icon`: tells the
+        /// launcher the clipboard changed, as Windows does, and waits for
+        /// the history to hold it first.
+        pub(super) fn copy_with(
+            &self,
+            copies: &Copies,
+            content: Content,
+            app: &str,
+            icon: Option<Icon>,
+        ) {
+            let wanted = content.clone();
+            *copies.0.lock().expect("copies") = Some((content, app.to_string(), icon));
+            self.send(WM_CLIPBOARDUPDATE, 0);
+            self.pump_until(|app| {
+                let first = app.history.entries().first();
+                first.is_some_and(|entry| *entry.content == wanted)
+            });
+        }
+
+        pub(super) fn copy(&self, copies: &Copies, content: Content, app: &str) {
+            self.copy_with(copies, content, app, None);
+        }
+
+        /// Erases the letter before the caret, or what is selected, as
+        /// Backspace does: Windows sends it as a character.
+        fn backspace(&self) {
+            self.send(WM_CHAR, 0x08);
+        }
+    }
+
+    /// Each row listed now, its title and its second line.
+    fn rows_listed() -> Vec<(String, String)> {
+        with_app(|app| {
+            let rows = app.results.rows().iter().enumerate();
+            let said = |(at, row): (usize, &Listed)| {
+                let subtitle = app.results.subtitle(at, Language::English).to_string();
+                (row.item.title.clone(), subtitle)
+            };
+            rows.map(said).collect()
+        })
+        .expect("app state")
+    }
+
+    fn put_back(content: Content) -> (Action, bool) {
+        (Action::PutBack(Arc::new(content)), false)
+    }
+
+    #[test]
+    fn what_is_copied_is_listed_under_the_empty_bar_newest_first_and_typing_searches() {
+        on_hidden_desktop(|| {
+            let (launcher, copies, _) = copying(None);
+            launcher.copy(&copies, text("first"), "Notepad");
+            launcher.copy(&copies, text("second\nline"), "Code");
+            assert!(!launcher.visible());
+            launcher.hotkey();
+            let rows = [
+                ("second", "Code · just now · 2 lines"),
+                ("first", "Notepad · just now"),
+            ];
+            let expected = rows.map(|(title, subtitle)| (title.to_string(), subtitle.to_string()));
+            assert_eq!(rows_listed(), expected);
+            let tall = launcher.client_size().1;
+            launcher.type_text("first");
+            assert!(titles_listed().is_empty(), "typing searches, as ever");
+            assert!(launcher.client_size().1 < tall);
+            hold(&[VK_SHIFT]);
+            launcher.press(VK_HOME);
+            hold(&[]);
+            launcher.backspace();
+            assert_eq!(launcher.query(), "");
+            assert_eq!(titles_listed(), ["second", "first"]);
+            assert_eq!(launcher.client_size().1, tall);
+        });
+    }
+
+    #[test]
+    fn enter_or_ctrl_c_puts_the_selected_entry_back_and_hides_remembering_no_pick() {
+        let picks = PicksFile::new("history-no-pick");
+        let picked = picks.0.clone();
+        on_hidden_desktop(move || {
+            let (launcher, copies, ran) = copying(Some(picked.clone()));
+            launcher.copy(&copies, text("first"), "Notepad");
+            launcher.copy(&copies, text("second"), "Notepad");
+            launcher.hotkey();
+            launcher.press(VK_DOWN);
+            launcher.press(VK_RETURN);
+            assert_eq!(*ran.borrow(), [put_back(text("first"))]);
+            assert!(!launcher.visible());
+            launcher.hotkey();
+            hold(&[VK_CONTROL]);
+            launcher.press(VK_C);
+            hold(&[]);
+            assert_eq!(ran.borrow()[1], put_back(text("second")));
+            assert!(!launcher.visible());
+            assert!(!picked.exists(), "an entry is never a pick");
+        });
+    }
+
+    #[test]
+    fn a_double_quote_looks_through_the_whole_history() {
+        on_hidden_desktop(|| {
+            let (launcher, copies, _) = copying(None);
+            for n in 1..=10 {
+                launcher.copy(&copies, text(&format!("copy {n:02}")), "Notepad");
+            }
+            launcher.hotkey();
+            assert_eq!(titles_listed().len(), MAX_ROWS);
+            launcher.type_text("\"");
+            assert_eq!(titles_listed().len(), MAX_ROWS);
+            assert_eq!(titles_listed()[0], "copy 10");
+            launcher.type_text("01");
+            assert_eq!(titles_listed(), ["copy 01"]);
+        });
+    }
+
+    #[test]
+    fn the_notice_comes_first_and_the_history_under_it() {
+        on_hidden_desktop(|| {
+            let (_scratch, path) = config_file("window-history-notice", "hotkey = 5\n");
+            let copies = Copies::default();
+            let (mut services, _) = services(listing(&[]).0, None);
+            services.clipboard = copies.watch();
+            services.config = Some(path);
+            let launcher = hidden(services);
+            for n in 1..=MAX_ROWS {
+                launcher.copy(&copies, text(&format!("copy {n}")), "Notepad");
+            }
+            launcher.hotkey();
+            let titles = titles_listed();
+            assert_eq!(titles.len(), MAX_ROWS);
+            assert!(titles[0].starts_with("config.toml, line 1"), "{titles:?}");
+            assert_eq!(titles[1], format!("copy {MAX_ROWS}"));
+            assert_eq!(titles[MAX_ROWS - 1], "copy 2");
+        });
+    }
+
+    #[test]
+    fn delete_erases_in_the_bar_and_where_it_erases_nothing_takes_the_entry_out() {
+        on_hidden_desktop(|| {
+            let (launcher, copies, _) = copying(None);
+            for copied in ["a", "b", "c"] {
+                launcher.copy(&copies, text(copied), "Notepad");
+            }
+            launcher.hotkey();
+            launcher.press(VK_DOWN);
+            launcher.press(VK_DELETE);
+            assert_eq!(titles_listed(), ["c", "a"]);
+            assert_eq!(launcher.lit_row(2), 1, "the row that took its place");
+            launcher.press(VK_DELETE);
+            assert_eq!(titles_listed(), ["c"]);
+            assert_eq!(launcher.lit_row(1), 0);
+            launcher.type_text("\"xy");
+            launcher.press(VK_LEFT);
+            launcher.press(VK_DELETE);
+            assert_eq!(launcher.query(), "\"x", "erased in the bar");
+            assert_eq!(titles_listed(), Vec::<String>::new());
+            launcher.press(VK_DELETE);
+            let kept = with_app(|app| app.history.entries().len());
+            assert_eq!(kept, Some(1), "no entry listed, none taken out");
+        });
+    }
+
+    #[test]
+    fn an_entrys_menu_copies_it_or_takes_it_out() {
+        on_hidden_desktop(|| {
+            let copies = Copies::default();
+            let choices = Rc::new(Choices::default());
+            let (mut services, ran) = services(listing(&[]).0, None);
+            services.clipboard = copies.watch();
+            services.row_menu = choices.clone();
+            let launcher = hidden(services);
+            launcher.copy(&copies, text("a"), "Notepad");
+            launcher.copy(&copies, text("b"), "Notepad");
+            launcher.hotkey();
+            *choices.pick.borrow_mut() = Some(Command::Forget);
+            let entry = with_app(|app| app.results.rows()[0].item.clone()).expect("app state");
+            launcher.menu_key();
+            let lines = row_menu::lines(&entry, false, Language::English);
+            assert_eq!(choices.opened.borrow()[0].0, lines);
+            assert_eq!(titles_listed(), ["a"]);
+            assert!(launcher.visible());
+            *choices.pick.borrow_mut() = Some(Command::Open { as_admin: false });
+            launcher.menu_key();
+            assert_eq!(*ran.borrow(), [put_back(text("a"))]);
+            assert!(!launcher.visible());
+        });
+    }
+
+    #[test]
+    fn turning_the_history_off_forgets_it_and_reads_the_clipboard_no_more() {
+        on_hidden_desktop(|| {
+            let (_scratch, path) = config_file("window-history-off", DEFAULT);
+            let copies = Copies::default();
+            let (mut services, _) = services(listing(&[]).0, None);
+            services.clipboard = copies.watch();
+            services.config = Some(path.clone());
+            let launcher = hidden(services);
+            let files = Content::Files(vec![r"C:\a.txt".to_string()]);
+            launcher.copy_with(&copies, files, "Explorer", Some(red(32)));
+            assert_eq!(with_app(|app| app.catalog.icons.len()), Some(1));
+            let off = DEFAULT.replace("clipboard_history = true", "clipboard_history = false");
+            std::fs::write(&path, off).expect("save");
+            launcher.pump_until(|app| !app.config.clipboard_history);
+            assert_eq!(with_app(|app| app.history.entries().len()), Some(0));
+            assert_eq!(
+                with_app(|app| app.catalog.icons.len()),
+                Some(0),
+                "its picture too"
+            );
+            launcher.hotkey();
+            assert!(titles_listed().is_empty());
+            *copies.0.lock().expect("copies") = Some((text("secret"), String::new(), None));
+            launcher.send(WM_CLIPBOARDUPDATE, 0);
+            drain();
+            assert!(copies.0.lock().expect("copies").is_some(), "never read");
+            std::fs::write(&path, DEFAULT).expect("save");
+            launcher.pump_until(|app| app.config.clipboard_history);
+            launcher.copy(&copies, text("again"), "Notepad");
+            assert_eq!(with_app(|app| app.history.entries().len()), Some(1));
+        });
+    }
+
+    #[test]
+    fn a_picture_shows_where_an_icon_goes_and_goes_with_its_entry() {
+        on_hidden_desktop(|| {
+            let (launcher, copies, _) = copying(None);
+            let picture = Content::Image {
+                width: 640,
+                height: 480,
+                png: vec![1],
+            };
+            let side = layout::icon_pixels(launcher.placement().dpi);
+            launcher.copy_with(&copies, picture, "Paint", Some(red(side)));
+            launcher.hotkey();
+            assert_eq!(rows_listed()[0].0, "Image 640 × 480");
+            let top = layout::row_top(0);
+            assert_eq!(launcher.pixel_at(28.0, top + 24.0), [0, 0, 255, 255]);
+            launcher.press(VK_ESCAPE);
+            for n in 0..copies::MOST {
+                launcher.copy(&copies, text(&n.to_string()), "Notepad");
+            }
+            let icons = with_app(|app| app.catalog.icons.len());
+            assert_eq!(icons, Some(0), "gone with its entry");
+        });
+    }
+
+    #[test]
+    fn what_is_copied_is_read_off_the_clipboard_and_put_back_on_it() {
+        let name = "window::tests::what_is_copied_is_read_off_the_clipboard_and_put_back_on_it";
+        in_own_window_station(name, || {
+            on_hidden_desktop(|| {
+                let (mut services, _) = services(listing(&[]).0, None);
+                services.clipboard = clipboard::Watch::real();
+                services.run = Box::new(run_in_background);
+                let launcher = hidden(services);
+                crate::clipboard::copy("first").expect("copy");
+                launcher.pump_until(|app| app.history.entries().len() == 1);
+                crate::clipboard::copy("second").expect("copy");
+                launcher.pump_until(|app| app.history.entries().len() == 2);
+                launcher.hotkey();
+                assert_eq!(titles_listed(), ["second", "first"]);
+                launcher.press(VK_DOWN);
+                launcher.press(VK_RETURN);
+                // Read back once it is there: reading in a loop would hold
+                // the clipboard from the threads that put and read it.
+                launcher.pump_until(|app| {
+                    let first = app.history.entries().first();
+                    first.is_some_and(|entry| *entry.content == text("first"))
+                });
+                assert_eq!(crate::clipboard::text().as_deref(), Some("first"));
+                assert_eq!(
+                    with_app(|app| app.history.entries().len()),
+                    Some(2),
+                    "once each"
+                );
+                launcher.hotkey();
+                assert_eq!(
+                    titles_listed(),
+                    ["first", "second"],
+                    "put back, it comes first"
+                );
+            });
+        });
     }
 
     /// Reported on 0.2.5: Uninstall… picked from the menu uninstalled

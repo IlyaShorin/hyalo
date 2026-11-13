@@ -70,6 +70,7 @@ enum Spot {
     Language,
     List(List),
     Updates,
+    Clipboard,
 }
 
 /// The page's sections, top to bottom; each is left out when it has
@@ -225,6 +226,7 @@ impl Panel {
             Change::Hotkey(_) => Spot::Hotkey,
             Change::Language(_) => Spot::Language,
             Change::CheckForUpdates(_) => Spot::Updates,
+            Change::ClipboardHistory(_) => Spot::Clipboard,
             Change::Add(list, _) | Change::Remove(list, _) => Spot::List(*list),
         };
         self.note = Some((spot, why));
@@ -464,6 +466,9 @@ impl Panel {
                 .written
                 .as_ref()
                 .map(|written| Effect::Change(Change::CheckForUpdates(!written.check_for_updates))),
+            Target::ClipboardHistory => self.written.as_ref().map(|written| {
+                Effect::Change(Change::ClipboardHistory(!written.clipboard_history))
+            }),
             Target::Pick(list) => Some(Effect::Pick(list)),
             Target::Language(language) => {
                 (language != self.language()).then_some(Effect::Change(Change::Language(language)))
@@ -603,6 +608,7 @@ impl Panel {
             cards.push(card(false, muted, vec![strip]));
         }
         cards.push(self.languages(muted));
+        cards.push(self.copying(written, muted));
         Some(Section {
             title: Some(self.say(Text::Launcher)),
             cards,
@@ -620,6 +626,17 @@ impl Panel {
         let help = self.help(Spot::Language, Text::LanguageHelp);
         let choice = Control::Choice(options.to_vec());
         let strip = setting(&self.say(Text::LanguageName), help, Some(choice));
+        card(false, muted, vec![strip])
+    }
+
+    /// The switch for the clipboard history.
+    fn copying(&self, written: &Written, muted: bool) -> Card {
+        let toggle = Control::Toggle {
+            target: Target::ClipboardHistory,
+            on: written.clipboard_history,
+        };
+        let help = self.help(Spot::Clipboard, Text::ClipboardHelp);
+        let strip = setting(&self.say(Text::ClipboardHistory), help, Some(toggle));
         card(false, muted, vec![strip])
     }
 
@@ -890,12 +907,7 @@ mod tests {
     }
 
     fn toggle(panel: &Panel) -> Option<bool> {
-        let marks = laid(panel).marks.into_iter();
-        let mut toggles = marks.filter_map(|mark| match mark.what {
-            What::Toggle { on, .. } => Some(on),
-            _ => None,
-        });
-        toggles.next()
+        switch(panel, Target::StartWithWindows)
     }
 
     #[test]
@@ -907,6 +919,7 @@ mod tests {
             "Hotkey",
             "Start with Windows",
             "Language",
+            "Clipboard history",
             "Folders",
             "Leave out of the index",
             r"C:\Windows\WinSxS",
@@ -1025,7 +1038,7 @@ mod tests {
             shown[2..4],
             [
                 "Line 2: unknown field `hotkye`, expected one of `hotkey`, `language`,",
-                "`check_for_updates`, `folders`, `search`"
+                "`check_for_updates`, `clipboard_history`, `folders`, `search`"
             ]
         );
         assert!(
@@ -1066,6 +1079,7 @@ mod tests {
         panel.reload(Err(broken()));
         let cards = [
             (true, false),
+            (false, true),
             (false, true),
             (false, true),
             (false, true),
@@ -1664,6 +1678,7 @@ notes
             "Сочетание клавиш",
             "Запускать вместе с Windows",
             "Язык",
+            "История буфера обмена",
             "Папки",
             "Не индексировать",
             r"C:\Windows\WinSxS",
@@ -1930,6 +1945,50 @@ notes
         );
         assert!(panel.look(Target::Install).enabled, "to try again");
         assert_eq!(click(&mut panel, Target::Install), Some(Effect::Install));
+    }
+
+    #[test]
+    fn the_clipboard_history_has_a_switch_among_the_launchers_settings() {
+        let mut panel = panel();
+        assert_eq!(switch(&panel, Target::ClipboardHistory), Some(true));
+        let help =
+            "Lists what you copy under the empty search bar; kept in memory alone, never on disk";
+        assert_eq!(
+            help_of(&panel, "Clipboard history"),
+            What::Help {
+                text: help.to_string(),
+                alarm: false
+            }
+        );
+        let off = Change::ClipboardHistory(false);
+        let clicked = click(&mut panel, Target::ClipboardHistory);
+        assert_eq!(clicked, Some(Effect::Change(off.clone())));
+        let text = DEFAULT.replace("clipboard_history = true", "clipboard_history = false");
+        panel.done(&off, Some(written(&text)));
+        assert_eq!(switch(&panel, Target::ClipboardHistory), Some(false));
+        let on = Change::ClipboardHistory(true);
+        assert_eq!(
+            click(&mut panel, Target::ClipboardHistory),
+            Some(Effect::Change(on.clone()))
+        );
+        panel.refused(&on, Why::Unsaved("the disk is full".to_string()));
+        assert_eq!(
+            help_of(&panel, "Clipboard history"),
+            What::Help {
+                text: "cannot save config.toml: the disk is full".to_string(),
+                alarm: true
+            }
+        );
+        let file = config::default_file(Language::Russian);
+        let panel = Panel::new(Ok(written(&file)), Some(false), Language::English);
+        let russian = "Скопированное — под пустой строкой поиска; только в памяти, не на диске";
+        assert_eq!(
+            help_of(&panel, "История буфера обмена"),
+            What::Help {
+                text: russian.to_string(),
+                alarm: false
+            }
+        );
     }
 
     #[test]
