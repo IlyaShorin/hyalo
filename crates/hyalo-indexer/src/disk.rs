@@ -3,6 +3,7 @@
 //! (`image::Image`).
 
 use std::io;
+use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
 use hyalo_core::volume::Journal;
@@ -47,6 +48,37 @@ pub trait Disk: Send + Sync {
 
     /// The records of the files and folders in the folder `record`.
     fn children(&self, record: u32) -> io::Result<Vec<u32>>;
+}
+
+/// A volume shared: read as the one it shares.
+impl<D: Disk + ?Sized> Disk for Arc<D> {
+    fn geometry(&self) -> io::Result<Geometry> {
+        (**self).geometry()
+    }
+
+    fn read(&self, at: u64, length: usize) -> io::Result<Vec<u8>> {
+        (**self).read(at, length)
+    }
+
+    fn record(&self, number: u32) -> io::Result<Option<Vec<u8>>> {
+        (**self).record(number)
+    }
+
+    fn journal(&self) -> io::Result<Journal> {
+        (**self).journal()
+    }
+
+    fn flush(&self) -> io::Result<()> {
+        (**self).flush()
+    }
+
+    fn changes(&self, from: i64, journal: u64, stop: &AtomicBool) -> io::Result<Option<Vec<u8>>> {
+        (**self).changes(from, journal, stop)
+    }
+
+    fn children(&self, record: u32) -> io::Result<Vec<u32>> {
+        (**self).children(record)
+    }
 }
 
 #[cfg(test)]

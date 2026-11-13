@@ -6,14 +6,13 @@
 //! installed.
 
 use std::io;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 use std::thread;
 use std::time::Duration;
 
 use hyalo_core::volume::Journal;
 use windows::Win32::Foundation::{
-    CloseHandle, ERROR_INVALID_PARAMETER, ERROR_IO_PENDING, ERROR_JOURNAL_NOT_ACTIVE,
-    ERROR_NO_MORE_FILES, HANDLE, WAIT_TIMEOUT,
+    ERROR_INVALID_PARAMETER, ERROR_JOURNAL_NOT_ACTIVE, ERROR_NO_MORE_FILES, HANDLE,
 };
 use windows::Win32::Storage::FileSystem::{
     CreateFileW, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OVERLAPPED, FILE_FLAGS_AND_ATTRIBUTES,
@@ -22,25 +21,19 @@ use windows::Win32::Storage::FileSystem::{
     FileIdBothDirectoryInfo, FileIdBothDirectoryRestartInfo, FileIdType, FlushFileBuffers,
     GetFileInformationByHandleEx, OPEN_EXISTING, OpenFileById, ReadFile, SYNCHRONIZE,
 };
-use windows::Win32::System::IO::{
-    CancelIoEx, DeviceIoControl, GetOverlappedResult, GetOverlappedResultEx, OVERLAPPED,
-    OVERLAPPED_0, OVERLAPPED_0_0,
-};
+use windows::Win32::System::IO::DeviceIoControl;
 use windows::Win32::System::Ioctl::{
     CREATE_USN_JOURNAL_DATA, FSCTL_CREATE_USN_JOURNAL, FSCTL_GET_NTFS_FILE_RECORD,
     FSCTL_GET_NTFS_VOLUME_DATA, FSCTL_QUERY_USN_JOURNAL, FSCTL_READ_USN_JOURNAL,
     NTFS_VOLUME_DATA_BUFFER, READ_USN_JOURNAL_DATA_V0, USN_JOURNAL_DATA_V0,
 };
-use windows::Win32::System::Threading::CreateEventW;
-use windows::core::{HRESULT, HSTRING};
+use windows::core::HSTRING;
 
 use crate::directory;
 use crate::disk::{Disk, Geometry};
 use crate::mft;
+use crate::overlapped::{Call, Owned, os, pending, wait};
 use crate::usn;
-
-/// How long a wait goes before it looks whether it is to stop.
-const PATIENCE: Duration = Duration::from_millis(500);
 
 /// How long changes gather between two reads of the journal, so a burst
 /// comes in one batch.
@@ -57,18 +50,6 @@ const JOURNAL_ROOM: usize = 64 << 10;
 /// Room for a folder's entries, read a roomful at a time.
 const ENTRIES_ROOM: usize = 64 << 10;
 
-/// A handle Windows gave, closed once when dropped.
-struct Owned(HANDLE);
-
-impl Drop for Owned {
-    fn drop(&mut self) {
-        // SAFETY: the handle is ours and closed only here.
-        unsafe {
-            let _ = CloseHandle(self.0);
-        }
-    }
-}
-
 /// A page of memory: what a read of the volume, which may bypass the
 /// cache, needs its buffer aligned to.
 #[derive(Clone, Copy)]
@@ -81,12 +62,6 @@ pub struct Ntfs {
     path: HSTRING,
     geometry: Geometry,
 }
-
-// SAFETY: a volume handle may be used from any thread, and from several at
-// once: each read and control carries its own `OVERLAPPED` and event.
-unsafe impl Send for Ntfs {}
-// SAFETY: as above; nothing in `Ntfs` changes after it is opened.
-unsafe impl Sync for Ntfs {}
 
 impl Ntfs {
     /// The volume of the drive `drive` (`C`), if it is NTFS and may be
@@ -132,13 +107,9 @@ impl Ntfs {
         output: &mut [u8],
         stop: Option<&AtomicBool>,
     ) -> io::Result<Option<usize>> {
-        let event = event()?;
-        let mut overlapped = OVERLAPPED {
-            hEvent: event.0,
-            ..Default::default()
-        };
-        // SAFETY: both buffers and `overlapped` outlive the call: `wait`
-        // sees it end, or cancels it and sees it end.
+        let mut call = Call::new(0)?;
+        // SAFETY: both buffers and the call outlive it: `wait` sees it
+        // end, or cancels it and sees it end.
         let issued = unsafe {
             DeviceIoControl(
                 self.volume.0,
@@ -148,11 +119,11 @@ impl Ntfs {
                 Some(output.as_mut_ptr().cast()),
                 output.len() as u32,
                 None,
-                Some(&raw mut overlapped),
+                Some(&raw mut call.overlapped),
             )
         };
         pending(issued)?;
-        self.wait(&raw const overlapped, stop)
+        wait(self.volume.0, &raw const call.overlapped, stop)
     }
 
     /// The structure the control `code` with `input` answers.
@@ -162,49 +133,6 @@ impl Ntfs {
         // SAFETY: the room is at least as long as `T`, aligned to 8, and
         // holds what Windows wrote of a `T`, a plain C structure.
         Ok(unsafe { room.as_ptr().cast::<T>().read_unaligned() })
-    }
-
-    /// Waits for the call issued with `overlapped` to end.
-    fn wait(
-        &self,
-        overlapped: *const OVERLAPPED,
-        stop: Option<&AtomicBool>,
-    ) -> io::Result<Option<usize>> {
-        let timeout = HRESULT::from_win32(WAIT_TIMEOUT.0);
-        loop {
-            let mut length = 0;
-            // SAFETY: the call was issued on this handle with `overlapped`.
-            let result = unsafe {
-                GetOverlappedResultEx(
-                    self.volume.0,
-                    overlapped,
-                    &mut length,
-                    PATIENCE.as_millis() as u32,
-                    false,
-                )
-            };
-            match result {
-                Ok(()) => return Ok(Some(length as usize)),
-                Err(error) if error.code() == timeout => {
-                    if stop.is_some_and(|stop| stop.load(Ordering::SeqCst)) {
-                        self.cancel(overlapped);
-                        return Ok(None);
-                    }
-                }
-                Err(error) => return Err(error.into()),
-            }
-        }
-    }
-
-    /// Cancels the call issued with `overlapped` and waits for it to end,
-    /// so nothing writes to its buffer after.
-    fn cancel(&self, overlapped: *const OVERLAPPED) {
-        let mut length = 0;
-        // SAFETY: the call is ours, on this handle.
-        unsafe {
-            let _ = CancelIoEx(self.volume.0, Some(overlapped));
-            let _ = GetOverlappedResult(self.volume.0, overlapped, &mut length, true);
-        }
     }
 
     /// What the journal is now.
@@ -240,7 +168,8 @@ impl Ntfs {
                 0,
                 None,
                 None,
-            )?;
+            )
+            .map_err(os)?;
         }
         Ok(())
     }
@@ -256,29 +185,19 @@ impl Disk for Ntfs {
         // SAFETY: the pages hold at least `length` bytes, and are not used
         // otherwise while `buffer` lives.
         let buffer = unsafe { std::slice::from_raw_parts_mut(pages.as_mut_ptr().cast(), length) };
-        let event = event()?;
-        let mut overlapped = OVERLAPPED {
-            hEvent: event.0,
-            Anonymous: OVERLAPPED_0 {
-                Anonymous: OVERLAPPED_0_0 {
-                    Offset: at as u32,
-                    OffsetHigh: (at >> 32) as u32,
-                },
-            },
-            ..Default::default()
-        };
-        // SAFETY: the buffer and `overlapped` outlive the read: `wait`
-        // sees it end before either is touched again.
+        let mut call = Call::new(at)?;
+        // SAFETY: the buffer and the call outlive the read: `wait` sees it
+        // end before either is touched again.
         let issued = unsafe {
             ReadFile(
                 self.volume.0,
                 Some(&mut *buffer),
                 None,
-                Some(&raw mut overlapped),
+                Some(&raw mut call.overlapped),
             )
         };
         pending(issued)?;
-        match self.wait(&raw const overlapped, None)? {
+        match wait(self.volume.0, &raw const call.overlapped, None)? {
             Some(read) if read == length => Ok(buffer.to_vec()),
             _ => Err(io::ErrorKind::UnexpectedEof.into()),
         }
@@ -336,7 +255,7 @@ impl Disk for Ntfs {
             FILE_FLAGS_AND_ATTRIBUTES(0),
         )?);
         // SAFETY: a plain call on a handle that is ours.
-        unsafe { FlushFileBuffers(writable.0)? };
+        unsafe { FlushFileBuffers(writable.0).map_err(os)? };
         Ok(())
     }
 
@@ -417,7 +336,7 @@ fn entries(folder: &Owned) -> io::Result<Vec<u32>> {
         match listed {
             Ok(()) => records.extend(directory::records(bytes_mut(&mut room))),
             Err(error) if error.code() == ERROR_NO_MORE_FILES.to_hresult() => return Ok(records),
-            Err(error) => return Err(error.into()),
+            Err(error) => return Err(os(error)),
         }
         class = FileIdBothDirectoryInfo;
     }
@@ -427,23 +346,9 @@ fn entries(folder: &Owned) -> io::Result<Vec<u32>> {
 fn open(path: &HSTRING, access: u32, flags: FILE_FLAGS_AND_ATTRIBUTES) -> io::Result<HANDLE> {
     let share = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
     // SAFETY: a plain call; the caller owns the handle it gives.
-    let handle = unsafe { CreateFileW(path, access, share, None, OPEN_EXISTING, flags, None)? };
+    let handle =
+        unsafe { CreateFileW(path, access, share, None, OPEN_EXISTING, flags, None).map_err(os)? };
     Ok(handle)
-}
-
-/// An event for one call to signal, closed when dropped.
-fn event() -> io::Result<Owned> {
-    // SAFETY: a plain call; the event is closed by `Owned`.
-    Ok(Owned(unsafe { CreateEventW(None, true, false, None)? }))
-}
-
-/// What a call issued on an overlapped handle said: it ended, or it is
-/// under way.
-fn pending(issued: windows::core::Result<()>) -> io::Result<()> {
-    match issued {
-        Err(error) if error.code() != ERROR_IO_PENDING.to_hresult() => Err(error.into()),
-        _ => Ok(()),
-    }
 }
 
 /// Memory of 8-byte words, as the bytes Windows writes into it.

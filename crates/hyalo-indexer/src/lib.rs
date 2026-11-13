@@ -8,10 +8,15 @@
 //! and the table is read again for those alone.
 
 mod bytes;
+pub mod client;
 pub mod directory;
 pub mod disk;
 pub mod listing;
 pub mod mft;
 pub mod ntfs;
+mod overlapped;
 pub mod read;
+pub mod security;
+pub mod server;
 pub mod usn;
+mod wire;
