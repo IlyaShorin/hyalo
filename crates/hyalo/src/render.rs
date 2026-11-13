@@ -14,7 +14,6 @@
 //! used only from the UI thread that created it.
 
 use std::borrow::Cow;
-use std::collections::HashMap;
 use std::ops::Range;
 
 use hyalo_core::item::ItemId;
@@ -35,6 +34,7 @@ use windows_numerics::Vector2;
 use crate::apps::Icon;
 use crate::field;
 use crate::layout::{BAR_HEIGHT, ICON_SIZE, ROW_HEIGHT, TEXT_LEFT, TEXT_RIGHT_PAD, row_top};
+use crate::recent::Recent;
 use crate::surface::{
     Behind, DISPLAY_FONT, Family, PREMULTIPLIED_BGRA, SELECTED_TEXT, Surface, TEXT_FONT, caret_x,
     hit, line_width, rgba, text_format, trimmed,
@@ -96,6 +96,11 @@ const SUBTITLE_LINE: (f32, f32) = (25.0, 18.0);
 /// The selected row's highlight: inset from the window's sides, radius.
 const SELECTION_INSET: f32 = 6.0;
 const SELECTION_RADIUS: f32 = 6.0;
+/// How many icons stay on the GPU: those of the rows drawn last, then the
+/// ones drawn before them. Eight full lists, so typing through a few
+/// queries and back uploads nothing again; at 200 % (icons of 64 px) they
+/// hold 1 MB.
+const KEPT_ICONS: usize = 64;
 
 /// Darkens the acrylic slightly so white text keeps its contrast.
 const TINT: D2D1_COLOR_F = rgba(0.06, 0.06, 0.08, 0.28);
@@ -118,8 +123,9 @@ const ASKING_TEXT: D2D1_COLOR_F = rgba(1.0, 0.78, 0.36, 0.95);
 pub struct Renderer {
     surface: Surface,
     fonts: Fonts,
-    /// Icons already on the GPU, by item.
-    icons: HashMap<ItemId, ID2D1Bitmap1>,
+    /// Icons already on the GPU, by item: the most recently drawn,
+    /// `KEPT_ICONS` at most.
+    icons: Recent<ItemId, ID2D1Bitmap1>,
     /// How far the query is scrolled left, in DIPs, so its caret shows.
     scroll: f32,
 }
@@ -141,7 +147,7 @@ impl Renderer {
         Ok(Self {
             surface,
             fonts,
-            icons: HashMap::new(),
+            icons: Recent::new(KEPT_ICONS),
             scroll: 0.0,
         })
     }
@@ -431,14 +437,10 @@ impl Renderer {
         self.surface.draw_text(&layout, ICON_LEFT, y, GLYPH)
     }
 
-    /// The icon as a Direct2D bitmap, uploaded the first time it is drawn.
+    /// The icon as a Direct2D bitmap, uploaded unless it is still kept.
     fn icon_bitmap(&mut self, id: &ItemId, icon: &Icon) -> Result<ID2D1Bitmap1> {
-        if let Some(bitmap) = self.icons.get(id) {
-            return Ok(bitmap.clone());
-        }
-        let bitmap = upload(&self.surface.dc, icon)?;
-        self.icons.insert(id.clone(), bitmap.clone());
-        Ok(bitmap)
+        let dc = &self.surface.dc;
+        self.icons.get_or_make(id, || upload(dc, icon))
     }
 
     /// Marks the matched letters: semibold, in the accent colour.
@@ -684,6 +686,61 @@ mod tests {
                 let frame = renderer.read_frame().expect("read the frame back");
                 assert_looks_like("list-150", &frame);
             }
+        });
+    }
+
+    #[test]
+    fn icons_of_rows_drawn_long_ago_leave_the_gpu_and_come_back_when_drawn_again() {
+        on_hidden_desktop(|| {
+            let (ids, icons) = (note_ids(), note_icons());
+            let canvas = Canvas::new();
+            let mut renderer =
+                Renderer::new(canvas.0, 1080, 336, 144, Behind::Glass).expect("a renderer");
+            renderer.draw(&note(&ids, &icons)).expect("draw");
+            // As many windows as the renderer keeps icons of, each opened
+            // and listed once, then closed: a new id each.
+            for handle in 0..KEPT_ICONS {
+                let id = ItemId(format!("hyalo:window:{handle}"));
+                let scene = Scene {
+                    rows: vec![Row {
+                        id: &id,
+                        title: "notes.txt - Notepad",
+                        subtitle: "Notepad".into(),
+                        highlights: Vec::new(),
+                        icon: Some(&icons[0]),
+                        glyph: None,
+                    }],
+                    selected: 0,
+                    ..Scene::bar(">")
+                };
+                renderer.draw(&scene).expect("draw a window");
+            }
+            assert_eq!(renderer.icons.len(), KEPT_ICONS, "the latest windows'");
+            renderer.draw(&note(&ids, &icons)).expect("draw again");
+            let frame = renderer.read_frame().expect("read the frame back");
+            assert_looks_like("list-150", &frame);
+            assert_eq!(renderer.icons.len(), KEPT_ICONS, "two windows' fewer");
+        });
+    }
+
+    #[test]
+    fn an_answer_row_with_grouped_digits_at_100_percent() {
+        on_hidden_desktop(|| {
+            let id = ItemId("hyalo:calculator".to_string());
+            let scene = Scene {
+                rows: vec![Row {
+                    id: &id,
+                    title: "1\u{A0}234\u{A0}567,5",
+                    subtitle: "Calculator · Enter to copy".into(),
+                    highlights: Vec::new(),
+                    icon: None,
+                    glyph: Some('\u{E8EF}'),
+                }],
+                selected: 0,
+                ..Scene::bar("1234567+0,5")
+            };
+            let frame = drawn(&scene, (720, 128), 96);
+            assert_looks_like("answer-100", &frame);
         });
     }
 

@@ -23,6 +23,7 @@ mod panel;
 mod picker;
 mod popup;
 mod rates;
+mod recent;
 mod recorder;
 mod registry;
 mod render;
