@@ -55,12 +55,14 @@ impl Index {
             };
         }
         let pattern = &Pattern::new(query);
-        let narrowing = &self.narrowing(filters, query.is_empty());
+        let (narrowing, unmatched) = (&self.narrowing(filters), query.is_empty());
         let (mut hits, scored) = thread::scope(|scope| {
             let threads: Vec<_> = self
                 .slices()
                 .map(|slice| {
-                    scope.spawn(move || self.best_in(slice, pattern, narrowing, places, limit))
+                    let search =
+                        move || self.best_in(slice, pattern, narrowing, places, limit, unmatched);
+                    scope.spawn(search)
                 })
                 .collect();
             let found = threads.into_iter().map(|thread| thread.join());
@@ -95,7 +97,8 @@ impl Index {
             .map(move |start| start..all.min(start + size))
     }
 
-    /// The best `limit` entries in `slice`.
+    /// The best `limit` entries in `slice`; `unmatched`, by their place
+    /// alone.
     fn best_in(
         &self,
         slice: Range<usize>,
@@ -103,11 +106,13 @@ impl Index {
         narrowing: &Narrowing,
         places: &Places,
         limit: usize,
+        unmatched: bool,
     ) -> (Vec<Hit>, usize) {
         let mut scan = Scan {
             index: self,
             pattern,
             narrowing,
+            unmatched,
             places,
             best: Best {
                 limit,
@@ -154,16 +159,15 @@ impl Index {
     pub fn sieve<'a>(&'a self, filters: &'a Filters) -> Sieve<'a> {
         Sieve {
             index: self,
-            narrowing: self.narrowing(filters, false),
+            narrowing: self.narrowing(filters),
         }
     }
 
     /// `filters` made ready: the folders `in:` names found.
-    fn narrowing<'a>(&self, filters: &'a Filters, unmatched: bool) -> Narrowing<'a> {
+    fn narrowing<'a>(&self, filters: &'a Filters) -> Narrowing<'a> {
         let named = !filters.folders.is_empty();
         Narrowing {
             filters,
-            unmatched,
             within: named.then(|| self.folders_named(&filters.folders)),
         }
     }
@@ -219,8 +223,6 @@ impl Sieve<'_> {
 /// Filters made ready for one search.
 struct Narrowing<'a> {
     filters: &'a Filters,
-    /// No words: what the filters let through is listed unmatched.
-    unmatched: bool,
     /// The folders `in:` names, when it names any: what is listed is
     /// under one of them.
     within: Option<HashSet<u32>>,
@@ -261,6 +263,8 @@ struct Scan<'a> {
     index: &'a Index,
     pattern: &'a Pattern,
     narrowing: &'a Narrowing<'a>,
+    /// No words: what the filters let through is listed unmatched.
+    unmatched: bool,
     places: &'a Places,
     best: Best,
     /// `(folder, points of its place)`, each folder in slot `folder % SEEN`.
@@ -281,7 +285,7 @@ impl Scan<'_> {
         if !listed || !self.narrowing.admits(self.index, at, entry) || !self.inside(entry.parent) {
             return;
         }
-        match self.narrowing.unmatched {
+        match self.unmatched {
             true => self.list(at, entry),
             false => self.match_name(at, entry),
         }
