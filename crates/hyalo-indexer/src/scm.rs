@@ -132,9 +132,9 @@ pub fn remove(services: &dyn Services, target: &Path) -> io::Result<()> {
     };
     stop_running(services, Some(state))?;
     services.delete(NAME)?;
-    held_on(|| fs::remove_file(target))?;
+    gone(held_on(|| fs::remove_file(target)))?;
     match target.parent() {
-        Some(folder) => held_on(|| fs::remove_dir(folder)),
+        Some(folder) => gone(held_on(|| fs::remove_dir(folder))),
         None => Ok(()),
     }
 }
@@ -148,14 +148,21 @@ fn copy(exe: &Path, target: &Path) -> io::Result<()> {
     held_on(|| fs::copy(exe, target).map(drop))
 }
 
+/// What removing did: a file already gone is removed.
+fn gone(removed: io::Result<()>) -> io::Result<()> {
+    match removed {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        other => other,
+    }
+}
+
 /// Does `act`, trying again for a while as long as a file it needs is
 /// held: the service's process holds its exe for a moment after the
-/// service manager says it stopped. A file already gone is no failure.
+/// service manager says it stopped.
 fn held_on(act: impl Fn() -> io::Result<()>) -> io::Result<()> {
     let until = Instant::now() + LOCKED_FOR;
     loop {
         match act() {
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
             Err(error) if held(&error) && Instant::now() < until => {
                 thread::sleep(Duration::from_millis(100));
             }
@@ -379,6 +386,19 @@ mod tests {
         install(&services, &exe, &target, ME).expect("installed");
         letting_go.join().expect("let go");
         assert_eq!(fs::read(&target).expect("copied"), b"the new build");
+    }
+
+    #[test]
+    fn an_exe_that_is_not_there_installs_nothing_at_once() {
+        let scratch = Scratch::new("install-missing");
+        let (exe, target) = paths(&scratch);
+        fs::remove_file(&exe).expect("removed");
+        let services = Noted::new(None, &[]);
+        let started = Instant::now();
+        let failed = install(&services, &exe, &target, ME).expect_err("nothing to copy");
+        assert_eq!(failed.kind(), io::ErrorKind::NotFound);
+        assert!(started.elapsed() < LOCKED_FOR / 2, "not tried again");
+        assert_eq!(services.calls(), Vec::<String>::new());
     }
 
     #[test]

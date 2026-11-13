@@ -6,9 +6,9 @@
 use std::io;
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 use std::sync::mpsc::Sender;
-use std::thread::{self, JoinHandle};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use hyalo_core::pipe::{Answer, Request};
@@ -17,6 +17,8 @@ use hyalo_index::{EntryId, Index};
 use hyalo_indexer::client::Connection;
 use hyalo_indexer::manager::Manager;
 use hyalo_indexer::scm::{self, Services};
+
+use super::watch::Stopping;
 
 /// Where the volumes come from: the service, or nowhere.
 pub trait Indexer: Send + Sync {
@@ -147,8 +149,7 @@ impl Listing {
 /// each with the root's place among the roots, until `stop` is set or
 /// nobody listens. An error is sent too, and is the last.
 pub struct Following {
-    stop: Arc<AtomicBool>,
-    thread: Option<JoinHandle<()>>,
+    _thread: Stopping,
 }
 
 impl Following {
@@ -174,17 +175,7 @@ impl Following {
             }
         });
         Following {
-            stop,
-            thread: Some(thread),
-        }
-    }
-}
-
-impl Drop for Following {
-    fn drop(&mut self) {
-        self.stop.store(true, Ordering::SeqCst);
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
+            _thread: Stopping::new(stop, thread),
         }
     }
 }

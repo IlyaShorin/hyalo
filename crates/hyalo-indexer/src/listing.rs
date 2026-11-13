@@ -26,15 +26,18 @@ struct Item {
     folder: bool,
     size: Option<u64>,
     written: i64,
-    /// The folder the name is in, and where the name lies in `names`; no
-    /// name when its length is none.
+    /// The folder the name is in, and where the name lies in `names`;
+    /// none for a record with no name.
+    name: Option<Place>,
+}
+
+/// Where an item's name is: its folder, and its stretch of `names`.
+#[derive(Debug, Clone, Copy)]
+struct Place {
     parent: u32,
     at: u32,
     length: u32,
 }
-
-/// The parent of a record with no name.
-const NONE: u32 = u32::MAX;
 
 impl Listing {
     /// Takes in the record `record` of the table, as read.
@@ -45,9 +48,7 @@ impl Listing {
             folder: read.folder,
             size: read.size,
             written: read.written.unwrap_or(0),
-            parent: NONE,
-            at: 0,
-            length: 0,
+            name: None,
         };
         if read.names.is_empty() {
             self.items.push(item);
@@ -55,10 +56,13 @@ impl Listing {
         for name in read.names {
             let at = self.names.len() as u32;
             self.names.push_str(&name.text);
-            self.items.push(Item {
+            let place = Place {
                 parent: name.parent,
                 at,
                 length: name.text.len() as u32,
+            };
+            self.items.push(Item {
+                name: Some(place),
                 ..item
             });
         }
@@ -68,7 +72,10 @@ impl Listing {
     pub fn join(&mut self, other: Listing) {
         let shift = self.names.len() as u32;
         let moved = other.items.into_iter().map(|item| Item {
-            at: item.at + shift,
+            name: item.name.map(|place| Place {
+                at: place.at + shift,
+                ..place
+            }),
             ..item
         });
         self.items.extend(moved);
@@ -109,12 +116,11 @@ fn files(items: &[Item]) -> Vec<(usize, usize)> {
 /// The folders among `files` under the root, each after the folder it is
 /// in.
 fn under_root(items: &[Item], files: &[(usize, usize)]) -> Vec<(usize, usize)> {
-    let mut folders: Vec<(u32, (usize, usize))> = files
+    let folders = files
         .iter()
-        .filter(|&&(at, _)| items[at].folder && items[at].record != ROOT)
-        .filter(|&&(at, _)| items[at].parent != NONE)
-        .map(|&file| (items[file.0].parent, file))
-        .collect();
+        .filter(|&&(at, _)| items[at].folder && items[at].record != ROOT);
+    let named = folders.filter_map(|&file| Some((items[file.0].name?.parent, file)));
+    let mut folders: Vec<(u32, (usize, usize))> = named.collect();
     folders.sort_by_key(|&(parent, _)| parent);
     let mut order = Vec::new();
     let mut waiting = VecDeque::from([ROOT]);
@@ -132,10 +138,10 @@ fn under_root(items: &[Item], files: &[(usize, usize)]) -> Vec<(usize, usize)> {
 /// What one file's items say of it.
 fn change(items: &[Item], names: &str) -> Change {
     let own = items[0];
-    let named = items.iter().filter(|item| item.parent != NONE);
-    let names = named.map(|item| Name {
-        parent: item.parent,
-        text: names[item.at as usize..(item.at + item.length) as usize].to_string(),
+    let named = items.iter().filter_map(|item| item.name);
+    let names = named.map(|place| Name {
+        parent: place.parent,
+        text: names[place.at as usize..(place.at + place.length) as usize].to_string(),
     });
     Change {
         record: own.record,

@@ -110,6 +110,14 @@ mod tests {
     }
 
     #[test]
+    fn a_record_of_no_name_is_as_short_as_a_record_is() {
+        let mut bare = change(97, 5, "")[..HEAD].to_vec();
+        bare[0..4].copy_from_slice(&(HEAD as u32).to_le_bytes());
+        let read = answer(9, &[bare, change(98, 5, "after")]);
+        assert_eq!(changed(&read), Some((9, vec![97, 98])));
+    }
+
+    #[test]
     fn a_record_beyond_the_index_s_numbers_is_passed_over() {
         let mut huge = change(0, 5, "far");
         huge[8..16].copy_from_slice(&((1_u64 << 40) | 1).to_le_bytes());

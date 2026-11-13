@@ -112,7 +112,7 @@ fn instance(name: &HSTRING, security: &Security, first: bool) -> io::Result<End>
     };
     let only = match first {
         true => FILE_FLAG_FIRST_PIPE_INSTANCE,
-        false => FILE_FLAGS_AND_ATTRIBUTES(0),
+        false => FILE_FLAGS_AND_ATTRIBUTES::default(),
     };
     let mode = PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS;
     // SAFETY: the name and the attributes outlive the call; the handle it
@@ -159,7 +159,7 @@ fn connection(end: End, open: Opener, stop: &AtomicBool) -> io::Result<()> {
     let over = AtomicBool::new(false);
     let answered = thread::scope(|scope| {
         scope.spawn(|| watch(&end, &over, stop));
-        let mut out = |answer: Answer| end.write(&answer.bytes(), &over);
+        let mut out = |answer: Answer| end.write(&answer.bytes(), Some(&over));
         let answered = answer(Request::read(&body), open, &mut out, &over);
         over.store(true, Ordering::SeqCst);
         answered

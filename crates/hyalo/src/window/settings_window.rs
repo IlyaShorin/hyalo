@@ -515,7 +515,7 @@ impl App {
         );
         let mut panel = Panel::new(file, self.starts(), self.services.windows_language);
         panel.set_updates(self.versions());
-        panel.set_indexing(Some(self.indexing_now()));
+        panel.set_indexing(self.indexing_now());
         Some(panel)
     }
 
@@ -532,7 +532,7 @@ impl App {
     fn show_indexing(&mut self) {
         let indexing = self.indexing_now();
         if let Some(window) = &mut self.settings {
-            window.panel.set_indexing(Some(indexing));
+            window.panel.set_indexing(indexing);
             window.redraw_or_say();
         }
     }

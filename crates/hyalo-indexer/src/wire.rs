@@ -14,8 +14,9 @@ use crate::overlapped::{Call, Owned, pending, read_at, wait};
 pub(crate) struct End(pub(crate) Owned);
 
 impl End {
-    /// Writes all of `bytes`, unless `stop` is set first.
-    pub(crate) fn write(&self, bytes: &[u8], stop: &AtomicBool) -> io::Result<()> {
+    /// Writes all of `bytes`, unless `stop`, if there is one, is set
+    /// first.
+    pub(crate) fn write(&self, bytes: &[u8], stop: Option<&AtomicBool>) -> io::Result<()> {
         let mut written = 0;
         while written < bytes.len() {
             let mut call = Call::new(0)?;
@@ -30,7 +31,7 @@ impl End {
                 )
             };
             pending(issued)?;
-            match wait(self.0.0, &raw const call.overlapped, Some(stop))? {
+            match wait(self.0.0, &raw const call.overlapped, stop)? {
                 None => return Err(io::ErrorKind::Interrupted.into()),
                 Some(0) => return Err(io::ErrorKind::WriteZero.into()),
                 Some(more) => written += more,

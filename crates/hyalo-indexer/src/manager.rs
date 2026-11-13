@@ -220,7 +220,7 @@ const USERS: &str = "Users";
 /// The SIDs the service's parameters list.
 fn read_users(name: &str) -> io::Result<Vec<String>> {
     let mut room = vec![0_u16; 4096];
-    let mut length = (room.len() * 2) as u32;
+    let mut length = size_of_val(room.as_slice()) as u32;
     // SAFETY: the room is ours and as long as said.
     let read = unsafe {
         RegGetValueW(

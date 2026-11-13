@@ -54,7 +54,7 @@ impl Connection {
                 return Err(io::ErrorKind::PermissionDenied.into());
             }
         }
-        end.write(bytes, &AtomicBool::new(false))?;
+        end.write(bytes, None)?;
         Ok(Connection { end })
     }
 
@@ -221,6 +221,8 @@ mod tests {
         assert_eq!(next(&connection), Answer::Listing(at));
         assert!(matches!(next(&connection), Answer::Files(files) if files.len() == 2));
         assert_eq!(next(&connection), Answer::Listed);
+        // Longer than the server waits before it looks whether to stop.
+        thread::sleep(crate::overlapped::PATIENCE * 2);
         image.change(16, None);
         let gone = Change {
             record: 16,
@@ -280,6 +282,31 @@ mod tests {
             matches!(second.ended(Duration::from_secs(10)), Some(Err(_))),
             "refused at once"
         );
+    }
+
+    #[test]
+    fn the_service_serves_another_while_one_is_followed_however_long() {
+        let (name, image) = (name("busy"), volume());
+        let _serving = Serving::start(&name, &image, Duration::from_millis(300));
+        let first = asked(&name, here(), &follow_c()).expect("connected");
+        assert!(matches!(next(&first), Answer::Listing(_)));
+        thread::sleep(crate::overlapped::PATIENCE * 2);
+        let refused = Request::Follow {
+            drive: 'D',
+            from: None,
+        };
+        let second = Connection::ask(&name, here(), &refused).expect("still served");
+        assert_eq!(next(&second), Answer::Refused);
+    }
+
+    #[test]
+    fn a_wait_for_an_answer_ends_once_stopped() {
+        let (name, image) = (name("stopped"), volume());
+        let _serving = Serving::start(&name, &image, Duration::from_secs(60));
+        let connection = asked(&name, here(), &follow_c()).expect("connected");
+        while !matches!(next(&connection), Answer::Listed) {}
+        let stop = AtomicBool::new(true);
+        assert_eq!(connection.next(&stop).expect("no error"), None);
     }
 
     #[test]

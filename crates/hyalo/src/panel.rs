@@ -222,9 +222,9 @@ impl Panel {
         self.settle_focus();
     }
 
-    /// How the indexer service is now.
-    pub fn set_indexing(&mut self, indexing: Option<Indexing>) {
-        self.indexing = indexing;
+    /// How the indexer service is now: the page shows it from then on.
+    pub fn set_indexing(&mut self, indexing: Indexing) {
+        self.indexing = Some(indexing);
         self.settle_focus();
     }
 
@@ -2167,12 +2167,12 @@ notes
             .next()
     }
 
-    fn indexing(installed: bool, busy: bool, failed: bool) -> Option<Indexing> {
-        Some(Indexing {
+    fn indexing(installed: bool, busy: bool, failed: bool) -> Indexing {
+        Indexing {
             installed,
             busy,
             failed,
-        })
+        }
     }
 
     fn help(text: Text, alarm: bool) -> What {

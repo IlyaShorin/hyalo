@@ -5,6 +5,7 @@
 
 use std::collections::{HashSet, VecDeque};
 use std::io;
+use std::num::NonZero;
 use std::sync::atomic::AtomicBool;
 use std::thread;
 
@@ -13,7 +14,7 @@ use hyalo_core::volume::{Change, Journal, Position};
 
 use crate::disk::{Disk, Geometry};
 use crate::listing::Listing;
-use crate::mft::{self, Piece, Table};
+use crate::mft::{self, Piece, Span, Table};
 use crate::usn;
 
 /// Where answers go: to the launcher, until it lets go.
@@ -41,7 +42,8 @@ pub fn list(disk: &dyn Disk) -> io::Result<Listing> {
     let geometry = disk.geometry()?;
     let table = table(disk, &geometry)?;
     let pieces = table.pieces(geometry.valid, PIECE);
-    let readers = thread::available_parallelism().map_or(1, |count| count.get().min(READERS));
+    let cores = thread::available_parallelism().unwrap_or(NonZero::<usize>::MIN);
+    let readers = cores.get().min(READERS);
     let mut shares = vec![Vec::new(); readers];
     for (at, piece) in pieces.into_iter().enumerate() {
         shares[at % readers].push(piece);
@@ -62,7 +64,11 @@ pub fn list(disk: &dyn Disk) -> io::Result<Listing> {
 /// Where the table lies: what its own record says, and the records its
 /// attribute list names for the stretches it had no room for.
 fn table(disk: &dyn Disk, geometry: &Geometry) -> io::Result<Table> {
-    let own = raw_record(disk, geometry, &[geometry.table * geometry.cluster])?;
+    let own = Span {
+        at: geometry.table * geometry.cluster,
+        length: geometry.record,
+    };
+    let own = raw_record(disk, &[own])?;
     let mut segments = vec![mft::data_runs(&own).ok_or_else(unreadable)?];
     let (cluster, record) = (geometry.cluster, geometry.record);
     let start = Table::new(cluster, record, segments.clone()).ok_or_else(unreadable)?;
@@ -70,20 +76,18 @@ fn table(disk: &dyn Disk, geometry: &Geometry) -> io::Result<Table> {
     for extension in elsewhere.into_iter().filter(|&number| number != 0) {
         let spans = start.spans(u64::from(extension) * record, record);
         let spans = spans.ok_or_else(unreadable)?;
-        let places: Vec<u64> = spans.iter().map(|span| span.at).collect();
-        let more = raw_record(disk, geometry, &places)?;
+        let more = raw_record(disk, &spans)?;
         segments.extend(mft::data_runs(&more).filter(|&(first, _)| first != 0));
     }
     Table::new(cluster, record, segments).ok_or_else(unreadable)
 }
 
-/// A record of the table read from the disk, at `places` (one, unless it
-/// lies across two stretches), with its sectors' ends put back.
-fn raw_record(disk: &dyn Disk, geometry: &Geometry, places: &[u64]) -> io::Result<Vec<u8>> {
-    let share = geometry.record as usize / places.len();
+/// A record of the table read from the disk, from `spans` (one, unless
+/// it lies across stretches), with its sectors' ends put back.
+fn raw_record(disk: &dyn Disk, spans: &[Span]) -> io::Result<Vec<u8>> {
     let mut bytes = Vec::new();
-    for &at in places {
-        bytes.extend(disk.read(at, share)?);
+    for span in spans {
+        bytes.extend(disk.read(span.at, span.length as usize)?);
     }
     match mft::fix(&mut bytes) {
         true => Ok(bytes),
@@ -350,6 +354,21 @@ mod tests {
             .list(&[(0x80, 0, 0), (0x80, 8, 1)]);
         let more = record().extending(0).data(8, 0, &runs_bytes(&[(300, 8)]));
         let image = Image::new(&[(0, own), (1, more), (40, file(5, "far.txt", 1))]);
+        assert_eq!(records(&listed(&image)), [0, 40]);
+    }
+
+    #[test]
+    fn a_stretch_of_the_table_said_twice_from_its_start_is_taken_once() {
+        let length = u64::from(RECORDS) * 1024;
+        let own = record()
+            .name(5, "$MFT", 3)
+            .data(0, length, &runs_bytes(&[(100, 8)]))
+            .list(&[(0x80, 0, 0), (0x80, 8, 1), (0x80, 0, 2)]);
+        let more = record().extending(0).data(8, 0, &runs_bytes(&[(300, 8)]));
+        let again = record()
+            .extending(0)
+            .data(0, length, &runs_bytes(&[(100, 8)]));
+        let image = Image::new(&[(0, own), (1, more), (2, again), (40, file(5, "far.txt", 1))]);
         assert_eq!(records(&listed(&image)), [0, 40]);
     }
 
