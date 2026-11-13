@@ -90,6 +90,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "hyalo-indexer"
+version = "0.2.8"
+
+[[package]]
 name = "indexmap"
 version = "2.14.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
