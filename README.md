@@ -94,7 +94,7 @@ Measured on one machine, with more than two million names on two NVMe drives, ag
 
 | | hyalo | Everything |
 |---|---|---|
-| A search, median | 2–11 ms (31 ms for `readme`) | 2–11 ms |
+| A search, median | 2–6 ms | 2–11 ms |
 | Loading the saved index at start | 0.36 s | 0.55 s |
 | Memory the index takes | 212 MB | 220 MB |
 | Building the index from nothing | 104 s, with your rights | 10.6 s, with admin rights |
