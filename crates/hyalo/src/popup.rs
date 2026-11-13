@@ -7,7 +7,8 @@ use windows::Win32::Foundation::{HWND, LPARAM, POINT, WPARAM};
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, DestroyMenu, HMENU, MENU_ITEM_FLAGS, MF_CHECKED, MF_GRAYED,
     MF_SEPARATOR, MF_STRING, PostMessageW, SetForegroundWindow, TPM_BOTTOMALIGN, TPM_LEFTALIGN,
-    TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON, TPM_TOPALIGN, TrackPopupMenuEx, WM_NULL,
+    TPM_NOANIMATION, TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON, TPM_TOPALIGN, TrackPopupMenuEx,
+    WM_NULL,
 };
 use windows::core::{HSTRING, PCWSTR, Result};
 
@@ -61,8 +62,11 @@ pub fn track<C: Clone>(window: HWND, lines: &[Line<C>], at: POINT, side: Side) -
         Side::Above => TPM_BOTTOMALIGN,
         Side::Below => TPM_TOPALIGN,
     };
-    // The command comes back here rather than as WM_COMMAND.
+    // The command comes back here rather than as WM_COMMAND. No fade:
+    // on Windows 11 26H2 a menu faded in stays blank until the pointer
+    // goes over its entries, in every app; one shown at once does not.
     let flags = side | TPM_LEFTALIGN | TPM_RIGHTBUTTON | TPM_RETURNCMD | TPM_NONOTIFY;
+    let flags = flags | TPM_NOANIMATION;
     // SAFETY: `menu` is ours and destroyed once. The window must be in
     // the foreground for the menu to close when the user clicks
     // elsewhere; WM_NULL afterwards lets it close on the first click.
@@ -120,12 +124,79 @@ fn flags<C>(entry: &Entry<C>) -> MENU_ITEM_FLAGS {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use crate::test_desktop::take_turn;
+    use std::cell::Cell;
+    use std::fs::File;
+    use windows::Win32::Foundation::LRESULT;
     use windows::Win32::System::Threading::GetCurrentThreadId;
     use windows::Win32::UI::WindowsAndMessaging::{
-        FindWindowExW, GetMenuItemCount, GetMenuItemID, GetMenuState, GetMenuStringW,
-        GetWindowThreadProcessId, MF_BYPOSITION,
+        CallNextHookEx, FindWindowExW, GWL_EXSTYLE, GetMenuItemCount, GetMenuItemID, GetMenuState,
+        GetMenuStringW, GetWindowLongW, GetWindowThreadProcessId, HHOOK, MF_BYPOSITION, MSGF_MENU,
+        SetWindowsHookExW, UnhookWindowsHookEx, WH_MSGFILTER, WS_EX_LAYERED,
     };
     use windows::core::w;
+
+    thread_local! {
+        /// Whether the menu was fading in at its loop's first message.
+        static FADING: Cell<Option<bool>> = const { Cell::new(None) };
+    }
+
+    /// The turn to show a real menu, held until the file is dropped.
+    /// Windows fades one menu at a time in the whole session: a menu that
+    /// another test shows meanwhile, in this process or another, would
+    /// come up without the fade a test may be looking for.
+    pub fn menu_turn() -> File {
+        take_turn("menu")
+    }
+
+    /// A look at the menu this thread shows next, taken as its own loop
+    /// takes its first message, before handling any: whether it is fading
+    /// in. Windows makes a menu layered while it fades in, where menus
+    /// fade (its default), and plain once it is in. A timer's look comes
+    /// only after the messages queued before it are handled, by when the
+    /// fade may be over. Holds the menu's turn.
+    pub struct FirstLook {
+        hook: HHOOK,
+        _turn: File,
+    }
+
+    impl FirstLook {
+        pub fn new() -> Self {
+            let turn = menu_turn();
+            FADING.set(None);
+            // SAFETY: a hook of this thread's alone, on a function of
+            // this module; unhooked on drop.
+            let hook = unsafe {
+                let thread = GetCurrentThreadId();
+                SetWindowsHookExW(WH_MSGFILTER, Some(first_message), None, thread)
+            };
+            let hook = hook.expect("a message filter");
+            Self { hook, _turn: turn }
+        }
+
+        /// Whether the menu was fading in, if one came up.
+        pub fn fading(&self) -> Option<bool> {
+            FADING.get()
+        }
+    }
+
+    impl Drop for FirstLook {
+        fn drop(&mut self) {
+            let _ = unsafe { UnhookWindowsHookEx(self.hook) };
+        }
+    }
+
+    /// Called by a menu's loop with each message it takes.
+    extern "system" fn first_message(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+        let menu = (code == MSGF_MENU as i32 && FADING.get().is_none())
+            .then(menu_up)
+            .flatten();
+        if let Some(menu) = menu {
+            let style = unsafe { GetWindowLongW(menu, GWL_EXSTYLE) } as u32;
+            FADING.set(Some(style & WS_EX_LAYERED.0 != 0));
+        }
+        unsafe { CallNextHookEx(None, code, wparam, lparam) }
+    }
 
     /// The popup menu this thread has up, if any.
     pub fn menu_up() -> Option<HWND> {

@@ -2200,7 +2200,7 @@ mod tests {
 
     use super::*;
     use crate::autostart;
-    use crate::popup::tests::menu_up;
+    use crate::popup::tests::{FirstLook, menu_turn, menu_up};
     use crate::render::Frame;
     use crate::scratch::Scratch;
     use crate::test_desktop::{
@@ -5287,6 +5287,7 @@ mod tests {
     #[test]
     fn a_refresh_while_the_real_menu_is_open_leaves_the_menu_up_above_the_launcher() {
         on_hidden_desktop(|| {
+            let _turn = menu_turn();
             let (provider, gate) = gated(&["Everything"], &["Everything", "Evernote"]);
             let (mut services, _) = services(provider, None);
             services.row_menu = Rc::new(row_menu::Popup);
@@ -5344,17 +5345,19 @@ mod tests {
     }
 
     #[test]
-    fn the_real_menu_opens_under_the_row_keeps_the_launcher_up_and_does_what_is_picked() {
+    fn the_real_menu_opens_whole_under_the_row_keeps_the_launcher_up_and_does_what_is_picked() {
         on_hidden_desktop(|| {
             let (mut services, ran) = uninstallers(&["Everything"], &[]);
             services.row_menu = Rc::new(row_menu::Popup);
             let launcher = Launcher::serving(services);
             launcher.search_for("every", 1);
+            let look = FirstLook::new();
             unsafe { SetTimer(Some(launcher.0), 1, 10, Some(pick_second)) };
             launcher.menu_key();
             let (shown, rect) = IN_MENU
                 .with(|seen| seen.borrow_mut().take())
                 .expect("a menu");
+            assert_eq!(look.fading(), Some(false), "up at once, as the tray's");
             assert!(shown, "losing no focus to its menu, the launcher stays");
             let (x, y) = layout::menu_spot(0);
             let under = launcher.on_screen(x, y);

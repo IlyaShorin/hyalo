@@ -258,13 +258,16 @@ mod tests {
         });
         assert!(!commands.collect::<Vec<_>>().contains(&Command::Install));
     }
+    use crate::popup::tests::{FirstLook, menu_up};
     use crate::test_desktop::on_hidden_desktop;
+    use std::cell::Cell;
     use windows::Win32::Graphics::Gdi::{
         BI_RGB, BITMAPINFO, BITMAPINFOHEADER, DIB_RGB_COLORS, DeleteObject, GetDC, GetDIBits,
         ReleaseDC,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
-        CreateWindowExW, DestroyWindow, GetIconInfo, ICONINFO, WINDOW_EX_STYLE, WINDOW_STYLE,
+        CreateWindowExW, DestroyWindow, EndMenu, GetIconInfo, ICONINFO, KillTimer, SetTimer,
+        WINDOW_EX_STYLE, WINDOW_STYLE,
     };
 
     fn alt_space() -> Option<Hotkey> {
@@ -416,6 +419,39 @@ mod tests {
             )
         }
         .expect("a window")
+    }
+
+    thread_local! {
+        static TICKS: Cell<u32> = const { Cell::new(0) };
+    }
+
+    /// Ticks inside the real menu's own loop: closes the menu once it is
+    /// up, picking nothing; gives up after a second.
+    extern "system" fn close_the_menu(window: HWND, _: u32, id: usize, _: u32) {
+        TICKS.set(TICKS.get() + 1);
+        if menu_up().is_some() || TICKS.get() > 100 {
+            let _ = unsafe { KillTimer(Some(window), id) };
+            let _ = unsafe { EndMenu() };
+        }
+    }
+
+    /// Reported on 0.2.7: the tray's menu came up as a blank light-grey
+    /// rectangle, each entry showing only once the pointer went over it.
+    /// Windows fades menus in unless told not to, and on Windows 11 26H2
+    /// (build 26300) a menu faded in never shows what it drew, in any
+    /// app's menu (PowerShell's too); one shown at once shows it all.
+    #[test]
+    fn the_tray_menu_comes_up_whole_rather_than_fading_in() {
+        on_hidden_desktop(|| {
+            let window = window();
+            let look = FirstLook::new();
+            unsafe { SetTimer(Some(window), 1, 10, Some(close_the_menu)) };
+            let lines = menu(alt_space(), Some(false), None, Language::English);
+            let picked = Shell.menu(window, &lines, POINT { x: 400, y: 400 });
+            unsafe { DestroyWindow(window) }.expect("destroy");
+            assert_eq!(picked, None, "closed with nothing picked");
+            assert_eq!(look.fading(), Some(false), "up at once, not fading in");
+        });
     }
 
     #[test]
