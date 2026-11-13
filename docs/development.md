@@ -47,7 +47,7 @@ The launcher never runs elevated. Only the indexer service does, because MFT acc
 - Uninstall an app from its row: Shift+Delete, then Enter
 - A menu on every row (right click, the Menu key or Shift+F10): what the row can do, each with the keys that do it
 
-**After 0.2.7** (done, not released yet)
+**In 0.2.8**
 - Clipboard history under the empty search bar: text, pictures and files, kept in memory only; Enter copies an entry again
 
 **Later**
