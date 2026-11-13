@@ -84,6 +84,52 @@ pub fn score(points: f64, kind: Kind, place: f64, picks: f64) -> f64 {
     points + kind_weight(kind) + place + boost(picks)
 }
 
+/// How much less a match in an item's other words is worth than the
+/// same match in its title: one kind of match.
+const BY_OTHER: f64 = 16.0;
+
+/// The `items` `filter` finds, best first, each with the letters of its
+/// title it matched: by its title, or, a little weaker and with nothing
+/// to highlight, by the best of the `other` words it gives for an item.
+/// For lists ranked only among themselves, such as the open windows:
+/// equal ones keep their order; an empty filter keeps every item.
+pub fn listed<'a>(
+    filter: &str,
+    items: &'a [Item],
+    other: impl Fn(&'a Item) -> Vec<&'a str>,
+) -> Vec<(Item, Vec<usize>)> {
+    if filter.is_empty() {
+        return items
+            .iter()
+            .map(|item| (item.clone(), Vec::new()))
+            .collect();
+    }
+    let pattern = matcher::Pattern::new(filter);
+    let by_other = |item: &'a Item| {
+        let points = other(item)
+            .into_iter()
+            .filter_map(|words| pattern.find(words));
+        let best = points.map(|found| found.points()).max_by(f64::total_cmp)?;
+        Some((best - BY_OTHER, Vec::new()))
+    };
+    let found = |item: &'a Item| match pattern.find(&item.title) {
+        Some(found) => Some((found.points(), found.positions)),
+        None => by_other(item),
+    };
+    let mut ranked: Vec<(f64, Item, Vec<usize>)> = items
+        .iter()
+        .filter_map(|item| {
+            let (points, positions) = found(item)?;
+            Some((points, item.clone(), positions))
+        })
+        .collect();
+    ranked.sort_by(|one, other| other.0.total_cmp(&one.0));
+    ranked
+        .into_iter()
+        .map(|(_, item, positions)| (item, positions))
+        .collect()
+}
+
 fn kind_weight(kind: Kind) -> f64 {
     match kind {
         Kind::File => 0.0,

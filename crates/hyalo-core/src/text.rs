@@ -56,6 +56,28 @@ impl Language {
     pub fn fill(self, text: Text, words: &[&str]) -> String {
         fill(self.say(text), words)
     }
+
+    /// `n` of something, in the form the number wants of `forms`, the
+    /// sentences for one, a few and many: English has one for 1 alone;
+    /// Russian for 1, 21, 31..., a few for 2 to 4, 22 to 24..., and many
+    /// for the rest, the teens among them.
+    pub fn count(self, n: u64, forms: [Text; 3]) -> String {
+        let form = match self {
+            Language::English => usize::from(n != 1) * 2,
+            Language::Russian => russian_form(n),
+        };
+        self.fill(forms[form], &[&n.to_string()])
+    }
+}
+
+/// Which of the three forms Russian wants after `n`.
+fn russian_form(n: u64) -> usize {
+    let teen = (11..=14).contains(&(n % 100));
+    match n % 10 {
+        1 if !teen => 0,
+        2..=4 if !teen => 1,
+        _ => 2,
+    }
 }
 
 /// Each language's code in the config and what it calls itself, in
@@ -155,6 +177,20 @@ table! {
     SearchWeb => "Search {0} for “{1}”", "Искать в {0}: «{1}»";
     WebSearch => "Web search · Enter to open in the browser",
         "Поиск в интернете · Enter — открыть в браузере";
+    /// An image copied, by its size in pixels.
+    ClipImage => "Image {0} × {1}", "Изображение {0} × {1}";
+    /// Files copied: the first one's name, and how many more.
+    ClipFiles => "{0} and {1} more", "{0} и ещё {1}";
+    /// How long ago something was copied.
+    JustNow => "just now", "только что";
+    MinutesAgo => "{0} min ago", "{0} мин назад";
+    HoursAgo => "{0} h ago", "{0} ч назад";
+    DaysAgo => "{0} d ago", "{0} дн. назад";
+    /// How many lines a text copied has, in the forms a number wants:
+    /// one, a few, many (`Language::count`).
+    LinesOne => "{0} line", "{0} строка";
+    LinesFew => "{0} lines", "{0} строки";
+    LinesMany => "{0} lines", "{0} строк";
 
     // A row's menu: what Enter does with the row, then what other keys do.
     Open => "Open", "Открыть";
@@ -166,6 +202,7 @@ table! {
     CopyPath => "Copy path", "Копировать путь";
     /// It asks first, as Shift+Delete does.
     Uninstall => "Uninstall…", "Удалить…";
+    RemoveFromHistory => "Remove from history", "Убрать из истории";
 
     // The tray.
     Show => "Show hyalo", "Показать hyalo";
@@ -218,6 +255,9 @@ table! {
     StartsInTray => "Starts hyalo in the tray when you sign in",
         "hyalo запускается в области уведомлений при входе в систему";
     LanguageName => "Language", "Язык";
+    ClipboardHistory => "Clipboard history", "История буфера обмена";
+    ClipboardHelp => "Lists what you copy under the empty search bar; kept in memory alone, never on disk",
+        "Скопированное — под пустой строкой поиска; только в памяти, не на диске";
     LanguageHelp => "For this window, the tray menu and the launcher's rows",
         "Для этого окна, меню в области уведомлений и строк поиска";
     Folders => "Folders", "Папки";
@@ -381,6 +421,35 @@ mod tests {
                 Language::English,
                 "{other:#06x}"
             );
+        }
+    }
+
+    #[test]
+    fn a_count_takes_the_form_its_number_wants_in_each_language() {
+        let forms = [Text::LinesOne, Text::LinesFew, Text::LinesMany];
+        let said = |language: Language, n| language.count(n, forms);
+        let russian = [
+            (1, "1 строка"),
+            (2, "2 строки"),
+            (4, "4 строки"),
+            (5, "5 строк"),
+            (11, "11 строк"),
+            (12, "12 строк"),
+            (14, "14 строк"),
+            (21, "21 строка"),
+            (22, "22 строки"),
+            (25, "25 строк"),
+            (101, "101 строка"),
+            (111, "111 строк"),
+            (112, "112 строк"),
+            (0, "0 строк"),
+        ];
+        for (n, form) in russian {
+            assert_eq!(said(Language::Russian, n), form);
+        }
+        assert_eq!(said(Language::English, 1), "1 line");
+        for n in [0, 2, 21, 22, 101] {
+            assert_eq!(said(Language::English, n), format!("{n} lines"));
         }
     }
 
