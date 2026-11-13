@@ -484,9 +484,9 @@ impl Panel {
         match target {
             Target::Fix | Target::OpenConfig => Some(Effect::OpenConfig),
             Target::StartWithWindows => self.starts.map(|on| Effect::StartWithWindows(!on)),
-            Target::Install => Some(Effect::Install),
-            Target::IndexerInstall => Some(Effect::Indexer(true)),
-            Target::IndexerRemove => Some(Effect::Indexer(false)),
+            Target::Install | Target::IndexerInstall | Target::IndexerRemove => {
+                Some(installing(target))
+            }
             Target::CheckUpdates => self
                 .written
                 .as_ref()
@@ -834,6 +834,16 @@ impl Panel {
             title: Some("config.toml".to_string()),
             cards: vec![card(false, false, vec![strip])],
         })
+    }
+}
+
+/// What a button that installs does: the newer release, or the indexer
+/// service in or out.
+fn installing(target: Target) -> Effect {
+    match target {
+        Target::IndexerInstall => Effect::Indexer(true),
+        Target::IndexerRemove => Effect::Indexer(false),
+        _ => Effect::Install,
     }
 }
 

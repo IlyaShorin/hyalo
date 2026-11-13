@@ -47,11 +47,19 @@ impl Control for System {
     }
 
     fn change(&self, install: bool) -> io::Result<()> {
-        let exe = std::env::current_exe()?;
-        let arguments = arguments(install, &security::current_user()?);
-        let code = crate::launch::waited(&exe.to_string_lossy(), &arguments, true)?;
-        outcome(code)
+        let asked = command_line(install);
+        let ended = asked.and_then(|(exe, arguments)| {
+            crate::launch::waited(&exe, &arguments, true).map_err(io::Error::from)
+        });
+        ended.and_then(outcome)
     }
+}
+
+/// This exe, and the arguments that install the service for this
+/// process's user, or remove it.
+fn command_line(install: bool) -> io::Result<(String, String)> {
+    let exe = std::env::current_exe()?.to_string_lossy().into_owned();
+    Ok((exe, arguments(install, &security::current_user()?)))
 }
 
 #[cfg(test)]
@@ -63,6 +71,19 @@ mod tests {
         let user = "S-1-5-21-1-2-3-1001";
         assert_eq!(arguments(true, user), format!("--indexer-install {user}"));
         assert_eq!(arguments(false, user), "--indexer-remove");
+    }
+
+    #[test]
+    fn this_exe_is_started_for_this_user() {
+        let (exe, install) = command_line(true).expect("a command line");
+        let here = std::env::current_exe().expect("this exe");
+        assert_eq!(exe, here.to_string_lossy());
+        let user = security::current_user().expect("a user");
+        assert_eq!(install, arguments(true, &user));
+        assert_eq!(
+            command_line(false).expect("a command line").1,
+            "--indexer-remove"
+        );
     }
 
     #[test]

@@ -64,9 +64,7 @@ use windows::Win32::UI::HiDpi::{
 /// that and nothing else: no launcher, no window.
 fn main() -> windows::core::Result<()> {
     let arguments: Vec<String> = std::env::args().collect();
-    if let Some(command) = hyalo_indexer::command(&arguments) {
-        std::process::exit(hyalo_indexer::run(command));
-    }
+    hyalo_indexer::run_if_asked(&arguments);
     let start = instance::Start::from_args(arguments.clone());
     if install::elsewhere(&arguments, start) {
         return Ok(());

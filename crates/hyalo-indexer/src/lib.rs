@@ -71,6 +71,14 @@ pub fn target_in(program_files: &Path) -> PathBuf {
     program_files.join(r"hyalo\hyalo-indexer.exe")
 }
 
+/// Does what the command line `arguments` asks of the service, if it
+/// asks anything, and ends the process; else nothing.
+pub fn run_if_asked(arguments: &[String]) {
+    if let Some(asked) = command(arguments) {
+        std::process::exit(run(asked));
+    }
+}
+
 /// Does what `command` asks; the process's exit code: 0 when it went
 /// well.
 pub fn run(command: Command) -> i32 {

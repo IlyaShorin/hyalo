@@ -537,6 +537,15 @@ impl App {
         }
     }
 
+    /// Installs what a button asked to: the newer release, or the indexer
+    /// service in or out.
+    fn installing(&mut self, effect: &Effect) {
+        match effect {
+            Effect::Indexer(install) => self.change_indexer(*install),
+            _ => self.install(),
+        }
+    }
+
     /// Installs the indexer service, or removes it, on a thread of its
     /// own: the UAC prompt waits for the user. One at a time.
     pub(super) fn change_indexer(&mut self, install: bool) {
@@ -729,11 +738,8 @@ fn carry_out(hwnd: HWND, effect: Effect) {
         Effect::OpenConfig => {
             with_app(App::open_config);
         }
-        Effect::Install => {
-            with_app(App::install);
-        }
-        Effect::Indexer(install) => {
-            with_app(|app| app.change_indexer(install));
+        Effect::Install | Effect::Indexer(_) => {
+            with_app(|app| app.installing(&effect));
         }
         Effect::Copy(text) => {
             with_app(|app| app.run_action(&Action::CopyText(text)));

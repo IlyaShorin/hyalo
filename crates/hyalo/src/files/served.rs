@@ -193,42 +193,51 @@ impl Service {
     /// A connection to the service, asking `request`: started first if it
     /// is installed but stopped, its pipe waited for while it starts.
     fn ask(&self, request: &Request) -> io::Result<Connection> {
-        let process = running()?;
-        let until = Instant::now() + STARTING;
-        loop {
-            match Connection::ask(hyalo_indexer::PIPE, Some(process), request) {
-                Err(error) if error.kind() == io::ErrorKind::NotFound && Instant::now() < until => {
-                    thread::sleep(Duration::from_millis(50));
-                }
-                asked => return asked,
+        let process = running(&Manager)?;
+        patiently(STARTING, || {
+            Connection::ask(hyalo_indexer::PIPE, Some(process), request)
+        })
+    }
+}
+
+/// The process of the service, started if it is installed and stopped.
+fn running(services: &dyn Services) -> io::Result<u32> {
+    let installed = services.state(scm::NAME)?.ok_or(io::ErrorKind::NotFound)?;
+    if !installed.running {
+        services.start(scm::NAME)?;
+    }
+    let state = services.state(scm::NAME)?;
+    state
+        .map(|state| state.process)
+        .ok_or(io::ErrorKind::NotFound.into())
+}
+
+/// Does `attempt` again and again for up to `longest` while what it opens
+/// is not there yet, as a service that is starting has no pipe yet.
+fn patiently<T>(longest: Duration, attempt: impl Fn() -> io::Result<T>) -> io::Result<T> {
+    let until = Instant::now() + longest;
+    loop {
+        match attempt() {
+            Err(error) if error.kind() == io::ErrorKind::NotFound && Instant::now() < until => {
+                thread::sleep(Duration::from_millis(50));
             }
+            done => return done,
         }
     }
 }
 
-/// The process of the service, started if it is not running.
-fn running() -> io::Result<u32> {
-    let state = Manager.state(scm::NAME)?.ok_or(io::ErrorKind::NotFound)?;
-    if state.running {
-        return Ok(state.process);
-    }
-    Manager.start(scm::NAME)?;
-    let state = Manager.state(scm::NAME)?.ok_or(io::ErrorKind::NotFound)?;
-    Ok(state.process)
-}
-
 impl Indexer for Service {
     fn follow(&self, root: &Path, from: Option<Position>) -> io::Result<Box<dyn Stream>> {
-        let drive = drive_of(root).ok_or(io::ErrorKind::Unsupported)?;
-        let asked = self.ask(&Request::Follow { drive, from })?;
-        Ok(Box::new(asked))
+        let drive = drive_of(root).ok_or(io::Error::from(io::ErrorKind::Unsupported));
+        let asked = drive.and_then(|drive| self.ask(&Request::Follow { drive, from }));
+        asked.map(|connection| Box::new(connection) as Box<dyn Stream>)
     }
 
     fn subtree(&self, root: &Path, records: &[u32]) -> io::Result<Vec<Change>> {
-        let drive = drive_of(root).ok_or(io::ErrorKind::Unsupported)?;
+        let drive = drive_of(root).ok_or(io::Error::from(io::ErrorKind::Unsupported));
         let records = records.to_vec();
-        let mut asked = self.ask(&Request::Subtree { drive, records })?;
-        gathered(&mut asked)
+        let asked = drive.and_then(|drive| self.ask(&Request::Subtree { drive, records }));
+        asked.and_then(|mut connection| gathered(&mut connection))
     }
 }
 
@@ -272,6 +281,117 @@ mod tests {
         journal: 2,
         next: 3,
     };
+
+    /// The service manager, as a test speaks for it: a service in the state
+    /// given, started when asked, its starts counted.
+    struct Managed {
+        state: std::cell::Cell<Option<scm::State>>,
+        starts: std::cell::Cell<usize>,
+    }
+
+    impl Services for Managed {
+        fn state(&self, _: &str) -> io::Result<Option<scm::State>> {
+            Ok(self.state.get())
+        }
+
+        fn start(&self, _: &str) -> io::Result<()> {
+            self.starts.set(self.starts.get() + 1);
+            self.state.set(Some(scm::State {
+                running: true,
+                process: 77,
+            }));
+            Ok(())
+        }
+
+        fn create(&self, _: &str, _: &str) -> io::Result<()> {
+            unreachable!("never installs")
+        }
+
+        fn configure(&self, _: &str, _: &str) -> io::Result<()> {
+            unreachable!("never installs")
+        }
+
+        fn describe(&self, _: &str) -> io::Result<()> {
+            unreachable!("never installs")
+        }
+
+        fn secure(&self, _: &str, _: &str) -> io::Result<()> {
+            unreachable!("never installs")
+        }
+
+        fn users(&self, _: &str) -> io::Result<Vec<String>> {
+            unreachable!("never installs")
+        }
+
+        fn set_users(&self, _: &str, _: &[String]) -> io::Result<()> {
+            unreachable!("never installs")
+        }
+
+        fn stop(&self, _: &str) -> io::Result<()> {
+            unreachable!("never stops it")
+        }
+
+        fn delete(&self, _: &str) -> io::Result<()> {
+            unreachable!("never removes it")
+        }
+    }
+
+    fn managed(state: Option<(bool, u32)>) -> Managed {
+        let state = state.map(|(running, process)| scm::State { running, process });
+        Managed {
+            state: std::cell::Cell::new(state),
+            starts: std::cell::Cell::new(0),
+        }
+    }
+
+    #[test]
+    fn a_service_running_is_talked_to_and_one_stopped_is_started_first() {
+        let running = managed(Some((true, 42)));
+        assert_eq!(super::running(&running).expect("its process"), 42);
+        assert_eq!(running.starts.get(), 0);
+        let stopped = managed(Some((false, 0)));
+        assert_eq!(super::running(&stopped).expect("started"), 77);
+        assert_eq!(stopped.starts.get(), 1);
+        let missing = managed(None);
+        let refused = super::running(&missing).expect_err("not installed");
+        assert_eq!(refused.kind(), io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn a_pipe_not_there_yet_is_tried_again_for_a_while_and_no_longer() {
+        let tries = std::cell::Cell::new(0);
+        let third = || {
+            tries.set(tries.get() + 1);
+            match tries.get() {
+                3 => Ok(3),
+                _ => Err(io::Error::from(io::ErrorKind::NotFound)),
+            }
+        };
+        assert_eq!(patiently(Duration::from_secs(5), third).expect("there"), 3);
+        let never = || Err::<(), _>(io::Error::from(io::ErrorKind::NotFound));
+        let started = Instant::now();
+        assert!(patiently(Duration::from_millis(200), never).is_err());
+        assert!(started.elapsed() < Duration::from_secs(2));
+        let denied = || Err::<(), _>(io::Error::from(io::ErrorKind::PermissionDenied));
+        assert!(
+            patiently(Duration::from_secs(5), denied).is_err(),
+            "at once"
+        );
+    }
+
+    #[test]
+    fn a_folder_that_is_no_drive_is_no_volume_the_service_reads() {
+        let follow = Service.follow(Path::new(r"C:\Temp"), None);
+        assert_eq!(
+            follow.err().map(|error| error.kind()),
+            Some(io::ErrorKind::Unsupported)
+        );
+        let subtree = Service.subtree(Path::new(r"C:\Temp"), &[40]);
+        assert_eq!(
+            subtree.map_err(|error| error.kind()),
+            Err(io::ErrorKind::Unsupported)
+        );
+    }
 
     #[test]
     fn a_drive_s_root_is_its_letter_and_any_other_folder_none() {

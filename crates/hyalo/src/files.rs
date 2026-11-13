@@ -376,18 +376,10 @@ impl Walk<'_> {
         while Arc::strong_count(shared) > 1 {
             // Out of the match, which would hold the lock through it.
             let patience = kept.patience(read(shared).version());
-            match heard.recv_timeout(patience) {
-                Ok((_, Heard::Watch(Event::Changed(records)))) => self.take(shared, &records),
-                Ok((root, Heard::Watch(Event::Lost))) => {
-                    self.rewalk(shared, &roots[root]);
-                    kept.saved = Mark::new(read(shared).version());
-                }
-                Ok((at, Heard::Service(answer))) => {
-                    if self.hear(shared, (at, &roots[at]), answer, sources) {
-                        kept.saved = Mark::new(read(shared).version());
-                    }
-                }
-                Err(_) => {}
+            if let Ok((at, heard)) = heard.recv_timeout(patience)
+                && self.heard(shared, (at, &roots[at]), heard, sources)
+            {
+                kept.saved = Mark::new(read(shared).version());
             }
             self.keep_out(shared, roots, &mut kept.excluded, report, sources);
             if self.recheck.taken() {
@@ -406,6 +398,29 @@ impl Walk<'_> {
             .due(read(shared).version(), Instant::now(), Duration::ZERO)
         {
             save_to(shared, self.snapshot);
+        }
+    }
+
+    /// Takes in what was heard of the root `root`, the `at`th: changes a
+    /// watch saw, a watch that lost track (the root is walked again), or
+    /// what the service said. Whether the snapshot was saved.
+    fn heard(
+        &self,
+        shared: &RwLock<Index>,
+        (at, root): (usize, &Path),
+        heard: Heard,
+        sources: &mut Sources,
+    ) -> bool {
+        match heard {
+            Heard::Watch(Event::Changed(records)) => {
+                self.take(shared, &records);
+                false
+            }
+            Heard::Watch(Event::Lost) => {
+                self.rewalk(shared, root);
+                true
+            }
+            Heard::Service(answer) => self.hear(shared, (at, root), answer, sources),
         }
     }
 
