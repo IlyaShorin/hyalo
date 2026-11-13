@@ -1,7 +1,11 @@
 //! How long a search takes on a made-up drive of a million names (or as
-//! many as `HYALO_BENCH_NAMES` says): `cargo bench -p hyalo-index`.
+//! many as `HYALO_BENCH_NAMES` says): `cargo bench -p hyalo-index`. With
+//! `HYALO_BENCH_SNAPSHOT` naming a snapshot, such as a copy of the
+//! launcher's `files.idx`, it searches that instead: a real machine's
+//! names, as they are, to compare with another search tool on the same
+//! files.
 
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use hyalo_core::filter::{Clock, Query};
 use hyalo_core::places::Places;
@@ -41,6 +45,20 @@ const RUNS: usize = 21;
 const LIMIT: usize = 16;
 
 fn main() {
+    let (index, now) = match std::env::var_os("HYALO_BENCH_SNAPSHOT") {
+        Some(path) => (snapshot(&path), seconds_now()),
+        None => (made_up(), synthetic::NOW),
+    };
+    let memory = index.memory() as f64 / 1_048_576.0;
+    println!("searching {} entries in {memory:.0} MiB", index.len());
+    let places = Places::new(&[r"C:\Desktop", r"C:\Documents"]);
+    for query in QUERIES {
+        report(&index, &places, query, now);
+    }
+}
+
+/// A made-up drive of `HYALO_BENCH_NAMES` names, saved and loaded back.
+fn made_up() -> Index {
     let count = std::env::var("HYALO_BENCH_NAMES")
         .map_or(1_000_000, |names| names.parse().unwrap_or(1_000_000));
     let started = Instant::now();
@@ -51,13 +69,25 @@ fn main() {
         "{} entries, built in {built:.2?}, {memory:.0} MiB",
         index.len()
     );
-    let index = reloaded(&index);
-    let memory = index.memory() as f64 / 1_048_576.0;
-    println!("loaded back: {memory:.0} MiB");
-    let places = Places::new(&[r"C:\Desktop", r"C:\Documents"]);
-    for query in QUERIES {
-        report(&index, &places, query);
-    }
+    reloaded(&index)
+}
+
+/// The snapshot at `path`, loaded as the launcher loads it at start.
+fn snapshot(path: &std::ffi::OsStr) -> Index {
+    let bytes = std::fs::read(path).expect("the snapshot");
+    let started = Instant::now();
+    let index = Index::load(&mut bytes.as_slice()).expect("a snapshot");
+    let size = bytes.len() as f64 / 1_048_576.0;
+    println!(
+        "snapshot {size:.0} MiB, loaded in {:.2?}",
+        started.elapsed()
+    );
+    index
+}
+
+fn seconds_now() -> i64 {
+    let since = SystemTime::now().duration_since(UNIX_EPOCH);
+    since.map_or(0, |since| since.as_secs() as i64)
 }
 
 /// The index saved to memory and loaded back, as a restart loads it.
@@ -76,9 +106,9 @@ fn reloaded(index: &Index) -> Index {
     back
 }
 
-fn report(index: &Index, places: &Places, text: &str) {
+fn report(index: &Index, places: &Places, text: &str, now: i64) {
     let clock = Clock {
-        now: synthetic::NOW,
+        now,
         offset: 3 * 60 * 60,
     };
     let query = Query::parse(text, clock);
