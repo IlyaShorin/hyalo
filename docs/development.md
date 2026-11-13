@@ -50,6 +50,9 @@ The launcher never runs elevated. Only the indexer service does, because MFT acc
 **In 0.2.8**
 - Clipboard history under the empty search bar: text, pictures and files, kept in memory only; Enter copies an entry again
 
+**In 0.3.0**
+- The indexer service, installed once from the settings window: reads the NTFS drives' master file tables and follows their USN journals, so the index is built in seconds rather than walked
+
 **Later**
 - Preview pane
 - On-demand content search (ripgrep in a chosen folder)
