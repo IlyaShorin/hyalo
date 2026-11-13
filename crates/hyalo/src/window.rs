@@ -5179,11 +5179,13 @@ mod tests {
                 assert_eq!(titles_listed(), ["second", "first"]);
                 launcher.press(VK_DOWN);
                 launcher.press(VK_RETURN);
-                launcher.pump_until(|_| crate::clipboard::text().as_deref() == Some("first"));
+                // Read back once it is there: reading in a loop would hold
+                // the clipboard from the threads that put and read it.
                 launcher.pump_until(|app| {
                     let first = app.history.entries().first();
-                    first.is_some_and(|entry| matches!(&*entry.content, Content::Text { text, .. } if text == "first"))
+                    first.is_some_and(|entry| *entry.content == text("first"))
                 });
+                assert_eq!(crate::clipboard::text().as_deref(), Some("first"));
                 assert_eq!(
                     with_app(|app| app.history.entries().len()),
                     Some(2),
