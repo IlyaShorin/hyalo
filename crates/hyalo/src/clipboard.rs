@@ -148,25 +148,28 @@ fn global(bytes: &[u8]) -> Result<HGLOBAL> {
 /// The clipboard, open on this thread until dropped.
 struct Clipboard;
 
-/// How often, and how far apart, opening the clipboard is tried: another
-/// app that watches it may be reading it at the very moment.
-const TRIES: u32 = 10;
+/// How often opening the clipboard is tried again, and how far apart:
+/// another app that watches it may be reading it at the very moment.
+const AGAIN: usize = 9;
 const BETWEEN: Duration = Duration::from_millis(10);
 
 impl Clipboard {
     /// Opens it with no owner window: what is put on it is all there at
-    /// once, so no one needs to be asked to render it later.
+    /// once, so no one needs to be asked to render it later. Held by
+    /// another, it is tried again a few times before giving up.
     fn open() -> Result<Self> {
-        let mut tried = 1;
-        // SAFETY: a plain call; Drop closes what it opened.
-        while let Err(error) = unsafe { OpenClipboard(None) } {
-            if tried == TRIES {
-                return Err(error);
+        for wait in std::iter::repeat_n(BETWEEN, AGAIN) {
+            if Self::try_open().is_ok() {
+                return Ok(Self);
             }
-            tried += 1;
-            std::thread::sleep(BETWEEN);
+            std::thread::sleep(wait);
         }
-        Ok(Self)
+        Self::try_open().map(|()| Self)
+    }
+
+    fn try_open() -> Result<()> {
+        // SAFETY: a plain call; Drop closes what it opened.
+        unsafe { OpenClipboard(None) }
     }
 }
 
@@ -487,6 +490,51 @@ mod tests {
             put_formats(vec![(registered("hyalo test"), vec![1, 2, 3])])
                 .expect("put a format of its own");
             assert_eq!(read(32), None, "nothing hyalo could put back");
+            let unreadable = vec![
+                (UNICODE_TEXT, utf16("hunter2")),
+                (registered(HISTORY), vec![1, 0]),
+            ];
+            put_formats(unreadable).expect("put a mark too short to read");
+            assert_eq!(read(32), None, "a mark that does not read keeps it out");
+        });
+    }
+
+    #[test]
+    fn text_goes_on_the_clipboard_ending_in_a_nul() {
+        assert_eq!(utf16("ab"), [b'a', 0, b'b', 0, 0, 0]);
+        assert_eq!(utf16(""), [0, 0]);
+    }
+
+    #[test]
+    fn a_long_text_is_read_whole_up_to_what_an_entry_holds_and_a_format_up_to_its_limit() {
+        let name = "clipboard::tests::a_long_text_is_read_whole_up_to_what_an_entry_holds_and_a_format_up_to_its_limit";
+        in_own_window_station(name, || {
+            let _com = Com::init().expect("COM");
+            let long = "a".repeat(MOST_BYTES * 3 / 4);
+            copy(&long).expect("copy");
+            let read_back = read(32).map(|(content, _)| content);
+            let whole = Content::Text {
+                text: long,
+                html: None,
+                rtf: None,
+            };
+            assert!(read_back == Some(whole), "3 MB of text, 6 MB as UTF-16");
+            let empty = Content::Text {
+                text: "a".to_string(),
+                html: Some(Vec::new()),
+                rtf: None,
+            };
+            put(&empty).expect("an empty format goes on too");
+            let format = registered("hyalo test");
+            put_formats(vec![(format, vec![7; 13])]).expect("put 13 bytes");
+            let _open = Clipboard::open().expect("open");
+            let size = open_bytes(format, usize::MAX).expect("the bytes").len();
+            assert!(size >= 13, "{size}");
+            assert!(open_bytes(format, size).is_some(), "as many as it may");
+            assert!(
+                open_bytes(format, size - 1).is_none(),
+                "one more than it may"
+            );
         });
     }
 }
