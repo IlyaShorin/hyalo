@@ -1,6 +1,6 @@
 # hyalo: notes for Claude
 
-Spotlight-style launcher for Windows 11, written in Rust. Goals, architecture and roadmap are in `README.md`.
+Spotlight-style launcher for Windows 11, written in Rust. What it does is in `README.md` and, in detail, `docs/guide.md`; goals, architecture, roadmap, releases and the development tools in `docs/development.md`; the comparison with Everything in `docs/benchmarks.md`. README screenshots are in `docs/images`, made from the renderer's own frames over a drawn wallpaper, with made-up rows: never a capture of the user's screen.
 
 ## Working rules
 
