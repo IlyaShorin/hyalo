@@ -95,7 +95,7 @@ Measured on one machine, with more than two million names on two NVMe drives, ag
 | | hyalo | Everything |
 |---|---|---|
 | A search, median | 2–6 ms | 2–11 ms |
-| Loading the saved index at start | 0.36 s walked; 0.49 s from its indexer service | 0.55 s |
+| Loading the saved index at start | 0.36 s walked; 0.41 s from its indexer service | 0.55 s |
 | Memory the index takes | 212 MB | 220 MB |
 | Building the index from nothing | 2.7 s with its indexer service; 104 s walking, with your rights | 10.6 s, with admin rights |
 
