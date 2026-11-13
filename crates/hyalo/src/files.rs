@@ -376,10 +376,9 @@ impl Walk<'_> {
         while Arc::strong_count(shared) > 1 {
             // Out of the match, which would hold the lock through it.
             let patience = kept.patience(read(shared).version());
-            if let Ok((at, heard)) = heard.recv_timeout(patience)
-                && self.heard(shared, (at, &roots[at]), heard, sources)
-            {
-                kept.saved = Mark::new(read(shared).version());
+            if let Ok((at, heard)) = heard.recv_timeout(patience) {
+                let root = (at, roots[at].as_path());
+                self.heard(shared, root, heard, (sources, &mut kept.saved));
             }
             self.keep_out(shared, roots, &mut kept.excluded, report, sources);
             if self.recheck.taken() {
@@ -402,40 +401,44 @@ impl Walk<'_> {
     }
 
     /// Takes in what was heard of the root `root`, the `at`th: changes a
-    /// watch saw, a watch that lost track (the root is walked again), or
-    /// what the service said. Whether the snapshot was saved.
+    /// watch saw, a watch that lost track (the root is walked again and
+    /// saved, which `saved` notes), or what the service said.
     fn heard(
         &self,
         shared: &RwLock<Index>,
         (at, root): (usize, &Path),
         heard: Heard,
-        sources: &mut Sources,
-    ) -> bool {
+        (sources, saved): (&mut Sources, &mut Mark),
+    ) {
         match heard {
-            Heard::Watch(Event::Changed(records)) => {
-                self.take(shared, &records);
-                false
-            }
+            Heard::Watch(Event::Changed(records)) => self.take(shared, &records),
             Heard::Watch(Event::Lost) => {
                 self.rewalk(shared, root);
-                true
+                self.save(shared, saved);
             }
-            Heard::Service(answer) => self.hear(shared, (at, root), answer, sources),
+            Heard::Service(answer) => self.hear(shared, (at, root), answer, (sources, saved)),
         }
+    }
+
+    /// Saves the snapshot, and notes in `saved` that it was, so it is not
+    /// saved again for nothing.
+    fn save(&self, shared: &RwLock<Index>, saved: &mut Mark) {
+        save_to(shared, self.snapshot);
+        *saved = Mark::new(read(shared).version());
     }
 
     /// Takes in what the service said of the root `root`, the `at`th: a
     /// listing is put together, then put in place of what the index held
     /// of the root and saved; changes are made at once, the folders that
     /// came in asked for. A root the service no longer reads is watched
-    /// and walked again. Whether the snapshot was saved.
+    /// and walked again, and saved.
     fn hear(
         &self,
         shared: &RwLock<Index>,
         (at, root): (usize, &Path),
         answer: io::Result<Answer>,
-        sources: &mut Sources,
-    ) -> bool {
+        (sources, saved): (&mut Sources, &mut Mark),
+    ) {
         match answer {
             Ok(Answer::Listing(position)) => {
                 sources.listings[at] = Listing::new(&root_name(root), position);
@@ -445,30 +448,28 @@ impl Walk<'_> {
                     listing.take(&changes);
                 }
             }
-            Ok(Answer::Listed) => return self.listed(shared, sources.listings[at].take()),
+            Ok(Answer::Listed) => {
+                if let Some(listing) = sources.listings[at].take() {
+                    self.listed(shared, listing);
+                    self.save(shared, saved);
+                }
+            }
             Ok(Answer::Changed(position, changes)) => {
                 self.changed(shared, root, &changes, position)
             }
             _ => {
                 sources.watch(at, root);
                 self.rewalk(shared, root);
-                return true;
+                self.save(shared, saved);
             }
         }
-        false
     }
 
     /// Puts the listing `listing` in place of what the index held of its
-    /// root, takes out what is excluded and saves the snapshot; whether
-    /// there was one.
-    fn listed(&self, shared: &RwLock<Index>, listing: Option<Listing>) -> bool {
-        let Some(listing) = listing else {
-            return false;
-        };
+    /// root, and takes out what is excluded.
+    fn listed(&self, shared: &RwLock<Index>, listing: Listing) {
         write(shared).replace(&listing.done());
         prune(shared, self.excluded, &|_| {});
-        save_to(shared, self.snapshot);
-        true
     }
 
     /// Makes the service's `changes` to the root `root`, read up to
@@ -485,15 +486,14 @@ impl Walk<'_> {
     }
 
     /// Walks `root` again into an index of its own and puts what it found
-    /// in place of what the index held of it; takes out what is excluded,
-    /// and saves the snapshot. The other roots stay as they are.
+    /// in place of what the index held of it, and takes out what is
+    /// excluded. The other roots stay as they are.
     fn rewalk(&self, shared: &RwLock<Index>, root: &Path) {
         let fresh = RwLock::default();
         walk(root, &fresh, self.excluded);
         let fresh = fresh.into_inner().unwrap_or_else(PoisonError::into_inner);
         write(shared).replace(&fresh);
         prune(shared, self.excluded, &|_| {});
-        save_to(shared, self.snapshot);
     }
 
     /// Makes the changes `records` hold, then walks the folders they
@@ -2030,6 +2030,63 @@ mod tests {
         send.send(Ok(Answer::Listed)).expect("sent");
         serving.finds("kept", &[folder.path("kept.txt")]);
         assert_eq!(search(serving.files(), "inside"), Vec::<String>::new());
+    }
+
+    /// When the snapshot at `path` was last written, once it is there.
+    fn written_at(serving: &Serving, path: &Path) -> std::time::SystemTime {
+        serving.until(|_| path.exists());
+        fs::metadata(path)
+            .and_then(|file| file.modified())
+            .expect("saved")
+    }
+
+    #[test]
+    fn a_listing_is_saved_at_once_and_not_again_when_nothing_changed_since() {
+        let folder = Scratch::new("served-saved-once");
+        let snapshot = Scratch::new("served-saved-once-snapshot");
+        let path = snapshot.0.join("files.idx");
+        let (indexer, send) = Scripted::new();
+        let serving = served(&folder, indexer, Some(path.clone()), &Excluded::default());
+        list(&send, at(100));
+        serving.finds("inside", &[folder.path(r"listed\inside.txt")]);
+        let saved = written_at(&serving, &path);
+        serving.stop();
+        assert_eq!(
+            fs::metadata(&path).and_then(|file| file.modified()).ok(),
+            Some(saved)
+        );
+    }
+
+    #[test]
+    fn a_root_walked_again_once_the_service_refused_it_is_saved_once() {
+        let folder = Scratch::new("served-refused-saved").with(&["walked.txt"]);
+        let snapshot = Scratch::new("served-refused-saved-snapshot");
+        let path = snapshot.0.join("files.idx");
+        let (indexer, send) = Scripted::new();
+        let serving = served(&folder, indexer, Some(path.clone()), &Excluded::default());
+        send.send(Ok(Answer::Refused)).expect("sent");
+        serving.finds("walked", &[folder.path("walked.txt")]);
+        let saved = written_at(&serving, &path);
+        // Long enough for a watch's first read to have nothing to tell.
+        thread::sleep(3 * TELL_EVERY);
+        let saved = fs::metadata(&path)
+            .and_then(|file| file.modified())
+            .unwrap_or(saved);
+        serving.stop();
+        assert_eq!(
+            fs::metadata(&path).and_then(|file| file.modified()).ok(),
+            Some(saved)
+        );
+    }
+
+    #[test]
+    fn asking_to_look_for_the_service_again_is_taken_once() {
+        let recheck = Recheck::default();
+        assert!(!recheck.taken());
+        recheck.ask();
+        recheck.ask();
+        assert!(recheck.taken());
+        assert!(!recheck.taken(), "taken already");
     }
 
     #[test]
