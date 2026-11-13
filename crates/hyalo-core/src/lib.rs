@@ -12,6 +12,7 @@ pub mod hotkey;
 pub mod item;
 pub mod keyboard;
 pub mod matcher;
+pub mod pipe;
 pub mod places;
 pub mod rank;
 pub mod rates;
