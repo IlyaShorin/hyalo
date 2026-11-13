@@ -575,6 +575,18 @@ mod tests {
     }
 
     #[test]
+    fn a_record_no_volume_could_have_is_refused() {
+        let index = listed();
+        let bytes = saved(&index);
+        // The records come before the one position: one per entry.
+        let records = bytes.len() - 28 - index.entries.len() * 4;
+        let first = u32::from_le_bytes(bytes[records..records + 4].try_into().unwrap());
+        assert_eq!(first, crate::volume::NO_FILE, "C: came by no record");
+        assert!(loaded(&with(&bytes, records, (1 << 28) - 1)).is_ok());
+        assert!(damaged(&with(&bytes, records, 1 << 28)));
+    }
+
+    #[test]
     fn a_record_for_every_entry_is_kept() {
         let bytes = saved(&listed());
         let longer = [bytes.as_slice(), &[0; 4]].concat();

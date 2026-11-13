@@ -62,7 +62,7 @@ impl Index {
         let held = self.held(root.0, record);
         let (now, came) = match &change.file {
             None => {
-                self.drop_entries(record, &held, &[]);
+                self.drop_entries(&held, &[]);
                 (Vec::new(), false)
             }
             Some(file) => self.place_file(root.0, record, file, held),
@@ -125,7 +125,7 @@ impl Index {
         file: &File,
         held: Vec<u32>,
     ) -> (Vec<u32>, bool) {
-        let held = self.same_kind(record, file.folder, held);
+        let held = self.same_kind(file.folder, held);
         let wanted = file.names.iter().filter_map(|name| {
             let folder = self.folder_of(root, name.parent)?;
             Some((folder, name.text.as_str()))
@@ -139,7 +139,7 @@ impl Index {
             came |= file.folder && fresh && entry.is_some();
             now.extend(entry);
         }
-        self.drop_entries(record, &held, &now);
+        self.drop_entries(&held, &now);
         for &at in &now {
             // Each is in the index: placed just now.
             let _ = self.set_stat(EntryId(at), file.size, file.written);
@@ -149,12 +149,12 @@ impl Index {
 
     /// The entries `held` of the record `record`, unless it changed from a
     /// file to a folder or the other way: then none of them stays.
-    fn same_kind(&mut self, record: u32, folder: bool, held: Vec<u32>) -> Vec<u32> {
+    fn same_kind(&mut self, folder: bool, held: Vec<u32>) -> Vec<u32> {
         let other = |at: &u32| self.entries[*at as usize].is_folder() != folder;
         if !held.iter().any(other) {
             return held;
         }
-        self.drop_entries(record, &held, &[]);
+        self.drop_entries(&held, &[]);
         Vec::new()
     }
 
@@ -192,7 +192,7 @@ impl Index {
             if self.rename(EntryId(at), EntryId(folder), name).is_ok() {
                 return (Some(at), false);
             }
-            self.drop_entries(record, &[at], &[]);
+            self.drop_entries(&[at], &[]);
         }
         (self.fresh(record, folder, name, is_folder), true)
     }
@@ -215,14 +215,13 @@ impl Index {
         Some(entry.0)
     }
 
-    /// Removes the entries among `entries` still the record `record`'s,
-    /// but for those it `keeps`: another may have taken a place since.
-    fn drop_entries(&mut self, record: u32, entries: &[u32], keeps: &[u32]) {
-        for &at in entries {
-            if !keeps.contains(&at) && self.files[at as usize] == record {
-                // Still its own, so still in the index.
-                let _ = self.remove(EntryId(at));
-            }
+    /// Removes the entries among `entries`, but for those it `keeps`: a
+    /// name given to another file may have taken one's place with what it
+    /// held, and the place gone to a new entry of the same file since.
+    fn drop_entries(&mut self, entries: &[u32], keeps: &[u32]) {
+        for &at in entries.iter().filter(|at| !keeps.contains(at)) {
+            // Gone already, if it went with a folder: then refused.
+            let _ = self.remove(EntryId(at));
         }
     }
 
@@ -265,9 +264,9 @@ impl Index {
             volume.records.resize(at + 1, NONE);
         }
         volume.records[at] = now.first().copied().unwrap_or(NONE);
-        match now.get(1..).filter(|links| !links.is_empty()) {
-            Some(links) => volume.links.insert(record, links.to_vec()),
-            None => volume.links.remove(&record),
+        match now {
+            [_, links @ ..] if !links.is_empty() => volume.links.insert(record, links.to_vec()),
+            _ => volume.links.remove(&record),
         };
     }
 
@@ -576,6 +575,84 @@ mod tests {
         assert_eq!(index.find(r"C:\Users\walked.txt"), Some(walked));
         index.settle(c, &file(50, 41, "notes.txt")).unwrap();
         assert!(!found(&index, r"C:\Users\Me\notes.txt"), "its folder went");
+    }
+
+    #[test]
+    fn a_file_given_a_folder_s_name_takes_its_place_with_what_it_held() {
+        let (mut index, c) = volume();
+        // notes.txt's other link was in Me, which a file now names.
+        let both = change(70, false, &[(41, "x.txt"), (60, "y.txt")], 1, 1);
+        index.settle(c, &both).unwrap();
+        let now = change(70, false, &[(40, "Me"), (60, "y.txt")], 2, 2);
+        assert_eq!(index.settle(c, &now), Ok(false));
+        let me = index.find(r"C:\Users\Me").expect("the file now");
+        assert_eq!(index.is_folder(me), Some(false));
+        assert_eq!(index.stat(me), Some((2, 2)));
+        assert!(found(&index, r"C:\Windows\y.txt"));
+        assert!(
+            !found(&index, r"C:\Users\Me\notes.txt"),
+            "went with the folder"
+        );
+        index.settle(c, &gone(70)).unwrap();
+        assert!(!found(&index, r"C:\Users\Me") && !found(&index, r"C:\Windows\y.txt"));
+    }
+
+    #[test]
+    fn a_change_for_a_record_no_volume_could_have_is_passed_over() {
+        let (mut index, c) = volume();
+        let far = 1 << 28;
+        assert_eq!(index.settle(c, &folder(far, ROOT, "far")), Ok(false));
+        assert_eq!(index.list(c, &file(far, ROOT, "far")), Ok(()));
+        assert!(!found(&index, r"C:\far"));
+        assert_eq!(index.settle(c, &folder(far - 1, ROOT, "near")), Ok(true));
+    }
+
+    #[test]
+    fn a_gone_file_brings_nothing_in() {
+        let (mut index, c) = volume();
+        assert_eq!(index.settle(c, &gone(41)), Ok(false));
+    }
+
+    #[test]
+    fn a_volume_s_map_takes_memory_for_its_records() {
+        let (small, _) = volume();
+        let (mut large, c) = volume();
+        large.settle(c, &file(100_000, ROOT, "far.txt")).unwrap();
+        let (mut also, d) = volume();
+        also.settle(d, &file(51, ROOT, "far.txt")).unwrap();
+        assert!(
+            large.memory() >= also.memory() + 4 * 99_000,
+            "a place per record"
+        );
+        assert!(large.memory() >= small.memory() + 4 * 99_000);
+    }
+
+    #[test]
+    fn one_volume_going_leaves_the_others_as_they_were() {
+        let (mut index, c) = volume();
+        let d = index.add_root("D:").unwrap();
+        index.set_position(c, position(10)).unwrap();
+        index.set_position(d, position(20)).unwrap();
+        index.remove(d).unwrap();
+        assert_eq!(index.position(c), Some(position(10)));
+        index.settle(c, &gone(50)).unwrap();
+        assert!(
+            !found(&index, r"C:\Users\Me\notes.txt"),
+            "still known by records"
+        );
+    }
+
+    #[test]
+    fn a_volume_put_in_place_with_no_position_still_comes_with_its_records() {
+        let mut walked = Index::default();
+        walked.add_root("C:").unwrap();
+        walked.add_root("D:").unwrap();
+        let (fresh, _) = volume();
+        walked.replace(&fresh);
+        let c = walked.find("C:").unwrap();
+        assert_eq!(walked.position(c), None);
+        walked.settle(c, &gone(50)).unwrap();
+        assert!(!found(&walked, r"C:\Users\Me\notes.txt"));
     }
 
     #[test]

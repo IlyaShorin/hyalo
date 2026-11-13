@@ -261,6 +261,10 @@ impl Index {
         }
         let folded = checked(name, false)?;
         if let Some(there) = self.child(parent.0, name).filter(|&at| at != id.0) {
+            // Replacing a folder it is in would take the entry with it.
+            if self.ancestry(id.0).any(|at| at == there) {
+                return Err(Error::WouldLoop);
+            }
             self.remove(EntryId(there))?;
         }
         self.version += 1;
@@ -766,6 +770,18 @@ mod tests {
         let windows = index.add(c, "Windows", true).unwrap();
         let system = index.add(windows, "System32", true).unwrap();
         (index, [c, users, me, notes, windows, system])
+    }
+
+    #[test]
+    fn an_entry_never_takes_the_name_of_a_folder_it_is_in() {
+        let (mut index, [c, users, me, notes, ..]) = drive();
+        let len = index.len();
+        // Users\Me\notes.txt as C:\Users would replace its own folder.
+        assert_eq!(index.rename(notes, c, "Users"), Err(Error::WouldLoop));
+        assert_eq!(index.rename(notes, users, "me"), Err(Error::WouldLoop));
+        assert_eq!(index.len(), len, "nothing removed");
+        assert_eq!(index.path(notes).as_deref(), Some(r"C:\Users\Me\notes.txt"));
+        assert_eq!(index.path(me).as_deref(), Some(r"C:\Users\Me"));
     }
 
     #[test]
