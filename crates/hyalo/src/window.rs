@@ -10,7 +10,7 @@
 //! on: `hwnd` is the live launcher window, owned by the UI thread.
 
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
@@ -303,8 +303,6 @@ struct App {
     /// When each source's provider last started; `None` before it ever
     /// did.
     found_at: Vec<Option<Instant>>,
-    /// Files and folders whose icons were asked for.
-    asked: HashSet<ItemId>,
     /// The provider's thread sends here and posts WM_FOUND.
     found: (Sender<Found>, Receiver<Found>),
     /// Where the pointer was last seen, in client pixels; `None` when not
@@ -1200,14 +1198,13 @@ impl App {
     }
 
     /// Asks for the icons of the files and folders listed that have none
-    /// yet, once each, on a thread of its own.
+    /// yet, once each while the catalog keeps them, on a thread of its
+    /// own.
     fn fetch_icons(&mut self) {
         let rows = self.results.rows().iter();
         let files = rows.filter(|row| row.item.path().is_some());
-        let wanted: Vec<ItemId> = files
-            .map(|row| row.item.id.clone())
-            .filter(|id| !self.catalog.icons.contains_key(id) && self.asked.insert(id.clone()))
-            .collect();
+        let listed = files.map(|row| row.item.id.clone()).collect();
+        let wanted = self.catalog.list_files(listed, catalog::KEPT_FILE_ICONS);
         if wanted.is_empty() {
             return;
         }
@@ -1458,7 +1455,6 @@ fn open(services: Services, shown: bool) -> Result<HWND> {
             frecency,
             services,
             found_at: vec![None; sources],
-            asked: HashSet::new(),
             found: channel(),
             pointer: None,
             hotkey: None,
@@ -5819,6 +5815,59 @@ mod tests {
             std::thread::sleep(Duration::from_millis(300));
             launcher.pump_until(|_| true);
             assert_eq!(asked.load(Ordering::SeqCst), 1);
+        });
+    }
+
+    /// Hyalo runs for days: each file listed once would otherwise keep
+    /// its icon for as long as it runs.
+    #[test]
+    fn icons_of_files_listed_long_ago_go_and_are_asked_for_again_when_listed_again() {
+        on_hidden_desktop(|| {
+            let lists = catalog::KEPT_FILE_ICONS / MAX_ROWS + 1;
+            let query = |list: usize| format!("w{list:03}");
+            let names: Vec<String> = (0..lists)
+                .flat_map(|list| (0..MAX_ROWS).map(move |row| format!("{}-{row}.txt", query(list))))
+                .collect();
+            let names: Vec<&str> = names.iter().map(String::as_str).collect();
+            let tree = Scratch::new("window-icons-kept").with(&names);
+            let (mut services, _) = walking(just(&tree.0), None);
+            let asked = Arc::new(Mutex::new(Vec::new()));
+            let noted = Arc::clone(&asked);
+            services.icons = Arc::new(move |ids: &[ItemId], size, report: &dyn Fn(Found)| {
+                for id in ids {
+                    noted.lock().expect("the ids asked").push(id.0.clone());
+                    report(Found::Icon(id.clone(), red(size)));
+                }
+            });
+            let launcher = Launcher::serving(services);
+            // Each query lists its own eight files with their icons; on
+            // the way, "w", "w0" and the like list others again.
+            let list = |typed: &str| {
+                launcher.type_text(&format!("\u{8}\u{8}\u{8}\u{8}{typed}"));
+                launcher.pump_until(|app| {
+                    let rows = app.results.rows();
+                    let shown = |row: &Listed| {
+                        row.item.title.starts_with(typed)
+                            && app.catalog.icons.contains_key(&row.item.id)
+                    };
+                    rows.len() == MAX_ROWS && rows.iter().all(shown)
+                });
+            };
+            (0..lists).for_each(|each| list(&query(each)));
+            let has_icon = |name: &&str| {
+                let id = ItemId(tree.path(name));
+                with_app(|app| app.catalog.icons.contains_key(&id)).expect("app state")
+            };
+            let kept = names.iter().filter(|name| has_icon(name)).count();
+            assert_eq!(kept, catalog::KEPT_FILE_ICONS);
+            let gone = *names.iter().find(|name| !has_icon(name)).expect("one went");
+            list(&gone[..4]);
+            list(&query(lists - 1));
+            let asked = asked.lock().expect("the ids asked");
+            let times = |name: &str| asked.iter().filter(|id| **id == tree.path(name)).count();
+            assert_eq!(times(gone), 2, "gone, so asked again");
+            let last = format!("{}-0.txt", query(lists - 1));
+            assert_eq!(times(&last), 1, "still kept");
         });
     }
 
