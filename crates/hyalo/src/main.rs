@@ -41,6 +41,8 @@ mod update;
 mod window;
 
 #[cfg(test)]
+mod readme_shots;
+#[cfg(test)]
 mod reference;
 #[cfg(test)]
 mod scratch;
