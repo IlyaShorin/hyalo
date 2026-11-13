@@ -469,11 +469,17 @@ mod tests {
         );
         image.change(19, None);
         image.change(21, None);
+        // One read of the journal or two, as it happens.
+        let mut changes = Vec::new();
+        let mut last = at(192);
+        while last != at(384) {
+            let Answer::Changed(read_to, more) = following.next() else {
+                panic!("only changes after the listing");
+            };
+            (last, changes) = (read_to, [changes, more].concat());
+        }
         // An extension record removed reads as any record gone.
-        assert_eq!(
-            following.next(),
-            Answer::Changed(at(384), vec![gone(19), gone(21)])
-        );
+        assert_eq!(changes, [gone(19), gone(21)]);
         assert!(following.end().is_ok());
     }
 

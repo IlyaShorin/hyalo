@@ -6,9 +6,9 @@ use std::io;
 use std::sync::atomic::AtomicBool;
 
 use hyalo_core::pipe;
-use windows::Win32::Storage::FileSystem::{ReadFile, WriteFile};
+use windows::Win32::Storage::FileSystem::WriteFile;
 
-use crate::overlapped::{Call, Owned, pending, wait};
+use crate::overlapped::{Call, Owned, pending, read_at, wait};
 
 /// One end of the pipe.
 pub(crate) struct End(pub(crate) Owned);
@@ -43,18 +43,7 @@ impl End {
     fn fill(&self, buffer: &mut [u8], stop: &AtomicBool) -> io::Result<bool> {
         let mut filled = 0;
         while filled < buffer.len() {
-            let mut call = Call::new(0)?;
-            // SAFETY: as for a write.
-            let issued = unsafe {
-                ReadFile(
-                    self.0.0,
-                    Some(&mut buffer[filled..]),
-                    None,
-                    Some(&raw mut call.overlapped),
-                )
-            };
-            pending(issued)?;
-            match wait(self.0.0, &raw const call.overlapped, Some(stop))? {
+            match read_at(self.0.0, 0, &mut buffer[filled..], Some(stop))? {
                 None => return Ok(false),
                 Some(0) => return Err(io::ErrorKind::UnexpectedEof.into()),
                 Some(more) => filled += more,
