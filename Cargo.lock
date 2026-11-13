@@ -67,6 +67,7 @@ version = "0.2.9"
 dependencies = [
  "hyalo-core",
  "hyalo-index",
+ "hyalo-indexer",
  "png",
  "windows",
  "windows-numerics",

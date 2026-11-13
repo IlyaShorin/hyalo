@@ -10,11 +10,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use hyalo_core::pipe::{Answer, Request, Unread, VERSION};
-use windows::Win32::Foundation::{ERROR_PIPE_CONNECTED, HLOCAL, LocalFree};
-use windows::Win32::Security::Authorization::{
-    ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
-};
-use windows::Win32::Security::{PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES};
+use windows::Win32::Foundation::ERROR_PIPE_CONNECTED;
+use windows::Win32::Security::SECURITY_ATTRIBUTES;
 use windows::Win32::Storage::FileSystem::{
     FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_FLAG_OVERLAPPED, FILE_FLAGS_AND_ATTRIBUTES,
     FlushFileBuffers, PIPE_ACCESS_DUPLEX, ReadFile,
@@ -26,8 +23,9 @@ use windows::Win32::System::Pipes::{
 use windows::core::HSTRING;
 
 use crate::disk::Disk;
-use crate::overlapped::{Call, Owned, os, pending, wait_while};
+use crate::overlapped::{Call, Owned, pending, wait_while};
 use crate::read::{self, Out};
+use crate::security::Security;
 use crate::wire::End;
 
 /// Opens the volume of a drive (`C`) for reading.
@@ -102,35 +100,6 @@ pub fn serve(
             });
         }
     })
-}
-
-/// A security descriptor made from SDDL, freed when dropped.
-struct Security(PSECURITY_DESCRIPTOR);
-
-impl Security {
-    fn new(sddl: &str) -> io::Result<Security> {
-        let mut descriptor = PSECURITY_DESCRIPTOR::default();
-        // SAFETY: a plain call; the descriptor is freed by `Drop`.
-        unsafe {
-            ConvertStringSecurityDescriptorToSecurityDescriptorW(
-                &HSTRING::from(sddl),
-                SDDL_REVISION_1,
-                &mut descriptor,
-                None,
-            )
-            .map_err(os)?;
-        }
-        Ok(Security(descriptor))
-    }
-}
-
-impl Drop for Security {
-    fn drop(&mut self) {
-        // SAFETY: Windows allocated it for us; freed once.
-        unsafe {
-            let _ = LocalFree(Some(HLOCAL(self.0.0)));
-        }
-    }
 }
 
 /// A new instance of the pipe: the first refused if the name is taken,

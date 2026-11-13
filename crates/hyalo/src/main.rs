@@ -59,8 +59,13 @@ use windows::Win32::UI::HiDpi::{
 /// A new build an update started (`--replace`) waits for the old one to
 /// end, then runs in its place. A release build started from anywhere
 /// but `%LOCALAPPDATA%\Programs\hyalo` installs itself there first.
+/// Started as the indexer service, or to install or remove it, it does
+/// that and nothing else: no launcher, no window.
 fn main() -> windows::core::Result<()> {
     let arguments: Vec<String> = std::env::args().collect();
+    if let Some(command) = hyalo_indexer::command(&arguments) {
+        std::process::exit(hyalo_indexer::run(command));
+    }
     let start = instance::Start::from_args(arguments.clone());
     if install::elsewhere(&arguments, start) {
         return Ok(());

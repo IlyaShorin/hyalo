@@ -6,10 +6,14 @@
 use std::io;
 
 use windows::Win32::Foundation::{HANDLE, HLOCAL, LocalFree};
-use windows::Win32::Security::Authorization::ConvertSidToStringSidW;
-use windows::Win32::Security::{GetTokenInformation, TOKEN_QUERY, TOKEN_USER, TokenUser};
+use windows::Win32::Security::Authorization::{
+    ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+};
+use windows::Win32::Security::{
+    GetTokenInformation, PSECURITY_DESCRIPTOR, TOKEN_QUERY, TOKEN_USER, TokenUser,
+};
 use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
-use windows::core::PWSTR;
+use windows::core::{HSTRING, PWSTR};
 
 use crate::overlapped::{Owned, os};
 
@@ -66,6 +70,35 @@ pub fn current_user() -> io::Result<String> {
         let sid = text.to_string();
         let _ = LocalFree(Some(HLOCAL(text.0.cast())));
         sid.map_err(|_| io::ErrorKind::InvalidData.into())
+    }
+}
+
+/// A security descriptor made from SDDL, freed when dropped.
+pub(crate) struct Security(pub(crate) PSECURITY_DESCRIPTOR);
+
+impl Security {
+    pub(crate) fn new(sddl: &str) -> io::Result<Security> {
+        let mut descriptor = PSECURITY_DESCRIPTOR::default();
+        // SAFETY: a plain call; the descriptor is freed by `Drop`.
+        unsafe {
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                &HSTRING::from(sddl),
+                SDDL_REVISION_1,
+                &mut descriptor,
+                None,
+            )
+            .map_err(os)?;
+        }
+        Ok(Security(descriptor))
+    }
+}
+
+impl Drop for Security {
+    fn drop(&mut self) {
+        // SAFETY: Windows allocated it for us; freed once.
+        unsafe {
+            let _ = LocalFree(Some(HLOCAL(self.0.0)));
+        }
     }
 }
 
