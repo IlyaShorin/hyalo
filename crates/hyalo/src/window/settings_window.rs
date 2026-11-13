@@ -1981,11 +1981,17 @@ mod tests {
             let settings = setup.settings();
             assert!(settings.shows("Indexer service"), "{:?}", settings.texts());
             settings.click(Target::IndexerInstall);
-            setup.until(|window| window.laid.area(Target::IndexerRemove).is_some());
+            // The button shows once installed, and works once it is done.
+            let ended = |target| {
+                move |window: &SettingsWindow| {
+                    window.laid.area(target).is_some() && window.panel.look(target).enabled
+                }
+            };
+            setup.until(ended(Target::IndexerRemove));
             assert_eq!(*unindexed.asked.lock().expect("asked"), [true]);
             assert!(recheck.taken(), "the provider looks for it");
             settings.click(Target::IndexerRemove);
-            setup.until(|window| window.laid.area(Target::IndexerInstall).is_some());
+            setup.until(ended(Target::IndexerInstall));
             assert_eq!(*unindexed.asked.lock().expect("asked"), [true, false]);
             assert!(recheck.taken(), "and walks its roots again");
         });

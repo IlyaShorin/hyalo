@@ -1156,6 +1156,17 @@ mod tests {
             (false, false),
         ];
         assert_eq!(muted(&panel), cards);
+        panel.set_indexing(Indexing::default());
+        let shown = muted(&panel);
+        assert_eq!(shown.len(), cards.len() + 1);
+        assert!(
+            shown.contains(&(false, false)),
+            "the index card is no setting"
+        );
+        assert_eq!(
+            shown.iter().filter(|&&card| card == (false, false)).count(),
+            2
+        );
     }
 
     #[test]

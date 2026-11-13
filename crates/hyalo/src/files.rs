@@ -327,7 +327,13 @@ impl Walk<'_> {
         // what its end took out, which a config saved meanwhile may name.
         let mut left_out = self.excluded.paths();
         let whole = walked.len() == roots.len();
-        for path in self.walk(shared, &walked, whole, report) {
+        // Every root the service's, nothing to walk or save: the listings
+        // are saved as they come.
+        let pruned = match walked.is_empty() && !roots.is_empty() {
+            true => Vec::new(),
+            false => self.walk(shared, &walked, whole, report),
+        };
+        for path in pruned {
             if !left_out.contains(&path) {
                 left_out.push(path);
             }
@@ -2055,6 +2061,26 @@ mod tests {
             fs::metadata(&path).and_then(|file| file.modified()).ok(),
             Some(saved)
         );
+    }
+
+    #[test]
+    fn roots_the_service_reads_are_not_saved_until_listed() {
+        let folder = Scratch::new("served-not-saved");
+        let snapshot = Scratch::new("served-not-saved-snapshot");
+        let path = snapshot.0.join("files.idx");
+        let (indexer, send) = Scripted::new();
+        let serving = served(
+            &folder,
+            indexer.clone(),
+            Some(path.clone()),
+            &Excluded::default(),
+        );
+        serving.until(|_| !indexer.asked().is_empty());
+        thread::sleep(3 * TELL_EVERY);
+        assert!(!path.exists(), "nothing walked, nothing saved");
+        list(&send, at(100));
+        serving.finds("inside", &[folder.path(r"listed\inside.txt")]);
+        assert!(serving.until(|_| path.exists()), "the listing saved");
     }
 
     #[test]
