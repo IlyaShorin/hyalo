@@ -228,7 +228,8 @@ impl Services {
         let drives: Roots = Arc::new(files::fixed_drives);
         let excluded = Excluded::default();
         let snapshot = files::default_snapshot();
-        let walk = files::provider(writer, drives, snapshot, excluded.clone());
+        let indexer = Arc::new(files::served::Service);
+        let walk = files::provider(writer, drives, snapshot, excluded.clone(), indexer);
         Self {
             sources: vec![
                 Source::apps(
@@ -2433,7 +2434,13 @@ mod tests {
         services.files = files;
         let excluded = Excluded::default();
         services.sources.push(Source::new(
-            files::provider(writer, roots, None, excluded.clone()),
+            files::provider(
+                writer,
+                roots,
+                None,
+                excluded.clone(),
+                Arc::new(files::served::Walked),
+            ),
             files::REFRESH_AFTER,
             Some(excluded),
         ));
