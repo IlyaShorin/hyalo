@@ -1,4 +1,4 @@
-use super::build::record;
+use super::build::{name, record};
 use super::*;
 
 /// The size of a record on most volumes.
@@ -11,13 +11,6 @@ const WRITTEN_SECONDS: i64 = 1_794_565_800;
 const WIN32: u8 = 1;
 const POSIX: u8 = 0;
 const WIN32_AND_DOS: u8 = 3;
-
-fn name(parent: u32, text: &str) -> Name {
-    Name {
-        parent,
-        text: text.to_string(),
-    }
-}
 
 #[test]
 fn windows_time_reads_in_seconds_since_1970() {

@@ -1,6 +1,8 @@
 //! Records made in tests, laid out byte for byte as NTFS lays them out.
 
-use super::{ATTRIBUTE_LIST, DATA, DIRECTORY, FILE_NAME, IN_USE, STANDARD_INFORMATION, STRIDE};
+use super::{
+    ATTRIBUTE_LIST, DATA, DIRECTORY, FILE_NAME, IN_USE, Name, STANDARD_INFORMATION, STRIDE,
+};
 
 /// Where the update sequence starts, as NTFS 3.1 puts it.
 const SEQUENCE_AT: usize = 0x30;
@@ -16,6 +18,14 @@ pub struct Made {
     flags: u16,
     base: u64,
     attributes: Vec<Vec<u8>>,
+}
+
+/// A file's name in the folder `parent`.
+pub fn name(parent: u32, text: &str) -> Name {
+    Name {
+        parent,
+        text: text.to_string(),
+    }
 }
 
 /// A record in use for a file, with nothing in it yet.

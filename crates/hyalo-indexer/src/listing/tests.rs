@@ -1,12 +1,5 @@
 use super::*;
-use crate::{Name, ROOT};
-
-fn name(parent: u32, text: &str) -> Name {
-    Name {
-        parent,
-        text: text.to_string(),
-    }
-}
+use crate::mft::build::name;
 
 fn folder(parent: u32, text: &str) -> Record {
     Record {
