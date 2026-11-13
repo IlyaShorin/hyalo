@@ -15,6 +15,7 @@ mod index;
 mod search;
 mod snapshot;
 pub mod synthetic;
+mod volume;
 
 pub use index::{EntryId, Error, Index, MAX_NAME};
 pub use search::{Searched, Sieve};
