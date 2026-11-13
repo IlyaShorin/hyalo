@@ -8,8 +8,10 @@
 //! and the table is read again for those alone.
 
 mod bytes;
+pub mod directory;
 pub mod disk;
 pub mod listing;
 pub mod mft;
+pub mod ntfs;
 pub mod read;
 pub mod usn;

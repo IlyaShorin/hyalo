@@ -94,6 +94,7 @@ name = "hyalo-indexer"
 version = "0.2.8"
 dependencies = [
  "hyalo-core",
+ "windows",
 ]
 
 [[package]]
