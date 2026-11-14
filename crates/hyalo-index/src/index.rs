@@ -1,8 +1,6 @@
 //! The entries and their names, and the changes a walk or a journal makes
 //! to them.
 
-use std::borrow::Cow;
-
 use hyalo_core::item::Item;
 use hyalo_core::matcher;
 use hyalo_core::volume::Position;
@@ -537,17 +535,17 @@ impl Index {
             let moved = match entry.is_live() {
                 true => {
                     let name = self.name_of(entry);
-                    let Some(copy) = fold.of(self, entry) else {
+                    let start = folded.len();
+                    if !fold.onto(self, entry, &mut folded) {
                         return false;
-                    };
+                    }
                     let moved = entry.named(
                         offset(names.len()),
                         name.len(),
-                        offset(folded.len()),
-                        copy.len(),
+                        offset(start),
+                        folded.len() - start,
                     );
                     names.push_str(name);
-                    folded.push_str(&copy);
                     moved
                 }
                 false => entry.named(0, 0, 0, 0),
@@ -714,12 +712,19 @@ enum Fold {
 }
 
 impl Fold {
-    fn of(self, index: &Index, entry: Entry) -> Option<Cow<'_, str>> {
+    /// Puts the entry's folded name after what `folded` holds; whether
+    /// its name is one `add` would take.
+    fn onto(self, index: &Index, entry: Entry, folded: &mut String) -> bool {
         match self {
-            Fold::Again => checked(index.name_of(entry), entry.is_root())
-                .ok()
-                .map(Cow::Owned),
-            Fold::Kept => Some(Cow::Borrowed(index.folded_of(entry))),
+            Fold::Again => {
+                let (name, start) = (index.name_of(entry), folded.len());
+                matcher::fold_onto(name, folded);
+                takes(name, &folded[start..], entry.is_root())
+            }
+            Fold::Kept => {
+                folded.push_str(index.folded_of(entry));
+                true
+            }
         }
     }
 }
@@ -743,16 +748,20 @@ fn lower(name: &str) -> impl Iterator<Item = char> + '_ {
     name.chars().flat_map(char::to_lowercase)
 }
 
-/// The name folded, if it can be a name: not empty, not too long either
-/// way, and one name, without a backslash, unless it is a root.
+/// The name folded, if it can be a name (`takes`).
 fn checked(name: &str, root: bool) -> Result<String, Error> {
     let folded = matcher::folded(name);
-    let fits = |text: &str| !text.is_empty() && text.len() <= MAX_NAME;
-    let one = root || !name.contains('\\');
-    match fits(name) && fits(&folded) && one {
+    match takes(name, &folded, root) {
         true => Ok(folded),
         false => Err(Error::BadName),
     }
+}
+
+/// Whether `name`, folded to `folded`, can be a name: not empty, not too
+/// long either way, and one name, without a backslash, unless it is a root.
+fn takes(name: &str, folded: &str, root: bool) -> bool {
+    let fits = |text: &str| !text.is_empty() && text.len() <= MAX_NAME;
+    fits(name) && fits(folded) && (root || !name.contains('\\'))
 }
 
 #[cfg(test)]
@@ -1228,6 +1237,21 @@ mod tests {
         assert_eq!((index.names.len(), index.garbage), (8, 4), "half: kept");
         index.remove(ab).unwrap();
         assert_eq!((index.names.len(), index.garbage), (2, 0), "more: rebuilt");
+    }
+
+    #[test]
+    fn a_removed_entry_names_nothing_once_the_names_are_moved() {
+        let mut index = Index::default();
+        let c = index.add_root("C:").unwrap();
+        let (ab, cdef) = (index.add(c, "ab", false), index.add(c, "cdef", false));
+        index.remove(cdef.unwrap()).unwrap();
+        index.remove(ab.unwrap()).unwrap();
+        assert_eq!(index.names, "C:", "rebuilt");
+        for removed in [ab, cdef].map(|id| index.entries[id.unwrap().0 as usize]) {
+            let names = (removed.name, removed.name_len());
+            let folded = (removed.folded, removed.folded_len());
+            assert_eq!((names, folded), ((0, 0), (0, 0)), "{removed:?}");
+        }
     }
 
     #[test]

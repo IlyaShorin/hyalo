@@ -364,7 +364,15 @@ fn in_order(query: &str, text: &str) -> bool {
 /// A name as matching compares it: every letter folded, ё as е. Indexes
 /// keep this beside the name for `Pattern::ceiling`.
 pub fn folded(name: &str) -> String {
-    name.chars().map(compared).collect()
+    let mut text = String::new();
+    fold_onto(name, &mut text);
+    text
+}
+
+/// `name` folded as `folded` folds it, put after what `text` holds: an
+/// index folds two million names onto one text without a string for each.
+pub fn fold_onto(name: &str, text: &mut String) {
+    text.extend(name.chars().map(compared));
 }
 
 /// Matches `query` against `name`, as typed and as if typed in the other
@@ -719,6 +727,13 @@ mod tests {
     #[test]
     fn a_name_is_folded_as_matching_compares_it() {
         assert_eq!(folded("Ёлка.TXT"), "елка.txt");
+    }
+
+    #[test]
+    fn a_name_is_folded_onto_the_end_of_a_text() {
+        let mut text = String::from("Ab");
+        fold_onto("Ёлка.TXT", &mut text);
+        assert_eq!(text, "Abелка.txt", "what was there stays as it was");
     }
 
     #[test]
