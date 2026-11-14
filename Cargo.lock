@@ -63,7 +63,7 @@ checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
 
 [[package]]
 name = "hyalo"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "hyalo-core",
  "hyalo-index",
@@ -75,7 +75,7 @@ dependencies = [
 
 [[package]]
 name = "hyalo-core"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -85,14 +85,14 @@ dependencies = [
 
 [[package]]
 name = "hyalo-index"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "hyalo-core",
 ]
 
 [[package]]
 name = "hyalo-indexer"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "hyalo-core",
  "windows",
