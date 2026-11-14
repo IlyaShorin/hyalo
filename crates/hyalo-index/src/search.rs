@@ -188,15 +188,15 @@ impl Index {
 }
 
 /// The cores this machine has.
-fn cores() -> usize {
+pub(crate) fn cores() -> usize {
     thread::available_parallelism()
         .unwrap_or(NonZero::<usize>::MIN)
         .get()
 }
 
-/// How many threads look through `all` entries: one per `CHUNK` of them,
-/// at most one per core.
-fn threads(all: usize, cores: usize) -> usize {
+/// How many threads share the work on `all` entries: one per `CHUNK` of
+/// them, at most one per core.
+pub(crate) fn threads(all: usize, cores: usize) -> usize {
     all.div_ceil(CHUNK).min(cores)
 }
 

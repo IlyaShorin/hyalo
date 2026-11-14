@@ -1,10 +1,13 @@
 //! The entries and their names, and the changes a walk or a journal makes
 //! to them.
 
+use std::thread;
+
 use hyalo_core::item::Item;
 use hyalo_core::matcher;
 use hyalo_core::volume::Position;
 
+use crate::search::{cores, threads};
 use crate::volume::{NO_FILE, Volume};
 
 /// One file or folder, as long as it is in the index. A removed entry's id
@@ -525,19 +528,60 @@ impl Index {
 
     /// Copies every live name and its folded copy into fresh arenas, which
     /// leaves out the names given up; whether each was a name `add` would
-    /// take. A removed entry is left naming nothing.
+    /// take. A removed entry is left naming nothing. Folding two million
+    /// names takes a core a tenth of a second, so the work is shared.
     fn rebuild(&mut self, fold: Fold) -> bool {
-        let live = self.entries.iter().filter(|entry| entry.is_live());
+        let threads = threads(self.entries.len(), cores());
+        self.rebuild_on(fold, threads)
+    }
+
+    /// `rebuild` on `threads` threads, each moving the names of one stretch
+    /// of the entries into arenas of its own, joined in order after: the
+    /// same arenas however many there are.
+    fn rebuild_on(&mut self, fold: Fold, threads: usize) -> bool {
+        let mut entries = std::mem::take(&mut self.entries);
+        let stretch = entries.len().div_ceil(threads.max(1)).max(1);
+        let index = &*self;
+        let moved = shared(entries.chunks_mut(stretch), |stretch| {
+            index.moved(stretch, fold)
+        });
+        let Some(moved) = moved.into_iter().collect::<Option<Vec<_>>>() else {
+            self.entries = entries;
+            return false;
+        };
+        // The names as they were are given back before the new ones are
+        // joined, so this takes no more room than one thread would.
+        self.names = String::new();
+        let (names, folded): (Vec<_>, Vec<_>) = moved.into_iter().unzip();
+        let ((names, name_starts), (folded, folded_starts)) = (joined(names), joined(folded));
+        let starts = name_starts.into_iter().zip(folded_starts);
+        for (stretch, (name, fold)) in entries.chunks_mut(stretch).zip(starts) {
+            for entry in stretch.iter_mut().filter(|entry| entry.is_live()) {
+                *entry = entry.named(
+                    entry.name + name,
+                    entry.name_len(),
+                    entry.folded + fold,
+                    entry.folded_len(),
+                );
+            }
+        }
+        (self.entries, self.names, self.folded, self.garbage) = (entries, names, folded, 0);
+        true
+    }
+
+    /// Copies the live names of `stretch`, and their folded copies, into
+    /// arenas of its own, pointing each entry at its place there; `None`
+    /// when a name is one `add` would refuse.
+    fn moved(&self, stretch: &mut [Entry], fold: Fold) -> Option<(String, String)> {
+        let live = stretch.iter().filter(|entry| entry.is_live());
         let room: usize = live.map(|entry| entry.name_len()).sum();
         let (mut names, mut folded) = (String::with_capacity(room), String::with_capacity(room));
-        for at in 0..self.entries.len() {
-            let entry = self.entries[at];
-            let moved = match entry.is_live() {
+        for entry in stretch {
+            *entry = match entry.is_live() {
                 true => {
-                    let name = self.name_of(entry);
-                    let start = folded.len();
-                    if !fold.onto(self, entry, &mut folded) {
-                        return false;
+                    let (name, start) = (self.name_of(*entry), folded.len());
+                    if !fold.onto(self, *entry, &mut folded) {
+                        return None;
                     }
                     let moved = entry.named(
                         offset(names.len()),
@@ -550,11 +594,8 @@ impl Index {
                 }
                 false => entry.named(0, 0, 0, 0),
             };
-            self.entries[at] = moved;
         }
-        folded.shrink_to_fit();
-        (self.names, self.folded, self.garbage) = (names, folded, 0);
-        true
+        Some((names, folded))
     }
 
     /// Rebuilds the arenas once more than half of the names are given up,
@@ -727,6 +768,48 @@ impl Fold {
             }
         }
     }
+}
+
+/// `texts` one after another, and where each starts. Each is copied on a
+/// thread of its own (`shared`): a core alone takes 13 ms over 67 MB, most
+/// of it spent having the fresh pages handed to it.
+fn joined(texts: Vec<String>) -> (String, Vec<u32>) {
+    let all = texts.iter().map(String::len).sum();
+    // Whatever its bytes start as, every one is copied over.
+    let mut whole = vec![u8::default(); all];
+    let (mut rest, mut places, mut starts) = (whole.as_mut_slice(), Vec::new(), Vec::new());
+    for text in &texts {
+        starts.push(offset(all - rest.len()));
+        let place;
+        (place, rest) = rest.split_at_mut(text.len());
+        places.push((place, text));
+    }
+    shared(places, |(place, text)| {
+        place.copy_from_slice(text.as_bytes())
+    });
+    let whole = String::from_utf8(whole).expect("whole texts, one after another");
+    (whole, starts)
+}
+
+/// `work` done on each of `pieces`, the first on this thread and each of
+/// the others on a thread of its own, the answers in order: a single piece
+/// starts no thread.
+fn shared<P: Send, A: Send>(
+    pieces: impl IntoIterator<Item = P>,
+    work: impl Fn(P) -> A + Sync,
+) -> Vec<A> {
+    let work = &work;
+    let mut pieces = pieces.into_iter();
+    let first = pieces.next();
+    thread::scope(|scope| {
+        let others: Vec<_> = pieces
+            .map(|piece| scope.spawn(move || work(piece)))
+            .collect();
+        let others = others
+            .into_iter()
+            .map(|thread| thread.join().expect("a thread sharing the work"));
+        first.map(work).into_iter().chain(others).collect()
+    })
 }
 
 /// A position or count as the u32 entries keep. The index holds far fewer
@@ -1237,6 +1320,78 @@ mod tests {
         assert_eq!((index.names.len(), index.garbage), (8, 4), "half: kept");
         index.remove(ab).unwrap();
         assert_eq!((index.names.len(), index.garbage), (2, 0), "more: rebuilt");
+    }
+
+    /// A root and `count` entries in it, a seventh of them folders, a
+    /// third removed, named in two alphabets.
+    fn mixed(count: usize) -> Index {
+        let mut index = Index::default();
+        let c = index.add_root("C:").unwrap();
+        let named = |n: usize| format!("Ёлка {n}.TXT");
+        let ids: Vec<_> = (0..count)
+            .map(|n| index.add(c, &named(n), n % 7 == 0).unwrap())
+            .collect();
+        for &id in ids.iter().step_by(3) {
+            index.remove(id).unwrap();
+        }
+        index
+    }
+
+    #[test]
+    fn names_moved_on_several_threads_land_where_one_thread_puts_them() {
+        let mut alone = mixed(40);
+        assert!(alone.rebuild_on(Fold::Again, 1));
+        let one = alone.find(r"C:\Ёлка 1.TXT").unwrap();
+        assert_eq!(alone.folded_of(alone.live(one).unwrap()), "елка 1.txt");
+        for threads in [2, 3, 7, 41, 100] {
+            let mut shared = mixed(40);
+            assert!(shared.rebuild_on(Fold::Again, threads), "{threads}");
+            assert_eq!(shared.entries, alone.entries, "{threads} threads");
+            assert_eq!(shared.names, alone.names, "{threads} threads");
+            assert_eq!(shared.folded, alone.folded, "{threads} threads");
+            let room = (shared.names.capacity(), shared.folded.capacity());
+            assert_eq!(room, (alone.names.len(), alone.folded.len()), "exact");
+        }
+    }
+
+    #[test]
+    fn shared_work_comes_back_in_order_the_first_done_here() {
+        let here = thread::current().id();
+        let done = shared(0..5, |n| (n * 10, thread::current().id() == here));
+        let answers: Vec<_> = done.iter().map(|&(answer, _)| answer).collect();
+        assert_eq!(answers, [0, 10, 20, 30, 40]);
+        let at_home: Vec<_> = done.iter().map(|&(_, home)| home).collect();
+        assert_eq!(at_home, [true, false, false, false, false]);
+        assert!(shared(0..0, |n: i32| n).is_empty());
+    }
+
+    #[test]
+    fn texts_are_joined_in_order_each_where_it_starts() {
+        let texts = ["ab", "", "вг", "d"].map(String::from).to_vec();
+        let (whole, starts) = joined(texts);
+        assert_eq!((whole.as_str(), starts), ("abвгd", vec![0, 2, 2, 6]));
+        assert_eq!(whole.capacity(), whole.len(), "no room to spare");
+        assert_eq!(joined(Vec::new()), (String::new(), Vec::new()));
+    }
+
+    #[test]
+    fn an_empty_index_and_no_threads_asked_for_are_no_trouble() {
+        let mut empty = Index::default();
+        assert!(empty.rebuild(Fold::Again), "no entries: no threads");
+        assert_eq!((empty.names.as_str(), empty.folded.as_str()), ("", ""));
+        let mut some = mixed(4);
+        assert!(some.rebuild_on(Fold::Again, 0), "as on one");
+        assert_eq!(some.names, "C:Ёлка 1.TXTЁлка 2.TXT");
+    }
+
+    #[test]
+    fn a_name_refused_on_any_thread_refuses_them_all() {
+        for threads in [1, 3] {
+            let mut index = mixed(40);
+            // The last thread's: 41 entries, 14 to a thread.
+            index.names = index.names.replace("Ёлка 38", "Ёлка\\38");
+            assert!(!index.rebuild_on(Fold::Again, threads), "{threads}");
+        }
     }
 
     #[test]
