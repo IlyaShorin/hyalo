@@ -54,7 +54,7 @@ hyalo finds your apps, files, folders and Windows settings as you type. It also 
 ## Install
 
 1. Download `hyalo.exe` from the [latest release](https://github.com/IlyaShorin/hyalo/releases/latest).
-2. Run it. It copies itself to `%LOCALAPPDATA%\Programs\hyalo` and waits in the tray. There is nothing to click through and no admin prompt.
+2. Run it. It copies itself to `%LOCALAPPDATA%\Programs\hyalo`, adds itself to the Start menu and waits in the tray. There is nothing to click through and no admin prompt.
 3. Press **Alt+Space**.
 
 From then on hyalo updates itself. A new version shows up as a quiet notice under the search bar and in the tray menu, and Install puts it in place.
@@ -131,7 +131,7 @@ The file index, your picks and your settings stay on your disk, in `%LOCALAPPDAT
 ## Uninstall
 
 1. In the tray menu, turn off *Start with Windows*, then choose *Exit*.
-2. Delete `%LOCALAPPDATA%\Programs\hyalo`.
+2. Delete `%LOCALAPPDATA%\Programs\hyalo` and its Start menu entry, `%APPDATA%\Microsoft\Windows\Start Menu\Programs\hyalo.lnk`.
 3. To remove your settings and index too, delete `%APPDATA%\hyalo` and `%LOCALAPPDATA%\hyalo`.
 
 ## Building from source

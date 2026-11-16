@@ -1,7 +1,8 @@
 //! Installing for the current user: a release `hyalo.exe` started from
 //! anywhere else (Downloads, say) puts itself in
-//! `%LOCALAPPDATA%\Programs\hyalo` and runs from there. No admin rights,
-//! nothing to click through.
+//! `%LOCALAPPDATA%\Programs\hyalo` and runs from there, and the build
+//! there lists itself in the Start menu. No admin rights, nothing to click
+//! through.
 
 use std::fs;
 use std::io;
@@ -11,10 +12,13 @@ use hyalo_core::update::Version;
 use windows::Win32::Storage::FileSystem::{
     GetFileVersionInfoSizeW, GetFileVersionInfoW, VS_FIXEDFILEINFO, VerQueryValueW,
 };
+use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance, IPersistFile};
+use windows::Win32::UI::Shell::{IShellLinkW, ShellLink};
 use windows::Win32::UI::WindowsAndMessaging::{ASFW_ANY, AllowSetForegroundWindow};
-use windows::core::{HSTRING, w};
+use windows::core::{HSTRING, Interface, Result, w};
 
 use crate::autostart;
+use crate::com::Com;
 use crate::instance::{self, Start};
 use crate::update;
 
@@ -134,8 +138,63 @@ fn replace(
 /// Where hyalo installs for the current user:
 /// `%LOCALAPPDATA%\Programs\hyalo\hyalo.exe`.
 pub fn installed_exe() -> Option<PathBuf> {
-    let local = std::env::var_os("LOCALAPPDATA")?;
-    Some(PathBuf::from(local).join(r"Programs\hyalo\hyalo.exe"))
+    under("LOCALAPPDATA", r"Programs\hyalo\hyalo.exe")
+}
+
+/// Where the Start menu lists hyalo for the current user:
+/// `%APPDATA%\Microsoft\Windows\Start Menu\Programs\hyalo.lnk`.
+pub fn start_menu_entry() -> Option<PathBuf> {
+    under(
+        "APPDATA",
+        r"Microsoft\Windows\Start Menu\Programs\hyalo.lnk",
+    )
+}
+
+/// `path` inside the folder the environment variable `variable` names.
+fn under(variable: &str, path: &str) -> Option<PathBuf> {
+    Some(PathBuf::from(std::env::var_os(variable)?).join(path))
+}
+
+/// Gives the build installed at `installed` its Start menu entry at
+/// `link` when `running` is that build and there is none; whether it
+/// made one. An entry already there is the user's, left as it is. COM
+/// must be initialized on this thread.
+pub fn give_entry(running: &Path, installed: &Path, link: &Path) -> Result<bool> {
+    if !same_file(running, installed) || link.exists() {
+        return Ok(false);
+    }
+    // SAFETY: COM is initialized on this thread, the caller's promise;
+    // the strings outlive the calls that read them.
+    unsafe {
+        let shortcut: IShellLinkW = CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER)?;
+        shortcut.SetPath(&HSTRING::from(installed.as_os_str()))?;
+        let file: IPersistFile = shortcut.cast()?;
+        file.Save(&HSTRING::from(link.as_os_str()), REMEMBER)?;
+    }
+    Ok(true)
+}
+
+/// Whether the shortcut saved becomes the shortcut object's current
+/// file: no, the object goes at once, and the file on disk is the same
+/// either way. No test pins this: nothing outside the object tells.
+const REMEMBER: bool = false;
+
+/// `give_entry` for the build that runs, on a thread of its own, so that
+/// an installed hyalo closed from the tray is found again in Start, and
+/// a hyalo installed before it had an entry gets one with its update.
+/// Not tested: it writes the user's own Start menu; `give_entry` is.
+pub fn give_running_entry() {
+    let (Ok(running), Some(installed), Some(link)) =
+        (std::env::current_exe(), installed_exe(), start_menu_entry())
+    else {
+        return;
+    };
+    std::thread::spawn(move || {
+        let given = Com::init().and_then(|_com| give_entry(&running, &installed, &link));
+        if let Err(error) = given {
+            eprintln!("hyalo: cannot add hyalo to the Start menu: {error}");
+        }
+    });
 }
 
 /// Whether `a` and `b` are one file: the same full path, letters in any
@@ -240,6 +299,8 @@ mod tests {
     use crate::update;
 
     use std::cell::{Cell, RefCell};
+
+    use windows::Win32::System::Com::STGM_READ;
 
     fn v(text: &str) -> Version {
         Version::parse(text).expect("a version")
@@ -472,6 +533,75 @@ mod tests {
         let local = std::env::var_os("LOCALAPPDATA").expect("LOCALAPPDATA");
         let expected = PathBuf::from(local).join(r"Programs\hyalo\hyalo.exe");
         assert_eq!(installed_exe(), Some(expected));
+    }
+
+    #[test]
+    fn the_start_menu_lists_hyalo_in_the_users_own_programs() {
+        let roaming = std::env::var_os("APPDATA").expect("APPDATA");
+        let expected =
+            PathBuf::from(roaming).join(r"Microsoft\Windows\Start Menu\Programs\hyalo.lnk");
+        assert_eq!(start_menu_entry(), Some(expected));
+    }
+
+    /// What the shortcut at `link` starts.
+    fn target_of(link: &Path) -> PathBuf {
+        let _com = Com::init().expect("COM");
+        let mut path = [0_u16; 260];
+        unsafe {
+            let shortcut: IShellLinkW =
+                CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER).expect("a shortcut");
+            let file: IPersistFile = shortcut.cast().expect("a file");
+            file.Load(&HSTRING::from(link.as_os_str()), STGM_READ)
+                .expect("the shortcut read");
+            shortcut
+                .GetPath(&mut path, std::ptr::null_mut(), 0)
+                .expect("its target");
+        }
+        let length = path
+            .iter()
+            .position(|&unit| unit == 0)
+            .unwrap_or(path.len());
+        PathBuf::from(String::from_utf16_lossy(&path[..length]))
+    }
+
+    /// An installed build, a downloaded one, and an empty Start menu.
+    fn start_menu(test: &str) -> (Scratch, PathBuf, PathBuf, PathBuf) {
+        let scratch = Scratch::new(test).with(&[
+            r"Programs\hyalo\",
+            r"Programs\hyalo\hyalo.exe",
+            r"Downloads\",
+            r"Downloads\hyalo.exe",
+            r"Start Menu\Programs\",
+        ]);
+        let installed = scratch.0.join(r"Programs\hyalo\hyalo.exe");
+        let downloaded = scratch.0.join(r"Downloads\hyalo.exe");
+        let link = scratch.0.join(r"Start Menu\Programs\hyalo.lnk");
+        (scratch, installed, downloaded, link)
+    }
+
+    #[test]
+    fn the_installed_copy_puts_itself_in_the_start_menu() {
+        let (_scratch, installed, _, link) = start_menu("install-entry");
+        let _com = Com::init().expect("COM");
+        assert!(give_entry(&installed, &installed, &link).expect("given"));
+        assert!(same_file(&target_of(&link), &installed));
+    }
+
+    #[test]
+    fn a_build_elsewhere_leaves_the_start_menu_alone() {
+        let (_scratch, installed, downloaded, link) = start_menu("install-no-entry");
+        let _com = Com::init().expect("COM");
+        assert!(!give_entry(&downloaded, &installed, &link).expect("nothing to do"));
+        assert!(!link.exists());
+    }
+
+    #[test]
+    fn an_entry_already_in_the_start_menu_stays_as_the_user_left_it() {
+        let (_scratch, installed, _, link) = start_menu("install-kept-entry");
+        fs::write(&link, b"the user's own").expect("an entry");
+        let _com = Com::init().expect("COM");
+        assert!(!give_entry(&installed, &installed, &link).expect("nothing to do"));
+        assert_eq!(fs::read(&link).expect("kept"), b"the user's own");
     }
 
     #[test]

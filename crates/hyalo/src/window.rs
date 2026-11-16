@@ -68,6 +68,7 @@ use crate::field::{self, Edit, Edited, Field};
 use crate::files::{self, Excluded, Files, Roots};
 use crate::highlight::utf16_ranges;
 use crate::hotkeys::{self, Hotkeys};
+use crate::install;
 use crate::instance::Start;
 use crate::keys::{self, Command, Held};
 use crate::layout::{self, Part, Position, Rect};
@@ -1415,11 +1416,13 @@ thread_local! {
 /// Opens the launcher, shown, in the tray, or with its settings window
 /// open, and runs until the window closes. Once it knows whether the
 /// window opened, it tidies up after an update, or, when it is a new
-/// build that could not start, goes back to the old one.
+/// build that could not start, goes back to the old one. The installed
+/// build that opened puts itself in the Start menu, if it is not there.
 pub fn run(start: Start, replace: bool) -> Result<()> {
     let opened = begin(Services::real(), start);
     update::settle_running(opened.is_ok(), replace);
     opened?;
+    install::give_running_entry();
     message_loop();
     Ok(())
 }
