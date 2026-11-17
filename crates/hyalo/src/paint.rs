@@ -29,7 +29,7 @@ use crate::page::{
 };
 use crate::panel::Look;
 use crate::surface::{
-    Behind, DISPLAY_FONT, SELECTED_TEXT, Surface, TEXT_FONT, caret_x, hit, line_width, rgba,
+    Behind, DISPLAY_FONT, Renew, SELECTED_TEXT, Surface, TEXT_FONT, caret_x, hit, line_width, rgba,
     text_format, trimmed,
 };
 
@@ -137,7 +137,6 @@ impl Painter {
     pub fn resize(&mut self, width: u32, height: u32, dpi: u32) -> Result<()> {
         self.surface.resize(width, height, dpi)
     }
-
     /// The view's size in DIPs.
     pub fn view(&self) -> (f32, f32) {
         self.surface.size()
@@ -628,6 +627,12 @@ impl Painter {
     }
 }
 
+impl Renew for Painter {
+    fn renew(&mut self) -> Result<()> {
+        self.surface.renew()
+    }
+}
+
 /// What a button or a × is lit with, when it may be used: pressed, or
 /// under the pointer.
 fn lit(look: Look) -> Option<D2D1_COLOR_F> {
@@ -710,6 +715,11 @@ mod tests {
     ) -> Frame {
         let canvas = Canvas::new();
         let painter = Painter::new(canvas.0, width, height, dpi, behind).expect("a painter");
+        painted_with(&painter, panel)
+    }
+
+    /// What `panel` looks like painted by `painter`.
+    fn painted_with(painter: &Painter, panel: &mut Panel) -> Frame {
         let (view, tall) = painter.view();
         let laid = lay_out(&panel.page(), view, &|text| painter.measure(text));
         panel.fit(laid.height, tall);
@@ -756,6 +766,22 @@ mod tests {
         on_hidden_desktop(|| {
             let mut panel = Panel::new(Ok(written(DEFAULT)), Some(true), Language::English);
             let frame = painted_over(&mut panel, (640, 1040), 96, Behind::Desktop);
+            assert_looks_like("settings-desktop-100", &frame);
+        });
+    }
+
+    #[test]
+    fn a_painter_renewed_paints_the_same_page_on_a_new_device() {
+        on_hidden_desktop(|| {
+            let mut panel = Panel::new(Ok(written(DEFAULT)), Some(true), Language::English);
+            let canvas = Canvas::new();
+            let mut painter =
+                Painter::new(canvas.0, 640, 1040, 96, Behind::Desktop).expect("a painter");
+            painted_with(&painter, &mut panel);
+            let old = painter.surface.device().expect("the device");
+            painter.renew().expect("renewed");
+            assert_ne!(painter.surface.device().expect("the device"), old);
+            let frame = painted_with(&painter, &mut panel);
             assert_looks_like("settings-desktop-100", &frame);
         });
     }
