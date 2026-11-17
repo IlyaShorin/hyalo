@@ -36,8 +36,8 @@ use crate::field;
 use crate::layout::{BAR_HEIGHT, ICON_SIZE, ROW_HEIGHT, TEXT_LEFT, TEXT_RIGHT_PAD, row_top};
 use crate::recent::Recent;
 use crate::surface::{
-    Behind, DISPLAY_FONT, Family, PREMULTIPLIED_BGRA, SELECTED_TEXT, Surface, TEXT_FONT, caret_x,
-    hit, line_width, rgba, text_format, trimmed,
+    Behind, DISPLAY_FONT, Family, PREMULTIPLIED_BGRA, Renew, SELECTED_TEXT, Surface, TEXT_FONT,
+    caret_x, hit, line_width, rgba, text_format, trimmed,
 };
 
 /// What to draw.
@@ -155,7 +155,6 @@ impl Renderer {
     pub fn resize(&mut self, width: u32, height: u32, dpi: u32) -> Result<()> {
         self.surface.resize(width, height, dpi)
     }
-
     pub fn draw(&mut self, scene: &Scene) -> Result<()> {
         self.surface.begin();
         let drawn = self.draw_scene(scene);
@@ -460,6 +459,15 @@ impl Renderer {
     }
 }
 
+impl Renew for Renderer {
+    /// The icons uploaded go with the old device: each is uploaded again
+    /// the next time its row is drawn.
+    fn renew(&mut self) -> Result<()> {
+        self.icons = Recent::new(KEPT_ICONS);
+        self.surface.renew()
+    }
+}
+
 impl Fonts {
     fn new(dwrite: &IDWriteFactory) -> Result<Self> {
         let normal = DWRITE_FONT_WEIGHT_NORMAL;
@@ -686,6 +694,25 @@ mod tests {
                 let frame = renderer.read_frame().expect("read the frame back");
                 assert_looks_like("list-150", &frame);
             }
+        });
+    }
+
+    #[test]
+    fn a_renderer_renewed_draws_the_same_rows_with_their_icons_on_a_new_device() {
+        on_hidden_desktop(|| {
+            let (ids, icons) = (note_ids(), note_icons());
+            let canvas = Canvas::new();
+            let mut renderer =
+                Renderer::new(canvas.0, 1080, 336, 144, Behind::Glass).expect("a renderer");
+            renderer.draw(&note(&ids, &icons)).expect("draw");
+            let old = renderer.surface.device().expect("the device");
+            renderer.renew().expect("renewed");
+            assert_ne!(renderer.surface.device().expect("the device"), old);
+            renderer
+                .draw(&note(&ids, &icons))
+                .expect("draw on the new device");
+            let frame = renderer.read_frame().expect("read the frame back");
+            assert_looks_like("list-150", &frame);
         });
     }
 

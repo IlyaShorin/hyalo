@@ -79,7 +79,7 @@ use crate::render::{Renderer, Row, Scene};
 use crate::results::{self, Listed, MAX_ROWS, Results};
 use crate::row_menu::{self, RowMenu};
 use crate::settings::{self, Loaded};
-use crate::surface::Behind;
+use crate::surface::{self, Behind};
 use crate::switcher;
 use crate::tray::{self, Tray};
 use crate::update::Updates;
@@ -613,13 +613,16 @@ impl App {
             .rect(self.results.rows().len(), self.position)
     }
 
-    /// Sizes the window for the rows it lists and draws it.
+    /// Sizes the window for the rows it lists and draws it, on a new
+    /// device when the graphics driver took the old one away.
     fn present(&mut self) -> Result<()> {
         let rect = self.rect();
         let (width, height) = (rect.width as u32, rect.height as u32);
         let dpi = self.placement.dpi;
         match &mut self.renderer {
-            Some(renderer) => renderer.resize(width, height, dpi)?,
+            Some(renderer) => {
+                surface::renewing(renderer, |renderer| renderer.resize(width, height, dpi))?
+            }
             None => {
                 let renderer = Renderer::new(self.hwnd, width, height, dpi, self.behind)?;
                 self.renderer = Some(renderer);
@@ -696,9 +699,9 @@ impl App {
             &self.catalog.icons,
             self.language(),
         );
-        self.renderer
-            .as_mut()
-            .map_or(Ok(()), |renderer| renderer.draw(&scene))
+        self.renderer.as_mut().map_or(Ok(()), |renderer| {
+            surface::renewing(renderer, |renderer| renderer.draw(&scene))
+        })
     }
 
     /// Moves the selection with `step` and shows where it went.

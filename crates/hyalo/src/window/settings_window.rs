@@ -50,7 +50,7 @@ use crate::page::{self, Laid, Target, What};
 use crate::paint::Painter;
 use crate::panel::{Effect, Indexing, Panel, Versions};
 use crate::recorder::Mods;
-use crate::surface::Behind;
+use crate::surface::{self, Behind};
 use crate::{clipboard, settings, tray};
 use std::sync::Arc;
 
@@ -237,14 +237,17 @@ impl SettingsWindow {
     }
 
     /// Lays the page out for the window's width, keeps the scroll within
-    /// it, and draws it.
+    /// it, and draws it, on a new device when the graphics driver took the
+    /// old one away.
     pub(super) fn redraw(&mut self) -> Result<()> {
         let painter = &self.painter;
         let (width, height) = painter.view();
         self.laid = page::lay_out(&self.panel.page(), width, &|text| painter.measure(text));
         self.panel.fit(self.laid.height, height);
-        let panel = &self.panel;
-        let drawn = painter.draw(&self.laid, panel.scroll(), &|target| panel.look(target));
+        let (laid, panel) = (&self.laid, &self.panel);
+        let drawn = surface::renewing(&mut self.painter, |painter| {
+            painter.draw(laid, panel.scroll(), &|target| panel.look(target))
+        });
         self.retitle();
         drawn
     }
@@ -391,7 +394,11 @@ impl SettingsWindow {
     /// The window took a new size: the picture takes it too.
     fn resize(&mut self) -> Outcome {
         let (width, height) = client_size(self.hwnd);
-        if let Err(error) = self.painter.resize(width, height, self.dpi) {
+        let dpi = self.dpi;
+        let resized = surface::renewing(&mut self.painter, |painter| {
+            painter.resize(width, height, dpi)
+        });
+        if let Err(error) = resized {
             eprintln!("hyalo: cannot resize the settings: {error}");
         }
         Outcome::Changed(None)

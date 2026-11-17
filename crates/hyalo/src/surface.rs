@@ -12,7 +12,7 @@
 
 use std::mem::ManuallyDrop;
 
-use windows::Win32::Foundation::HWND;
+use windows::Win32::Foundation::{D2DERR_RECREATE_TARGET, HWND};
 use windows::Win32::Graphics::Direct2D::Common::{
     D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_COLOR_F, D2D1_GRADIENT_STOP, D2D1_PIXEL_FORMAT,
 };
@@ -42,9 +42,11 @@ use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_SAMPLE_DESC,
 };
 use windows::Win32::Graphics::Dxgi::{
-    CreateDXGIFactory2, DXGI_CREATE_FACTORY_FLAGS, DXGI_PRESENT, DXGI_SCALING_STRETCH,
-    DXGI_SWAP_CHAIN_DESC1, DXGI_SWAP_CHAIN_FLAG, DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL,
-    DXGI_USAGE_RENDER_TARGET_OUTPUT, IDXGIDevice, IDXGIFactory2, IDXGISurface, IDXGISwapChain1,
+    CreateDXGIFactory2, DXGI_CREATE_FACTORY_FLAGS, DXGI_ERROR_DEVICE_HUNG,
+    DXGI_ERROR_DEVICE_REMOVED, DXGI_ERROR_DEVICE_RESET, DXGI_ERROR_DRIVER_INTERNAL_ERROR,
+    DXGI_PRESENT, DXGI_SCALING_STRETCH, DXGI_SWAP_CHAIN_DESC1, DXGI_SWAP_CHAIN_FLAG,
+    DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL, DXGI_USAGE_RENDER_TARGET_OUTPUT, IDXGIDevice, IDXGIFactory2,
+    IDXGISurface, IDXGISwapChain1,
 };
 use windows::core::{BOOL, Interface, PCWSTR, Result, w};
 use windows_numerics::Vector2;
@@ -147,16 +149,53 @@ impl Behind {
     }
 }
 
+/// What draws on a graphics device, which the driver takes away when it
+/// restarts (a TDR, after the GPU stopped answering): every call on the
+/// device then fails, and only a new one draws again.
+pub trait Renew {
+    /// Makes the device, and everything that lives on it, anew.
+    fn renew(&mut self) -> Result<()>;
+}
+
+/// Does `work` on `picture`; when its device turns out lost, renews the
+/// picture and does the work once more. A device lost again, or one that
+/// cannot be made yet (the driver is still restarting), is the error, and
+/// the next work renews it again.
+pub fn renewing<P: Renew>(
+    picture: &mut P,
+    mut work: impl FnMut(&mut P) -> Result<()>,
+) -> Result<()> {
+    match work(picture) {
+        Err(error) if lost(&error) => {
+            picture.renew()?;
+            work(picture)
+        }
+        done => done,
+    }
+}
+
+/// Whether `error` says the device is gone: removed, reset, hung or
+/// broken as DXGI says it, or a target Direct2D says to make again.
+fn lost(error: &windows::core::Error) -> bool {
+    [
+        DXGI_ERROR_DEVICE_REMOVED,
+        DXGI_ERROR_DEVICE_RESET,
+        DXGI_ERROR_DEVICE_HUNG,
+        DXGI_ERROR_DRIVER_INTERNAL_ERROR,
+        D2DERR_RECREATE_TARGET,
+    ]
+    .contains(&error.code())
+}
+
 pub struct Surface {
     swap_chain: IDXGISwapChain1,
     pub dc: ID2D1DeviceContext,
     pub dwrite: IDWriteFactory,
-    // Kept alive so the composition tree stays attached to the window.
-    _composition: (
-        IDCompositionDevice,
-        IDCompositionTarget,
-        IDCompositionVisual,
-    ),
+    /// The window the picture shows in.
+    hwnd: HWND,
+    /// Kept alive so the composition tree stays attached to the window;
+    /// none only while a renewal lets go of the old one, or failed after.
+    composition: Option<Composition>,
     width: u32,
     height: u32,
     dpi: u32,
@@ -188,7 +227,8 @@ impl Surface {
             swap_chain,
             dc,
             dwrite,
-            _composition: composition,
+            hwnd,
+            composition: Some(composition),
             width,
             height,
             dpi,
@@ -197,7 +237,6 @@ impl Surface {
         surface.bind_target()?;
         Ok(surface)
     }
-
     pub fn resize(&mut self, width: u32, height: u32, dpi: u32) -> Result<()> {
         let (width, height) = (width.max(1), height.max(1));
         if (width, height, dpi) == (self.width, self.height, self.dpi) {
@@ -329,6 +368,18 @@ impl Surface {
     }
 }
 
+impl Renew for Surface {
+    /// The same picture on a new device: its window, size, scale and
+    /// ground. A window takes one composition at a time, so the old one
+    /// goes first; should the new surface fail, the old pieces stay, lost,
+    /// and the next work renews them again.
+    fn renew(&mut self) -> Result<()> {
+        self.composition = None;
+        *self = Self::new(self.hwnd, self.width, self.height, self.dpi, self.ground)?;
+        Ok(())
+    }
+}
+
 /// Behind the letters selected in a field: the launcher's blue,
 /// see-through.
 pub const SELECTED_TEXT: D2D1_COLOR_F = rgba(0.30, 0.52, 1.0, 0.45);
@@ -451,15 +502,19 @@ fn create_device_context(dxgi_device: &IDXGIDevice) -> Result<ID2D1DeviceContext
     }
 }
 
+/// What shows a swap chain in a window: the device, the window's target
+/// and the visual whose content the swap chain is.
+type Composition = (
+    IDCompositionDevice,
+    IDCompositionTarget,
+    IDCompositionVisual,
+);
+
 fn compose(
     hwnd: HWND,
     dxgi_device: &IDXGIDevice,
     swap_chain: &IDXGISwapChain1,
-) -> Result<(
-    IDCompositionDevice,
-    IDCompositionTarget,
-    IDCompositionVisual,
-)> {
+) -> Result<Composition> {
     unsafe {
         let device: IDCompositionDevice = DCompositionCreateDevice(dxgi_device)?;
         let target = device.CreateTargetForHwnd(hwnd, true)?;
@@ -510,6 +565,11 @@ mod readback {
     }
 
     impl Surface {
+        /// The device the surface draws on.
+        pub fn device(&self) -> Result<ID3D11Device> {
+            unsafe { self.swap_chain.GetDevice() }
+        }
+
         /// Copies the last presented frame to the CPU.
         ///
         /// In a flip-model swap chain buffer 0 is always the next back
@@ -601,9 +661,10 @@ mod readback {
 
 #[cfg(test)]
 mod tests {
-    use windows::Win32::Foundation::DCOMPOSITION_ERROR_WINDOW_ALREADY_COMPOSED;
-
+    use windows::Win32::Foundation::{DCOMPOSITION_ERROR_WINDOW_ALREADY_COMPOSED, E_OUTOFMEMORY};
     use windows::Win32::Graphics::DirectWrite::DWRITE_FONT_WEIGHT_NORMAL;
+    use windows::Win32::Graphics::Dxgi::DXGI_ERROR_UNSUPPORTED;
+    use windows::core::HRESULT;
 
     use super::*;
     use crate::test_desktop::on_hidden_desktop;
@@ -666,6 +727,94 @@ mod tests {
         });
     }
 
+    /// A picture whose work fails with the codes it is given, in turn,
+    /// then goes well, and whose renewal fails with `refused`, if any.
+    #[derive(Default)]
+    struct Scripted {
+        fails: Vec<HRESULT>,
+        refused: Option<HRESULT>,
+        worked: usize,
+        renewed: usize,
+    }
+
+    impl Scripted {
+        fn failing(fails: &[HRESULT]) -> Self {
+            Self {
+                fails: fails.to_vec(),
+                ..Self::default()
+            }
+        }
+    }
+
+    impl Renew for Scripted {
+        fn renew(&mut self) -> Result<()> {
+            self.renewed += 1;
+            self.refused.map_or(Ok(()), |code| Err(code.into()))
+        }
+    }
+
+    fn work(picture: &mut Scripted) -> Result<()> {
+        picture.worked += 1;
+        match picture.fails.is_empty() {
+            true => Ok(()),
+            false => Err(picture.fails.remove(0).into()),
+        }
+    }
+
+    /// Every way DXGI and Direct2D say the device is gone.
+    const LOST: [HRESULT; 5] = [
+        DXGI_ERROR_DEVICE_REMOVED,
+        DXGI_ERROR_DEVICE_RESET,
+        DXGI_ERROR_DEVICE_HUNG,
+        DXGI_ERROR_DRIVER_INTERNAL_ERROR,
+        D2DERR_RECREATE_TARGET,
+    ];
+
+    #[test]
+    fn work_that_went_well_renews_nothing() {
+        let mut picture = Scripted::default();
+        renewing(&mut picture, work).expect("done");
+        assert_eq!((picture.worked, picture.renewed), (1, 0));
+    }
+
+    #[test]
+    fn work_on_a_lost_device_is_done_again_on_a_new_one() {
+        for code in LOST {
+            let mut picture = Scripted::failing(&[code]);
+            renewing(&mut picture, work).expect("done on the new device");
+            assert_eq!((picture.worked, picture.renewed), (2, 1), "{code}");
+        }
+    }
+
+    #[test]
+    fn work_that_failed_otherwise_is_not_done_again() {
+        let mut picture = Scripted::failing(&[E_OUTOFMEMORY]);
+        let failed = renewing(&mut picture, work).expect_err("failed");
+        assert_eq!(failed.code(), E_OUTOFMEMORY);
+        assert_eq!((picture.worked, picture.renewed), (1, 0));
+    }
+
+    #[test]
+    fn a_device_lost_again_is_the_error_and_the_next_work_renews_it_again() {
+        let mut picture = Scripted::failing(&[DXGI_ERROR_DEVICE_REMOVED; 3]);
+        let failed = renewing(&mut picture, work).expect_err("lost again");
+        assert_eq!(failed.code(), DXGI_ERROR_DEVICE_REMOVED);
+        assert_eq!((picture.worked, picture.renewed), (2, 1));
+        renewing(&mut picture, work).expect("done on the third device");
+        assert_eq!((picture.worked, picture.renewed), (4, 2));
+    }
+
+    #[test]
+    fn a_device_that_cannot_be_made_yet_is_the_error() {
+        let mut picture = Scripted {
+            refused: Some(DXGI_ERROR_UNSUPPORTED),
+            ..Scripted::failing(&[DXGI_ERROR_DEVICE_REMOVED])
+        };
+        let failed = renewing(&mut picture, work).expect_err("no device yet");
+        assert_eq!(failed.code(), DXGI_ERROR_UNSUPPORTED);
+        assert_eq!((picture.worked, picture.renewed), (1, 1));
+    }
+
     #[test]
     fn behind_a_backdrop_dwm_refused_is_the_desktop() {
         assert_eq!(Behind::of(Ok(())), Behind::Glass);
@@ -713,6 +862,36 @@ mod tests {
             assert_eq!(surface.size(), (1.0, 1.0));
             surface.begin();
             surface.end(Ok(())).expect("a frame");
+        });
+    }
+
+    #[test]
+    fn a_surface_renewed_draws_on_a_new_device_in_the_same_window_as_before() {
+        on_hidden_desktop(|| {
+            let canvas = Canvas::new();
+            let grey = rgba(0.5, 0.5, 0.5, 1.0);
+            let mut surface = Surface::new(canvas.0, 64, 64, 96, grey).expect("a surface");
+            surface.resize(90, 30, 144).expect("resize");
+            let old = surface.device().expect("the device");
+            surface.renew().expect("renewed");
+            assert_ne!(surface.device().expect("the device"), old, "a new one");
+            assert_eq!(surface.size(), (60.0, 20.0), "the size and the scale");
+            surface.begin();
+            surface.end(Ok(())).expect("a frame on the new device");
+            let frame = surface.read_frame().expect("read back");
+            assert_eq!((frame.width, frame.height), (90, 30));
+            let [b, g, r, a] = frame.pixel(45, 15);
+            assert_eq!(a, 255, "from the same ground");
+            assert!(
+                [b, g, r].iter().all(|c| c.abs_diff(128) <= 1),
+                "{b} {g} {r}"
+            );
+            // The window's one composition is the new surface's.
+            let device: IDCompositionDevice =
+                unsafe { DCompositionCreateDevice(None) }.expect("a composition device");
+            let second = unsafe { device.CreateTargetForHwnd(canvas.0, true) };
+            let refused = second.expect_err("the topmost target is taken");
+            assert_eq!(refused.code(), DCOMPOSITION_ERROR_WINDOW_ALREADY_COMPOSED);
         });
     }
 
